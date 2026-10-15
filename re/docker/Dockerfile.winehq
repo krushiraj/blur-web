@@ -1,0 +1,9 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive WINEARCH=win32 WINEPREFIX=/wine WINEDEBUG=-all DISPLAY=:99
+RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends wget gnupg ca-certificates xvfb xauth xdotool imagemagick cabextract tcpdump libgl1-mesa-dri libgl1-mesa-dri:i386 \
+ && mkdir -pm755 /etc/apt/keyrings && wget -q -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key \
+ && wget -q -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources \
+ && apt-get update && apt-get install -y --install-recommends winehq-stable \
+ && rm -rf /var/lib/apt/lists/*
+COPY run.sh /run.sh
+RUN chmod +x /run.sh
