@@ -1,0 +1,1 @@
+# address  bytes-popped-by-ret  eax-value-or-dash   (the function is replaced by a stub that returns immediately)
