@@ -6,40 +6,58 @@
 #include <math.h>
 
 #define OPTNONE __attribute__((optnone, noinline))
+typedef struct { uint8_t cf, zf, sf, of, pf, af; } Fl;
 typedef struct Cpu {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
     uint32_t teb;                    // guest address of the thread's TEB (FS base)
     uint32_t df;                     // direction flag (0/1), preserved across calls
-    int rn; uint32_t rs[65536];     // shadow stack of the return addresses the active C frames expect
-    uint32_t lastret;                // return address the most recent `ret` (or API return) really popped
+    uint32_t pc;                     // jump target handed to rt_dispatch
+    int32_t budget;                  // entries left before this guest thread must give the others a turn
+    Fl fl;                           // flags carried across entry points (jumps between lifted functions)
     double st[8]; int top;           // x87 register stack (double precision; 80-bit extended is not reproduced)
     uint32_t mxcsr;                  // SSE control/status (rounding mode is not modelled)
     uint16_t fcw, fsw;               // x87 control / status words
     uint8_t xmm[8][16];              // SSE registers
+    uint64_t mm[8];                  // MMX registers (kept apart from the x87 stack)
     uint32_t last_eflags;            // eflags image for pushfd/popfd round trips
 } Cpu;
 
 extern uint8_t *G;                   // guest memory base: guest address A lives at G + A
-#define M8(a)   (*(uint8_t  *)(G + (uint32_t)(a)))
-#define M16(a)  (*(uint16_t *)(G + (uint32_t)(a)))
-#define M32(a)  (*(uint32_t *)(G + (uint32_t)(a)))
-#define M64(a)  (*(uint64_t *)(G + (uint32_t)(a)))
-#define MF32(a) (*(float    *)(G + (uint32_t)(a)))
-#define MF64(a) (*(double   *)(G + (uint32_t)(a)))
+// Guest memory and register-file accessors go through may_alias types: the lifted code freely mixes widths and types on the same bytes
+// (e.g. a movq store followed by a comiss load of its high half), which is undefined under C strict aliasing. Without this, clang/arm64
+// hoists such loads (and the compare) out of loops -- see port/work/fp-edge/FP_EDGE.md (native race stall in f_004d1310).
+typedef uint8_t  __attribute__((may_alias)) u8a;
+typedef uint16_t __attribute__((may_alias, aligned(1))) u16a;
+typedef uint32_t __attribute__((may_alias, aligned(1))) u32a;
+typedef uint64_t __attribute__((may_alias, aligned(1))) u64a;
+typedef float    __attribute__((may_alias, aligned(1))) f32a;
+typedef double   __attribute__((may_alias, aligned(1))) f64a;
+#define M8(a)   (*(u8a  *)(G + (uint32_t)(a)))
+#define M16(a)  (*(u16a *)(G + (uint32_t)(a)))
+#define M32(a)  (*(u32a *)(G + (uint32_t)(a)))
+#define M64(a)  (*(u64a *)(G + (uint32_t)(a)))
+#define MF32(a) (*(f32a *)(G + (uint32_t)(a)))
+#define MF64(a) (*(f64a *)(G + (uint32_t)(a)))
 
-typedef struct { uint8_t cf, zf, sf, of, pf, af; } Fl;
 
 // ---- dispatch for calls the lifter could not resolve statically -------------------------------------------------------------------
 typedef void (*GuestFn)(Cpu *c);
 extern int rt_trace;                                     // debugging: log every function entry
 void rt_enter(Cpu *c, uint32_t addr);
-extern void rt_mismatch(Cpu *c, uint32_t a, int found);
-static inline int rt_expected(Cpu *c, uint32_t a) { int f = 0; for (int i = c->rn - 1; i >= 0; i--) if (c->rs[i] == a) { f = 1; break; } if (__builtin_expect(rt_trace, 0)) rt_mismatch(c, a, f); return f; }
-void rt_violation(Cpu *c, uint32_t callee, uint32_t be, uint32_t bb, uint32_t bs, uint32_t bd, uint32_t bp);
-// direct call; in trace mode, check that the callee preserved the callee-saved registers and the stack balance
-#define CALLF(fn, t) do { if (__builtin_expect(rt_trace, 0)) { uint32_t _b = c->ebx, _s = c->esi, _d = c->edi, _p = c->ebp, _e = c->esp; fn(c); \
-    if (c->ebx != _b || c->esi != _s || c->edi != _d || c->ebp != _p || ((c->esp - _e) & 3)) rt_violation(c, (t), _e, _b, _s, _d, _p); } else fn(c); } while (0)
-void rt_call(Cpu *c, uint32_t target);                  // indirect call (function table, then host API stubs)
+// Control flow: every call, return and indirect jump is a tail jump (MUSTTAIL); the guest stack alone says where control goes.
+#define MUSTTAIL __attribute__((musttail))
+void rt_dispatch(Cpu *c);
+extern const struct { uint32_t a; GuestFn f; } rt_table_x[];   // functions added incrementally (lift_extra.py)
+extern const unsigned rt_table_x_n;                  // jump to a guest address: lifted function, host API stub, or thread exit
+void rt_cpuid(Cpu *c); void rt_rdtsc(Cpu *c);
+void rt_preempt(Cpu *c);                                 // time slice used up
+void rt_spin(Cpu *c);                                    // a spin-wait iteration: lets other guest threads run now and then
+enum { V_PCMPEQB = 0, V_PCMPEQW, V_PCMPEQD, V_PCMPGTB, V_PCMPGTW, V_PCMPGTD, V_PADDB, V_PADDW, V_PADDD, V_PADDQ, V_PSUBB, V_PSUBW, V_PSUBD, V_PSUBQ, V_PADDUSB, V_PADDUSW, V_PSUBUSB, V_PSUBUSW, V_PADDSB, V_PADDSW, V_PSUBSB, V_PSUBSW, V_PMAXUB, V_PMINUB, V_PMAXSW, V_PMINSW, V_PAVGB, V_PAVGW, V_PMULLW, V_PMULHW, V_PMULHUW, V_PMADDWD, V_PSADBW, V_PAND, V_PANDN, V_POR, V_PXOR, V_PUNPCKLBW, V_PUNPCKLWD, V_PUNPCKLDQ, V_PUNPCKHBW, V_PUNPCKHWD, V_PUNPCKHDQ, V_PACKSSWB, V_PACKUSWB, V_PACKSSDW, V_PSLLW, V_PSLLD, V_PSLLQ, V_PSRLW, V_PSRLD, V_PSRLQ, V_PSRAW, V_PSRAD };
+void v_binop(int op, uint8_t *d, const uint8_t *s, int n);
+void v_shift(int op, uint8_t *d, uint64_t cnt, int n);
+uint32_t v_movmskb(const uint8_t *s, int n);
+#define SAVE do { c->eax = eax; c->ecx = ecx; c->edx = edx; c->ebx = ebx; c->esp = esp; c->ebp = ebp; c->esi = esi; c->edi = edi; c->fl = f; } while (0)
+#define LOAD do { eax = c->eax; ecx = c->ecx; edx = c->edx; ebx = c->ebx; esp = c->esp; ebp = c->ebp; esi = c->esi; edi = c->edi; } while (0)
 void rt_unsupported(Cpu *c, uint32_t addr, const char *what) __attribute__((noreturn));
 
 // ---- flag helpers (size in bits: 8/16/32) -----------------------------------------------------------------------------------------
@@ -91,10 +109,10 @@ static inline uint32_t fl_rcr(Fl *f, uint32_t a, uint32_t n, int bits) {
     uint64_t w = bits + 1; f->of = (((a >> (bits - 1)) & 1) ^ f->cf); uint64_t r = ((v >> n) | (v << (w - n))) & ((1ull << w) - 1); f->cf = (r >> bits) & 1; return (uint32_t)r & fl_mask(bits);
 }
 // ---- SSE helpers --------------------------------------------------------------------------------------------------------------------
-#define XF(i, k) (((float *)c->xmm[i])[k])
-#define XD(i, k) (((double *)c->xmm[i])[k])
-#define XU(i, k) (((uint32_t *)c->xmm[i])[k])
-#define XQ(i, k) (((uint64_t *)c->xmm[i])[k])
+#define XF(i, k) (((f32a *)c->xmm[i])[k])
+#define XD(i, k) (((f64a *)c->xmm[i])[k])
+#define XU(i, k) (((u32a *)c->xmm[i])[k])
+#define XQ(i, k) (((u64a *)c->xmm[i])[k])
 static inline void sse_comis(Fl *f, double a, double b) {          // comiss/ucomiss/comisd: ZF,PF,CF; OF=SF=AF=0
     f->of = f->sf = f->af = 0;
     if (a != a || b != b) { f->zf = f->pf = f->cf = 1; } else if (a > b) { f->zf = f->pf = f->cf = 0; } else if (a < b) { f->zf = f->pf = 0; f->cf = 1; } else { f->zf = 1; f->pf = f->cf = 0; }
