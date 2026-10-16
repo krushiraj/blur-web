@@ -49,15 +49,40 @@ static int is_block(uint32_t f, uint32_t *bytes) {
 static uint32_t pitch_of(uint32_t f, uint32_t w) { uint32_t bb; if (is_block(f, &bb)) return ((w + 3) / 4) * bb; return (w * bits_per_pixel(f) + 7) / 8; }
 static uint32_t size_of(uint32_t f, uint32_t w, uint32_t h) { uint32_t bb; if (is_block(f, &bb)) return ((w + 3) / 4) * ((h + 3) / 4) * bb; return pitch_of(f, w) * h; }
 
+// Byte offset of a LockRect sub-rectangle inside a level (pRect = guest RECT {left, top, right, bottom}, may be 0). For block-compressed formats D3D
+// returns the address of the 4x4 block that contains (left, top): (top / 4) block rows, (left / 4) blocks. The old code multiplied the PIXEL row by the
+// BLOCK-row pitch, i.e. wrote 4x too far (outside the level, over neighbouring heap objects) -- and Texture::LockRect ignored pRect altogether.
+static uint32_t rect_offset(Ctx *c, uint32_t fmt, uint32_t pitch, uint32_t rect) {
+    if (!rect) return 0; uint32_t l = rd32(c, rect), t = rd32(c, rect + 4), bb;
+    if (is_block(fmt, &bb)) return (t / 4) * pitch + (l / 4) * bb;
+    return t * pitch + (l * bits_per_pixel(fmt)) / 8;
+}
 static uint32_t oid(Obj *o) { return (uint32_t)(o - objs); }
 static uint32_t pow2lv(uint32_t v, uint32_t l) { v >>= l; return v ? v : 1; }
+static uint32_t suspects[4096], suspect_age[4096]; static int nsuspect;
+static void suspect_add(uint32_t id) { for (int i = 0; i < nsuspect; i++) if (suspects[i] == id) return; if (nsuspect < 4096) { suspects[nsuspect] = id; suspect_age[nsuspect++] = 0; } }
+static void resend_if_filled(Ctx *c);
 // send one mip level / cube face of a texture to the browser
 static void send_level(Ctx *c, Obj *o, uint32_t face, uint32_t level) {
     if (!gfx_on() || level >= o->nlev) return;
     uint32_t lw = pow2lv(o->w, level), lh = pow2lv(o->h, level), ld = o->kind == K_VOLUME ? pow2lv(o->d, level) : 1, pitch = o->lev_pitch[level];
     uint32_t n = size_of(o->fmt, lw, lh) * ld, base = o->data + o->lev_off[level] + (o->kind == K_CUBE ? face * (o->len / 6) : 0);
     uint8_t *tmp = malloc(n + 1); rdbuf(c, base, tmp, n);
+    { static int ts = -1; if (ts < 0) ts = getenv("BLUR_TEXSTAT") != NULL; if (ts && level == 0 && lw >= 512) { uint32_t nz = 0; for (uint32_t i = 0; i < n; i++) nz += tmp[i] != 0; fprintf(stderr, "[tex] #%u %ux%u fmt=%u bytes=%u nonzero=%.1f%% frame=%llu\n", oid(o), lw, lh, o->fmt, n, 100.0 * nz / (n ? n : 1), (unsigned long long)st.frames); } }
+    if (n >= 4096 && level == 0) { int allz = 1; for (uint32_t i = 0; i < n; i += 4) if (*(uint32_t *)(tmp + i)) { allz = 0; break; } if (allz) suspect_add(oid(o)); }
     uint32_t w[8] = {oid(o), face, level, lw, lh, ld, o->fmt, pitch}; gfx_msg(G_TEX_UPLOAD, w, 8, tmp, n); free(tmp);
+}
+// Textures that were uploaded all-zero are probably filled later through a lock pointer the game keeps (no second Unlock): re-send them once data shows up.
+static void resend_if_filled(Ctx *c) {
+    if (st.frames % 15) return;                                   // sparse sampling, every 15th frame: this runs over thousands of placeholder textures
+    for (int i = 0; i < nsuspect; ) {
+        Obj *o = &objs[suspects[i]]; int filled = 0;
+        if (o->data && o->nlev) { uint32_t n = size_of(o->fmt, o->w, o->h); if (n > 65536) n = 65536; uint32_t step = (n / 64) & ~3u; if (!step) step = 4; for (uint32_t k = 0; k < n && !filled; k += step) if (rd32(c, o->data + o->lev_off[0] + k)) filled = 1; }
+        if (!filled) { if (++suspect_age[i] > 240) { suspects[i] = suspects[--nsuspect]; suspect_age[i] = suspect_age[nsuspect]; continue; } i++; continue; }      // give up after ~1 minute at 60 fps
+        uint32_t faces = o->kind == K_CUBE ? 6 : 1; uint32_t id = suspects[i]; suspects[i] = suspects[--nsuspect]; suspect_age[i] = suspect_age[nsuspect];
+        for (uint32_t f = 0; f < faces; f++) for (uint32_t l = 0; l < o->nlev; l++) send_level(c, o, f, l);
+        if (getenv("BLUR_TEXSTAT")) fprintf(stderr, "[tex] #%u filled after upload; re-sent\n", id);
+    }
 }
 static void send_buf(Ctx *c, Obj *o, uint32_t off, uint32_t n) {
     if (!gfx_on() || off >= o->len) return; if (off + n > o->len) n = o->len - off;
@@ -88,10 +113,10 @@ static uint32_t surf_desc(Ctx *c, uint32_t *a) {
     wr32(c, a[1] + 16, o->ms); wr32(c, a[1] + 20, 0); wr32(c, a[1] + 24, o->w); wr32(c, a[1] + 28, o->h); return 0;
 }
 static uint32_t surf_lock(Ctx *c, uint32_t *a) {
-    Obj *o = O(c, a[0]); wr32(c, a[1], o->lev_pitch[0]); wr32(c, a[1] + 4, o->data);
-    if (a[2]) { uint32_t l = rd32(c, a[2]), t = rd32(c, a[2] + 4); wr32(c, a[1] + 4, o->data + t * o->lev_pitch[0] + (l * bits_per_pixel(o->fmt)) / 8); } return 0;
+    Obj *o = O(c, a[0]); wr32(c, a[1], o->lev_pitch[0]); wr32(c, a[1] + 4, o->data + rect_offset(c, o->fmt, o->lev_pitch[0], a[2])); return 0;
 }
-static uint32_t surf_unlock(Ctx *c, uint32_t *a) { Obj *o = O(c, a[0]); if (o->parent) send_level(c, &objs[o->parent], o->face, o->level); return 0; }
+static void canary_check(Ctx *c, Obj *o, const char *where);
+static uint32_t surf_unlock(Ctx *c, uint32_t *a) { Obj *o = O(c, a[0]); if (o->parent) canary_check(c, &objs[o->parent], "surface UnlockRect"); if (o->parent) send_level(c, &objs[o->parent], o->face, o->level); return 0; }
 static uint32_t surf_container(Ctx *c, uint32_t *a) { Obj *o = O(c, a[0]); if (o->parent) { wr32(c, a[2], objs[o->parent].guest); return 0; } wr32(c, a[2], st.device); return 0; }
 static const ComMethod surf_m[] = { IU, RES, { "GetContainer", 3, surf_container }, { "GetDesc", 2, surf_desc }, { "LockRect", 4, surf_lock }, { "UnlockRect", 1, surf_unlock }, Z("GetDC", 2), Z("ReleaseDC", 2) };
 
@@ -102,8 +127,27 @@ static uint32_t new_surface(Ctx *c, uint32_t w, uint32_t h, uint32_t fmt, uint32
 }
 
 // textures
-static uint32_t tex_lock(Ctx *c, uint32_t *a) { Obj *o = O(c, a[0]); uint32_t l = a[1] < o->nlev ? a[1] : 0; wr32(c, a[2], o->lev_pitch[l]); wr32(c, a[2] + 4, o->data + o->lev_off[l]); return 0; }
-static uint32_t tex_unlock(Ctx *c, uint32_t *a) { send_level(c, O(c, a[0]), 0, a[1]); return 0; }
+extern uint32_t g_api_ret;
+static int texw(uint32_t id) { static long lo = -2, hi; if (lo == -2) { lo = -1; const char *e = getenv("BLUR_TEXWATCH"); if (e) { lo = atol(e); const char *d = strchr(e, '-'); hi = d ? atol(d + 1) : lo; } } return lo >= 0 && (long)id >= lo && (long)id <= hi; }
+#include <unicorn/unicorn.h>
+static void emu_wcb(uc_engine *uc, uc_mem_type type, uint64_t addr, int size, int64_t value, void *ud) {
+    (void)type; static int n; if (n++ > 60) return; uint32_t eip, esp, ebp; uc_reg_read(uc, UC_X86_REG_EIP, &eip); uc_reg_read(uc, UC_X86_REG_ESP, &esp); uc_reg_read(uc, UC_X86_REG_EBP, &ebp);
+    fprintf(stderr, "[emuw] write %d bytes at %08x val=%llx eip=%08x esp=%08x ebp=%08x chain:", size, (uint32_t)addr, (unsigned long long)value, eip, esp, ebp);
+    uint32_t b = ebp; for (int k = 0; k < 8 && b > 0x10000 && b < 0x10000000; k++) { uint32_t ret = 0, nb = 0; uc_mem_read(uc, b + 4, &ret, 4); uc_mem_read(uc, b, &nb, 4); fprintf(stderr, " %08x", ret); if (nb <= b) break; b = nb; }
+    fprintf(stderr, "\n"); (void)ud;
+}
+static void canary_check(Ctx *c, Obj *o, const char *where) {
+    static int on = -1; if (on < 0) on = getenv("BLUR_CANARY") != NULL; if (!on || !o->data || !o->len) return;
+    int last = -1; for (int i = 0; i < 256; i++) if (G[o->data + o->len + i] != 0xAB) last = i;
+    if (last >= 0) { static uint32_t seen[64]; static int ns; uint32_t key = o->fmt * 1000003u + o->w * 4099u + o->h;
+        int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) dup = 1;
+        if (!dup && ns < 64) { seen[ns++] = key; fprintf(stderr, "[canary] texture #%ld %ux%u fmt=%u nlev=%u len=%u data=%08x wrote %d byte(s) past the end (%s, caller %08x, frame %llu)\n", (long)(o - objs), o->w, o->h, o->fmt, o->nlev, o->len, o->data, last + 1, where, g_api_ret, (unsigned long long)st.frames); }
+        memset(G + o->data + o->len, 0xAB, 256); }
+}
+static uint32_t tex_lock(Ctx *c, uint32_t *a) { Obj *o = O(c, a[0]);
+    if (getenv("BLUR_HOSTWATCH") && (long)(o - objs) == atol(getenv("BLUR_HOSTWATCH")) && a[1] == 0) { g_hw_lo = o->data + o->lev_off[0]; g_hw_hi = g_hw_lo + 0x40000; fprintf(stderr, "[hostw] watching %08x-%08x\n", g_hw_lo, g_hw_hi); }
+    { static int armed; const char *e = getenv("BLUR_EMUWATCH"); if (e && !g_recomp && !armed && (long)(o - objs) == atol(e) && a[1] == 0) { armed = 1; uc_hook h; uint32_t lo = o->data + o->lev_off[0]; uc_hook_add(c->uc, &h, UC_HOOK_MEM_WRITE, (void *)emu_wcb, NULL, lo, lo + 0x3ffff); fprintf(stderr, "[emuw] armed %08x..\n", lo); } } if (texw((uint32_t)(o - objs))) { fprintf(stderr, "[texw] lock #%ld lvl=%u flags=%x ret=%08x frame=%llu data=%08x callers:", (long)(o - objs), a[1], a[4], g_api_ret, (unsigned long long)st.frames, o->data + o->lev_off[a[1] < o->nlev ? a[1] : 0]); extern uint32_t g_api_esp; for (int k = 1; k < 80; k++) { uint32_t w = rd32(c, g_api_esp + 4 * k); if (w >= 0x401000 && w < 0xe40000) fprintf(stderr, " %08x", w); } fprintf(stderr, "\n"); } uint32_t l = a[1] < o->nlev ? a[1] : 0; wr32(c, a[2], o->lev_pitch[l]); wr32(c, a[2] + 4, o->data + o->lev_off[l]); return 0; }
+static uint32_t tex_unlock(Ctx *c, uint32_t *a) { canary_check(c, O(c, a[0]), "UnlockRect"); if (texw((uint32_t)(O(c, a[0]) - objs))) fprintf(stderr, "[texw] unlock #%ld lvl=%u ret=%08x frame=%llu\n", (long)(O(c, a[0]) - objs), a[1], g_api_ret, (unsigned long long)st.frames); send_level(c, O(c, a[0]), 0, a[1]); return 0; }
 static uint32_t tex_getsurf(Ctx *c, uint32_t *a) {
     Obj *o = O(c, a[0]); uint32_t l = a[1] < o->nlev ? a[1] : 0, w = o->w >> l ? o->w >> l : 1, h = o->h >> l ? o->h >> l : 1;
     uint32_t g = new_surface(c, w, h, o->fmt, o->pool, o->usage, 0, o->data + o->lev_off[l], o->lev_pitch[l], (uint32_t)(o - objs)); O(c, g)->level = l; wr32(c, a[2], g); return 0;
@@ -116,12 +160,13 @@ static uint32_t tex_levels(Ctx *c, uint32_t *a) { return O(c, a[0])->nlev; }
 static const ComMethod tex_m[] = { IU, RES, Z("SetLOD", 2), Z("GetLOD", 1), { "GetLevelCount", 1, tex_levels }, Z("SetAutoGenFilterType", 2), Z("GetAutoGenFilterType", 1),
     Z("GenerateMipSubLevels", 1), { "GetLevelDesc", 3, tex_leveldesc }, { "GetSurfaceLevel", 3, tex_getsurf }, { "LockRect", 5, tex_lock }, { "UnlockRect", 2, tex_unlock }, Z("AddDirtyRect", 2) };
 
+static void canary_check(Ctx *c, Obj *o, const char *where);
 static void layout_levels(Ctx *c, Obj *o, uint32_t faces) {
     uint32_t total = 0, w = o->w, h = o->h, lv = o->levels ? o->levels : 1;
     if (!o->levels) { uint32_t m = w > h ? w : h; lv = 1; while (m > 1) { m >>= 1; lv++; } }
     if (lv > 16) lv = 16; o->nlev = lv;
     for (uint32_t l = 0; l < lv; l++) { uint32_t lw = (w >> l) ? (w >> l) : 1, lh = (h >> l) ? (h >> l) : 1; o->lev_off[l] = total; o->lev_pitch[l] = pitch_of(o->fmt, lw); total += size_of(o->fmt, lw, lh); }
-    o->len = total * faces; o->data = guest_alloc(c, o->len + 16);
+    o->len = total * faces; o->data = guest_alloc(c, o->len + 256); memset(G + o->data + o->len, 0xAB, 256);    // canary (BLUR_CANARY)
 }
 
 // cube/volume textures (data-only: enough for the game to create and fill them)
@@ -163,14 +208,14 @@ static uint32_t copy_code(Ctx *c, uint32_t src, uint32_t *len, int is_decl) {
 
 // ---- device -----------------------------------------------------------------------------------------------------------------------------
 #define D_CREATE(NAME, NARGS, CODE) static uint32_t NAME(Ctx *c, uint32_t *a) { CODE }
-D_CREATE(d_createtexture, 9, { Obj *o; uint32_t g = make_obj(c, "IDirect3DTexture9", tex_m, NM(tex_m), K_TEXTURE, &o); o->w = a[1]; o->h = a[2]; o->levels = a[3]; o->usage = a[4]; o->fmt = a[5]; o->pool = a[6]; layout_levels(c, o, 1); GFXW(G_TEX_CREATE, oid(o), 0, o->w, o->h, 1, o->nlev, o->fmt, o->usage); LOG("CreateTexture %ux%u lv=%u fmt=%u usage=%x pool=%u -> %08x\n", a[1], a[2], o->nlev, a[5], a[4], a[6], g); wr32(c, a[7], g); return 0; })
-D_CREATE(d_createvolume, 10, { Obj *o; uint32_t g = make_obj(c, "IDirect3DVolumeTexture9", vol_m, NM(vol_m), K_VOLUME, &o); o->w = a[1]; o->h = a[2]; o->d = a[3]; o->levels = a[4]; o->usage = a[5]; o->fmt = a[6]; o->pool = a[7]; layout_levels(c, o, a[3] ? a[3] : 1); GFXW(G_TEX_CREATE, oid(o), 2, o->w, o->h, o->d, o->nlev, o->fmt, o->usage); wr32(c, a[8], g); return 0; })
-D_CREATE(d_createcube, 8, { Obj *o; uint32_t g = make_obj(c, "IDirect3DCubeTexture9", cube_m, NM(cube_m), K_CUBE, &o); o->w = o->h = a[1]; o->levels = a[2]; o->usage = a[3]; o->fmt = a[4]; o->pool = a[5]; layout_levels(c, o, 6); GFXW(G_TEX_CREATE, oid(o), 1, o->w, o->h, 1, o->nlev, o->fmt, o->usage); wr32(c, a[6], g); return 0; })
-D_CREATE(d_createvb, 7, { Obj *o; uint32_t g = make_obj(c, "IDirect3DVertexBuffer9", buf_m, NM(buf_m), K_VB, &o); o->len = a[1]; o->usage = a[2]; o->fvf = a[3]; o->pool = a[4]; o->data = guest_alloc(c, a[1] + 16); GFXW(G_BUF_CREATE, oid(o), 0, a[1], 0, a[2]); LOG("CreateVertexBuffer len=%u -> %08x\n", a[1], g); wr32(c, a[5], g); return 0; })
-D_CREATE(d_createib, 7, { Obj *o; uint32_t g = make_obj(c, "IDirect3DIndexBuffer9", buf_m, NM(buf_m), K_IB, &o); o->len = a[1]; o->usage = a[2]; o->fmt = a[3]; o->pool = a[4]; o->data = guest_alloc(c, a[1] + 16); GFXW(G_BUF_CREATE, oid(o), 1, a[1], a[3], a[2]); LOG("CreateIndexBuffer len=%u -> %08x\n", a[1], g); wr32(c, a[5], g); return 0; })
-D_CREATE(d_creatert, 9, { LOG("CreateRenderTarget %ux%u fmt=%u ms=%u\n", a[1], a[2], a[3], a[4]); { uint32_t sg = new_surface(c, a[1], a[2], a[3], 0, 1, a[4], 0, 0, 0); GFXW(G_SURF_CREATE, oid(O(c, sg)), a[1], a[2], a[3], 1, a[4]); wr32(c, a[7], sg); } return 0; })
-D_CREATE(d_createds, 9, { LOG("CreateDepthStencilSurface %ux%u fmt=%u\n", a[1], a[2], a[3]); { uint32_t sg = new_surface(c, a[1], a[2], a[3], 0, 2, a[4], 0, 0, 0); GFXW(G_SURF_CREATE, oid(O(c, sg)), a[1], a[2], a[3], 2, a[4]); wr32(c, a[7], sg); } return 0; })
-D_CREATE(d_createoffscreen, 7, { wr32(c, a[5], new_surface(c, a[1], a[2], a[3], a[4], 0, 0, 0, 0, 0)); return 0; })
+D_CREATE(d_createtexture, 9, { if (!a[1] || !a[2]) { wr32(c, a[7], 0); LOG("d_createtexture: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } Obj *o; uint32_t g = make_obj(c, "IDirect3DTexture9", tex_m, NM(tex_m), K_TEXTURE, &o); o->w = a[1]; o->h = a[2]; o->levels = a[3]; o->usage = a[4]; o->fmt = a[5]; o->pool = a[6]; layout_levels(c, o, 1); GFXW(G_TEX_CREATE, oid(o), 0, o->w, o->h, 1, o->nlev, o->fmt, o->usage); LOG("CreateTexture %ux%u lv=%u fmt=%u usage=%x pool=%u -> %08x\n", a[1], a[2], o->nlev, a[5], a[4], a[6], g); wr32(c, a[7], g); return 0; })
+D_CREATE(d_createvolume, 10, { if (!a[1] || !a[2] || !a[3]) { wr32(c, a[8], 0); LOG("d_createvolume: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } Obj *o; uint32_t g = make_obj(c, "IDirect3DVolumeTexture9", vol_m, NM(vol_m), K_VOLUME, &o); o->w = a[1]; o->h = a[2]; o->d = a[3]; o->levels = a[4]; o->usage = a[5]; o->fmt = a[6]; o->pool = a[7]; layout_levels(c, o, a[3] ? a[3] : 1); GFXW(G_TEX_CREATE, oid(o), 2, o->w, o->h, o->d, o->nlev, o->fmt, o->usage); wr32(c, a[8], g); return 0; })
+D_CREATE(d_createcube, 8, { if (!a[1]) { wr32(c, a[6], 0); LOG("d_createcube: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } Obj *o; uint32_t g = make_obj(c, "IDirect3DCubeTexture9", cube_m, NM(cube_m), K_CUBE, &o); o->w = o->h = a[1]; o->levels = a[2]; o->usage = a[3]; o->fmt = a[4]; o->pool = a[5]; layout_levels(c, o, 6); GFXW(G_TEX_CREATE, oid(o), 1, o->w, o->h, 1, o->nlev, o->fmt, o->usage); wr32(c, a[6], g); return 0; })
+D_CREATE(d_createvb, 7, { if (!a[1]) { wr32(c, a[5], 0); LOG("d_createvb: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } Obj *o; uint32_t g = make_obj(c, "IDirect3DVertexBuffer9", buf_m, NM(buf_m), K_VB, &o); o->len = a[1]; o->usage = a[2]; o->fvf = a[3]; o->pool = a[4]; o->data = guest_alloc(c, a[1] + 16); GFXW(G_BUF_CREATE, oid(o), 0, a[1], 0, a[2]); LOG("CreateVertexBuffer len=%u -> %08x\n", a[1], g); wr32(c, a[5], g); return 0; })
+D_CREATE(d_createib, 7, { if (!a[1]) { wr32(c, a[5], 0); LOG("d_createib: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } Obj *o; uint32_t g = make_obj(c, "IDirect3DIndexBuffer9", buf_m, NM(buf_m), K_IB, &o); o->len = a[1]; o->usage = a[2]; o->fmt = a[3]; o->pool = a[4]; o->data = guest_alloc(c, a[1] + 16); GFXW(G_BUF_CREATE, oid(o), 1, a[1], a[3], a[2]); LOG("CreateIndexBuffer len=%u -> %08x\n", a[1], g); wr32(c, a[5], g); return 0; })
+D_CREATE(d_creatert, 9, { if (!a[1] || !a[2]) { wr32(c, a[7], 0); LOG("d_creatert: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } LOG("CreateRenderTarget %ux%u fmt=%u ms=%u\n", a[1], a[2], a[3], a[4]); { uint32_t sg = new_surface(c, a[1], a[2], a[3], 0, 1, a[4], 0, 0, 0); GFXW(G_SURF_CREATE, oid(O(c, sg)), a[1], a[2], a[3], 1, a[4]); wr32(c, a[7], sg); } return 0; })
+D_CREATE(d_createds, 9, { if (!a[1] || !a[2]) { wr32(c, a[7], 0); LOG("d_createds: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } LOG("CreateDepthStencilSurface %ux%u fmt=%u\n", a[1], a[2], a[3]); { uint32_t sg = new_surface(c, a[1], a[2], a[3], 0, 2, a[4], 0, 0, 0); GFXW(G_SURF_CREATE, oid(O(c, sg)), a[1], a[2], a[3], 2, a[4]); wr32(c, a[7], sg); } return 0; })
+D_CREATE(d_createoffscreen, 7, { if (!a[1] || !a[2]) { wr32(c, a[5], 0); LOG("d_createoffscreen: invalid arguments -> D3DERR_INVALIDCALL\n"); return 0x8876086c; } wr32(c, a[5], new_surface(c, a[1], a[2], a[3], a[4], 0, 0, 0, 0, 0)); return 0; })
 static void send_vdecl(Ctx *c, Obj *o) {
     if (!gfx_on()) return; uint8_t *tmp = malloc(o->codelen + 1); rdbuf(c, o->code, tmp, o->codelen);
     uint32_t w[2] = {oid(o), o->codelen / 8}; gfx_msg(G_VDECL, w, 2, tmp, o->codelen); free(tmp);
@@ -184,6 +229,15 @@ static void dump_shader(Ctx *c, Obj *o, const char *stage) {
 static void send_shader(Ctx *c, Obj *o, uint32_t stage) {
     if (!gfx_on()) return;
     uint8_t *code = malloc(o->codelen + 4); rdbuf(c, o->code, code, o->codelen);
+    { static int init, have; static const char *missdir;                 // offline cache (BLUR_SHADER_CACHE=shaders.bin): send the key, the browser has the GLSL
+      if (!init) { init = 1; const char *p = getenv("BLUR_SHADER_CACHE"); missdir = getenv("BLUR_SHADER_MISS");
+          if (!p && access("web/shaders.bin", R_OK) == 0) p = "web/shaders.bin";          // default: on when the page can fetch the same file; BLUR_SHADER_CACHE=off disables
+          if (p && !strcmp(p, "off")) p = NULL;
+          if (p) { int n = shc_load(p); have = n > 0; fprintf(stderr, "[shader-cache] %s: %d entries\n", p, n); } }
+      uint64_t h = shc_fnv64(code, o->codelen);
+      if (have && shc_has(h, o->codelen)) { uint32_t w[5] = {oid(o), stage, (uint32_t)h, (uint32_t)(h >> 32), o->codelen}; gfx_msg(G_SHADER_REF, w, 5, NULL, 0); free(code); return; }
+      if (have) { fprintf(stderr, "[shader-cache] MISS %016llx_%u (live translation)\n", (unsigned long long)h, o->codelen);
+          if (missdir) { char fn[512]; snprintf(fn, sizeof fn, "%s/%016llx_%u.bin", missdir, (unsigned long long)h, o->codelen); FILE *mf = fopen(fn, "wb"); if (mf) { fwrite(code, 1, o->codelen, mf); fclose(mf); } } } }
     ShaderXlat x; if (shader_translate(code, o->codelen, &x) == 0) {
         // payload: id, stage, glsl_len, nin, nout, nsamp, then IOEnt tables (4 bytes each) and the GLSL text
         uint32_t w[6] = {oid(o), stage, x.glsl_len, (uint32_t)x.nin, (uint32_t)x.nout, (uint32_t)x.nsamp};
@@ -231,8 +285,8 @@ static uint32_t d_setps(Ctx *c, uint32_t *a) { st.ps = a[1]; GFXW(G_SET_PS, a[1]
 static uint32_t d_getps(Ctx *c, uint32_t *a) { wr32(c, a[1], st.ps); return 0; }
 static uint32_t d_setvsf(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 256) { rdbuf(c, a[2], st.vsf[a[1]], 16 * a[3]); uint32_t w[2] = {a[1], a[3]}; gfx_msg(G_SET_VSC, w, 2, st.vsf[a[1]], 16 * a[3]); } return 0; }
 static uint32_t d_getvsf(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 256) wrbuf(c, a[2], st.vsf[a[1]], 16 * a[3]); return 0; }
-static FILE *dump_fp(void);
-static uint32_t d_setpsf(Ctx *c, uint32_t *a) { if (getenv("BLUR_PSLOG") && a[1] <= 25 && a[1] + a[3] > 21) { FILE *f = stderr; fprintf(f, "[frame %llu ret=%08x ptr=%08x] ", (unsigned long long)st.frames, g_api_ret, a[2]); fprintf(f, "SETPSF start=%u count=%u vals:", a[1], a[3]); for (uint32_t k = 0; k < a[3] * 4 && k < 20; k++) { uint32_t w = rd32(c, a[2] + 4 * k); float fl; memcpy(&fl, &w, 4); fprintf(f, " %g", fl); } fprintf(f, "\n"); }
+static FILE *dump_fp(void); extern uint32_t g_api_ret;
+static uint32_t d_setpsf(Ctx *c, uint32_t *a) { if (getenv("BLUR_PSLOG") && a[1] <= 25 && a[1] + a[3] > 21) { FILE *f = stderr; fprintf(f, "[frame %llu ret=%08x ptr=%08x] ", (unsigned long long)st.frames, g_api_ret, a[2]); fprintf(f, "SETPSF start=%u count=%u vals:", a[1], a[3]); if (a[1] == 23 || a[1] == 21) { fprintf(f, " [mem"); for (int k = -4; k < 12; k++) { uint32_t w = rd32(c, a[2] + 4 * k); float fl; memcpy(&fl, &w, 4); fprintf(f, " %g", fl); } fprintf(f, "] "); } for (uint32_t k = 0; k < a[3] * 4 && k < 20; k++) { uint32_t w = rd32(c, a[2] + 4 * k); float fl; memcpy(&fl, &w, 4); fprintf(f, " %g", fl); } fprintf(f, "\n"); }
     if (a[1] + a[3] <= 224) { rdbuf(c, a[2], st.psf[a[1]], 16 * a[3]); uint32_t w[2] = {a[1], a[3]}; gfx_msg(G_SET_PSC, w, 2, st.psf[a[1]], 16 * a[3]); } return 0; }
 static uint32_t d_getpsf(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 224) wrbuf(c, a[2], st.psf[a[1]], 16 * a[3]); return 0; }
 static uint32_t d_setvsi(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 16) { rdbuf(c, a[2], st.vsi[a[1]], 16 * a[3]); uint32_t w[2] = {a[1], a[3]}; gfx_msg(G_SET_VSCI, w, 2, st.vsi[a[1]], 16 * a[3]); } return 0; }
@@ -252,9 +306,27 @@ static uint32_t d_clear(Ctx *c, uint32_t *a) {   // Count, pRects, Flags, Color,
 }
 static uint32_t d_draw(Ctx *c, uint32_t *a);
 static uint32_t vert_count(uint32_t type, uint32_t n) { switch (type) { case 1: return n; case 2: return 2 * n; case 3: return n + 1; case 4: return 3 * n; case 5: case 6: return n + 2; } return n; }
-static uint32_t d_drawp(Ctx *c, uint32_t *a) { GFXW(G_DRAW, a[1], 0, 0, 0, 0, a[2], a[3]); return d_draw(c, a); }                        // type, startvertex, primcount
-static uint32_t d_drawip(Ctx *c, uint32_t *a) { GFXW(G_DRAW, a[1], 1, a[2], a[3], a[4], a[5], a[6]); return d_draw(c, a); }             // type, base, minidx, numverts, startindex, primcount
-static uint32_t d_drawpup(Ctx *c, uint32_t *a) {                                                                                         // type, primcount, data, stride
+static void ff_log(Ctx *c, const char *what, uint32_t *a) {
+    static int on = -1; if (on < 0) on = getenv("BLUR_FFLOG") != NULL; if (!on || st.vs) return;
+    static uint32_t seen[32]; static int ns; uint32_t key = st.fvf * 31u + st.ps * 7u + a[1]; for (int i = 0; i < ns; i++) if (seen[i] == key) return; if (ns < 32) seen[ns++] = key;
+    fprintf(stderr, "[ff] %s without vertex shader: fvf=%08x vdecl=%u ps=%u (codelen %u) type=%u a1=%u a2=%u a3=%u a4=%u tex0=%u tex1=%u tex2=%u tex3=%u rt=%08x vp=%u,%u,%u,%u\n", what, st.fvf, st.vdecl, st.ps, st.ps ? O(c, st.ps)->codelen : 0,
+        a[1], a[1], a[2], a[3], a[4], st.tex[0], st.tex[1], st.tex[2], st.tex[3], st.rt, st.vp[0], st.vp[1], st.vp[2], st.vp[3]);
+}
+static void ff_dump(Ctx *c, uint32_t *a) {      // decl + first vertices of a DrawPrimitiveUP (a[3]=data a[4]=stride)
+    static int n; if (!getenv("BLUR_FFLOG") || st.vs || n++ % 40 != 0 || n > 400) return; Obj *d = O(c, st.vdecl);
+    for (uint32_t o = d->code; d->code && o + 8 <= d->code + d->codelen; o += 8) { uint16_t stream = rd16(c, o), off = rd16(c, o + 2); uint8_t ty = rd8(c, o + 4), me = rd8(c, o + 5), us = rd8(c, o + 6), ui = rd8(c, o + 7); if (stream == 0xff) break; fprintf(stderr, "[ff]   elem stream=%u off=%u type=%u method=%u usage=%u idx=%u\n", stream, off, ty, me, us, ui); }
+    for (int v = 0; v < 4; v++) { fprintf(stderr, "[ff]   v%d:", v); for (uint32_t k = 0; k < a[4] / 4; k++) { uint32_t w = rd32(c, a[3] + v * a[4] + 4 * k); float f; memcpy(&f, &w, 4); fprintf(stderr, " %g", (double)f); } fprintf(stderr, "\n"); }
+    for (int t = 0; t < 3; t++) { Obj *o = O(c, st.tex[t]); uint32_t nz = 0, sum = 0; for (uint32_t i = 0; i < o->lev_off[1] && o->data; i += 7) { uint8_t b = G[o->data + i]; if (b) nz++; sum += b; }
+        fprintf(stderr, "[ff]   tex%d #%ld data=%08x %ux%u fmt=%u nlev=%u sampled-nonzero=%u mean=%.1f\n", t, (long)(o - objs), o->data, o->w, o->h, o->fmt, o->nlev, nz, o->lev_off[1] ? (double)sum / (o->lev_off[1] / 7 + 1) : 0.0); }
+    fprintf(stderr, "[ff]   ps consts c0..c3:"); for (int k = 0; k < 4; k++) fprintf(stderr, " (%g %g %g %g)", st.psf[k][0], st.psf[k][1], st.psf[k][2], st.psf[k][3]); fprintf(stderr, "\n");
+}
+static void pre_draw(Ctx *c) {
+    { static int force = -1; if (force < 0) force = getenv("BLUR_UIFORCE") != NULL;      // diagnostic: make the UI shaders' colour ramp opaque white
+      if (force && st.vs && O(c, st.vs)->codelen == 344) { float v[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}}; uint32_t w[2] = {23, 2}; gfx_msg(G_SET_PSC, w, 2, v, 32); GFXW(G_SET_RS, 22, 1); GFXW(G_SET_RS, 7, 0); st.rs[22] = 1; } }
+}
+static uint32_t d_drawp(Ctx *c, uint32_t *a) { pre_draw(c); ff_log(c, "DrawPrimitive", a); GFXW(G_DRAW, a[1], 0, 0, 0, 0, a[2], a[3]); return d_draw(c, a); }                        // type, startvertex, primcount
+static uint32_t d_drawip(Ctx *c, uint32_t *a) { pre_draw(c); ff_log(c, "DrawIndexedPrimitive", a); GFXW(G_DRAW, a[1], 1, a[2], a[3], a[4], a[5], a[6]); return d_draw(c, a); }             // type, base, minidx, numverts, startindex, primcount
+static uint32_t d_drawpup(Ctx *c, uint32_t *a) { ff_log(c, "DrawPrimitiveUP", a); ff_dump(c, a);                                                                                         // type, primcount, data, stride
     uint32_t nv = vert_count(a[1], a[2]), nb = nv * a[4]; if (gfx_on() && nb < (32u << 20)) { uint8_t *tmp = malloc(nb + 1); rdbuf(c, a[3], tmp, nb); uint32_t w[7] = {a[1], a[2], a[4], nv, 0, 0, 0}; gfx_msg(G_DRAW_UP, w, 7, tmp, nb); free(tmp); }
     return d_draw(c, a);
 }
@@ -266,24 +338,35 @@ static uint32_t d_drawipup(Ctx *c, uint32_t *a) {                               
 static FILE *dump_fp(void) { static FILE *f; if (!f) f = tmpfile(); return f; }
 static uint32_t d_draw(Ctx *c, uint32_t *a) {
     st.draws++; st.draws_frame++;
+    { static int ut = -1; if (ut < 0) ut = getenv("BLUR_UITEX") != NULL; Obj *pp = O(c, st.ps);
+      if (ut && (pp->codelen == 596 || pp->codelen == 680) && st.frames % 300 == 100) {
+        fprintf(stderr, "[uitex] frame %llu ps#%ld(%u B) tex:", (unsigned long long)st.frames, (long)(pp - objs), pp->codelen);
+        for (int i = 0; i < 4; i++) if (st.tex[i]) { Obj *t = O(c, st.tex[i]); uint32_t n = size_of(t->fmt, t->w, t->h), nz = 0, cnt = 0; for (uint32_t k = 0; k < n && t->data; k += 16) { cnt++; nz += rd32(c, t->data + t->lev_off[0] + k) != 0; }
+          fprintf(stderr, " s%d=#%ld %ux%u/f%u live-nonzero=%.0f%%", i, (long)(t - objs), t->w, t->h, t->fmt, cnt ? 100.0 * nz / cnt : 0.0); }
+        fprintf(stderr, "\n"); } }
     static long dd = -2; if (dd == -2) dd = getenv("BLUR_DRAWDUMP") ? atol(getenv("BLUR_DRAWDUMP")) : -1;       // BLUR_DRAWDUMP=N: print every draw of the first frame having >= N draws
     if ((dlog(c) && st.frames < 4) || dd >= 0) {
         FILE *ef = (dd >= 0) ? dump_fp() : stderr; Obj *v = O(c, st.vs), *p = O(c, st.ps); fprintf(ef, "[d3d9] DRAW type=%u prims=%u indexed=%d  vs=#%ld(%u B) ps=#%ld(%u B) rt=%08x vp=%ux%u tex:", a[1], a[3], (int)(a[0] && st.ib), (long)(v - objs), v->codelen, (long)(p - objs), p->codelen, st.rt ? st.rt : st.backbuf, st.vp[2], st.vp[3]);
         for (int i = 0; i < 16; i++) if (st.tex[i]) { Obj *t = O(c, st.tex[i]); fprintf(ef, " s%d=%ux%u/f%u", i, t->w, t->h, t->fmt); }
         fprintf(ef, "  rs: zen=%u blend=%u src=%u dst=%u cull=%u\n", st.rs[7], st.rs[27], st.rs[19], st.rs[20], st.rs[22]);
+        if (getenv("BLUR_DRAWCONST") && (v - objs) > 1000 && st.ib) { Obj *ib = O(c, st.ib); fprintf(ef, "    idx args base=%d minidx=%u nverts=%u start=%u  ib fmt=%u len=%u idx:", (int)a[2], a[3], a[4], a[5], ib->fmt, ib->len); for (int k = 0; k < 8; k++) fprintf(ef, " %u", rd16(c, ib->data + (a[5] + k) * 2)); fprintf(ef, "\n"); }
+        if (getenv("BLUR_DRAWCONST") && (v - objs) > 1000) fprintf(ef, "    scissor_en=%u rect=%u,%u,%u,%u colorwrite=%x zwrite=%u zfunc=%u alphatest=%u stencil=%u\n", st.rs[174], st.scissor[0], st.scissor[1], st.scissor[2], st.scissor[3], st.rs[168], st.rs[14], st.rs[23], st.rs[15], st.rs[52]);
         if (getenv("BLUR_DRAWCONST") && (v - objs) > 1000 && st.vb[0]) { Obj *vb = O(c, st.vb[0]); fprintf(ef, "    vb0 stride=%u off=%u data=%08x len=%u verts:\n", st.vb_stride[0], st.vb_off[0], vb->data, vb->len); for (int k = 0; k < 4; k++) { fprintf(ef, "      "); for (uint32_t q = 0; q < st.vb_stride[0] / 4 && q < 12; q++) { uint32_t w = rd32(c, vb->data + st.vb_off[0] + k * st.vb_stride[0] + q * 4); float fl; memcpy(&fl, &w, 4); fprintf(ef, "%g(%08x) ", fl, w); } fprintf(ef, "\n"); } }
         if (getenv("BLUR_DRAWCONST") && (v - objs) > 1000) { for (int k = 32; k < 36; k++) fprintf(ef, "    vc%d = %g %g %g %g\n", k, st.vsf[k][0], st.vsf[k][1], st.vsf[k][2], st.vsf[k][3]); for (int k = 21; k < 26; k++) fprintf(ef, "    pc%d = %g %g %g %g\n", k, st.psf[k][0], st.psf[k][1], st.psf[k][2], st.psf[k][3]); }
     }
     return 0;
 }
+uint64_t g_frames_pub;
 static uint32_t d_present(Ctx *c, uint32_t *a) {
-    (void)a; st.frames++;
+    (void)a; st.frames++; g_frames_pub = st.frames;
     if (dlog(c) && (st.frames <= 5 || st.frames % 60 == 0)) fprintf(stderr, "[d3d9] Present #%llu (draws last frame=%llu, clears=%llu)\n", (unsigned long long)st.frames, (unsigned long long)st.draws_frame, (unsigned long long)st.clears);
     { static long dd2 = -2; static int done; if (dd2 == -2) dd2 = getenv("BLUR_DRAWDUMP") ? atol(getenv("BLUR_DRAWDUMP")) : -1;
       if (dd2 >= 0 && !done) { FILE *f = dump_fp(); if ((long)st.draws_frame >= dd2) { done = 1; fflush(f); rewind(f); char ln[1024]; while (fgets(ln, sizeof ln, f)) fputs(ln, stderr); fprintf(stderr, "[drawdump] end frame %llu\n", (unsigned long long)st.frames); } else { fflush(f); rewind(f); if (ftruncate(fileno(f), 0)) {} } } }
     { static int on = -1; static uint64_t last, t_flush, sec0, fr0, dr0, worst, maxdt; static uint64_t pres_last;
       if (on < 0) on = getenv("BLUR_FPSLOG") != NULL;
-      uint64_t t0 = real_us(); st.draws_frame = 0; GFXW(G_PRESENT, (uint32_t)st.frames); gfx_flush(); t_flush += real_us() - t0;
+      { extern void ww_arm(void), ww_rearm(void); static int armed; if (getenv("BLUR_WATCHW")) { if (!armed && st.frames == 1 && getenv("BLUR_WATCHW_AFTER_FRAME1")) { ww_arm(); armed = 1; } if (armed || !getenv("BLUR_WATCHW_AFTER_FRAME1")) ww_rearm(); } }
+      { static int dm = -1; if (dm < 0) dm = getenv("BLUR_MEMDUMP") != NULL; if (dm && (st.frames == 5 || st.frames == 300)) { uint32_t lo = (uint32_t)strtoul(getenv("BLUR_MEMDUMP"), 0, 16); fprintf(stderr, "[memdump] frame %llu @%08x:", (unsigned long long)st.frames, lo); for (int k = 0; k < 64; k++) fprintf(stderr, " %02x", rd8(c, lo + k)); fprintf(stderr, "\n"); } }
+      resend_if_filled(c); uint64_t t0 = real_us(); st.draws_frame = 0; GFXW(G_PRESENT, (uint32_t)st.frames); gfx_flush(); t_flush += real_us() - t0;
       if (on) { uint64_t n = real_us(); if (pres_last && n - pres_last > maxdt) maxdt = n - pres_last; pres_last = n; if (!sec0) { sec0 = n; fr0 = st.frames; dr0 = st.draws; }
         if (n - sec0 >= 1000000) { fprintf(stderr, "[fps] %.1f fps  draws/frame %.0f  gfx_flush %.2f ms/frame  worst frame %.1f ms\n", (st.frames - fr0) * 1e6 / (n - sec0), (double)(st.draws - dr0) / (st.frames - fr0 ? st.frames - fr0 : 1), t_flush / 1000.0 / (st.frames - fr0 ? st.frames - fr0 : 1), maxdt / 1000.0); sec0 = n; fr0 = st.frames; dr0 = st.draws; t_flush = 0; maxdt = 0; } }
       (void)last; (void)worst; }
@@ -416,3 +499,6 @@ void d3d9_set_const(Ctx *c, int ps, int set, uint32_t reg, const void *data, uin
     LOG("const %s set=%d reg=%u n=%u\n", ps ? "ps" : "vs", set, reg, nvec); (void)c;
 }
 void d3d9_get_const_f(int ps, uint32_t reg, float *out) { if (reg < (ps ? 224u : 256u)) memcpy(out, ps ? st.psf[reg] : st.vsf[reg], 16); }
+
+// ---- snapshot (see snap_ctx.c): the D3D9 object table must still be empty at the snapshot point (the game has not created a device at the OEP)
+int d3d9_snap_busy(void) { return nobjs - 1 + (int)st.frames + (int)st.draws; }

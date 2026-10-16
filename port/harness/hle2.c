@@ -1,6 +1,7 @@
 // Second batch of Win32 API implementations: virtual filesystem, time, system info, window/display queries,
 // crypto, winsock placeholders, and defined failures for Bink / DirectX until those phases land.
 #include "emu.h"
+static uint32_t packet;      // XInput packet number (file scope so it can be snapshotted)
 #include <ctype.h>
 #include <dirent.h>
 #include <fnmatch.h>
@@ -9,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+uint32_t h_DirectSoundCreate8(Ctx *c, uint32_t *a); uint32_t h_DirectSoundEnumerateA(Ctx *c, uint32_t *a);
 #define H(n) static uint32_t h_##n(Ctx *c, uint32_t *a)
 #define UNUSED (void)c; (void)a
 #define INVALID_HANDLE 0xffffffffu
@@ -33,10 +35,30 @@ static int map_path_user(const char *rel, char *host, int rw_write) {
     if (rw_write) for (char *q = sv + strlen(g_savedir) + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(sv, 0755); *q = '/'; }
     snprintf(host, 1024, "%s", sv); return 1;
 }
+// The game asks for "ui\\movies\\atvi.bik" while the directory is "UI/movies": Windows and macOS file systems ignore case, the browser file systems
+// (WORKERFS, MEMFS) do not. If the exact path does not exist, match every component after the game directory case-insensitively.
+static void fix_case(char *host) {
+    struct stat st; if (stat(host, &st) == 0) return;
+    size_t root = strlen(g_gamedir); if (strncmp(host, g_gamedir, root) || host[root] != '/') return;
+    char cur[1024]; snprintf(cur, sizeof cur, "%s", g_gamedir); char *p = host + root + 1;
+    while (*p) {
+        char *e = strchr(p, '/'); size_t n = e ? (size_t)(e - p) : strlen(p); char comp[256]; if (n >= sizeof comp) return; memcpy(comp, p, n); comp[n] = 0;
+        char next[1024]; snprintf(next, sizeof next, "%s/%s", cur, comp);
+        if (stat(next, &st) != 0) {
+            DIR *d = opendir(cur); if (!d) return; struct dirent *de; int found = 0;
+            while ((de = readdir(d))) if (!strcasecmp(de->d_name, comp)) { snprintf(next, sizeof next, "%s/%s", cur, de->d_name); found = 1; break; }
+            closedir(d); if (!found) return;
+        }
+        snprintf(cur, sizeof cur, "%s", next); if (!e) break; p = e + 1;
+    }
+    snprintf(host, 1024, "%s", cur);
+}
 static int map_path(const char *gp, char *host, int rw_write) {
     char p[512]; snprintf(p, sizeof p, "%s", gp);
     for (char *q = p; *q; q++) if (*q == '\\') *q = '/';
     char *rel = p;
+    { size_t L = strlen(p); while (L > 1 && p[L - 1] == '/') p[--L] = 0;                                    // directory probes with a trailing slash
+      if (!strcasecmp(p, "C:/Users") || !strcasecmp(p, "C:/Users/player")) { char tmp[1024]; snprintf(tmp, sizeof tmp, "%s/userprofile", g_savedir); mkdir(g_savedir, 0755); mkdir(tmp, 0755); snprintf(host, 1024, "%s", tmp); return 1; } }
     if (!strncasecmp(rel, "C:/BLUR/", 8)) rel += 8;
     else if (!strncasecmp(rel, "C:/Users/player/", 16)) { char tmp[512]; snprintf(tmp, sizeof tmp, "userprofile/%s", rel + 16); snprintf(p, sizeof p, "%s", tmp); rel = p; *host = 0; return map_path_user(rel, host, rw_write); }
     else if (rel[0] && rel[1] == ':' && rel[2] != '/' && (rel[0] == 'c' || rel[0] == 'C')) rel += 2;      // drive-relative: relative to the current directory (C:\BLUR)
@@ -51,9 +73,10 @@ static int map_path(const char *gp, char *host, int rw_write) {
     }
     struct stat st;
     if (stat(sv, &st) == 0) { snprintf(host, 1024, "%s", sv); return 1; }
-    snprintf(host, 1024, "%s/%s", g_gamedir, rel); return 1;
+    snprintf(host, 1024, "%s/%s", g_gamedir, rel); fix_case(host); return 1;
 }
 static uint32_t open_file(Ctx *c, const char *gp, uint32_t access, uint32_t disp) {
+    if (getenv("BLUR_BOOTRAM") && strstr(gp, "gamedata.pak")) { G[0x1226f94] = 1; fprintf(stderr, "[poke] BootRamPakEnable=1\n"); }     // experiment: take the boot_rampak path
     char host[1024]; int wr = (access & GENERIC_WRITE_) || disp == 1 || disp == 2 || disp == 5;
     if (!map_path(gp, host, wr)) { set_err(c, 3); return INVALID_HANDLE; }
     struct stat st; int exists = stat(host, &st) == 0;
@@ -70,6 +93,13 @@ static uint32_t open_file(Ctx *c, const char *gp, uint32_t access, uint32_t disp
     if (c->verbose) fprintf(stderr, "[file] open %s -> %s (h=%x)\n", gp, host, h);
     return h;
 }
+static uint32_t do_mkdir(Ctx *c, const char *gp) {
+    char host[1024]; if (!map_path(gp, host, 1)) { set_err(c, 3); return 0; }
+    struct stat st; if (stat(host, &st) == 0) { set_err(c, 183); return 0; }                                  // ERROR_ALREADY_EXISTS
+    if (mkdir(host, 0755) != 0) { set_err(c, 3); return 0; } set_err(c, 0); if (c->verbose) fprintf(stderr, "[file] CreateDirectory %s -> %s\n", gp, host); return 1;
+}
+H(CreateDirectoryA) { char n[512]; rd_cstr(c, a[0], n, sizeof n); return do_mkdir(c, n); }
+H(CreateDirectoryW) { char n[512]; rd_wstr(c, a[0], n, sizeof n); return do_mkdir(c, n); }
 H(CreateFileA) { char n[512]; rd_cstr(c, a[0], n, sizeof n); return open_file(c, n, a[1], a[4]); }
 H(CreateFileW) { char n[512]; rd_wstr(c, a[0], n, sizeof n); return open_file(c, n, a[1], a[4]); }
 H(ReadFile) {
@@ -210,7 +240,7 @@ H(MessageBoxA) {
 H(GetKeyState_) { UNUSED; return 0; }
 
 // ---- CryptoAPI hashing: accumulate the data, digest on demand (MD5, SHA-1, SHA-256) --------------------------------------------------
-#define MAXHASH 64
+#define MAXHASH 4096
 static struct { int used; uint32_t alg; uint8_t *data; size_t len, cap; } hashes[MAXHASH];
 H(CryptCreateHash) {                                   // prov, algid, key, flags, phHash
     for (int i = 1; i < MAXHASH; i++) if (!hashes[i].used) { hashes[i].used = 1; hashes[i].alg = a[1]; hashes[i].data = NULL; hashes[i].len = hashes[i].cap = 0; wr32(c, a[4], 0x8000 + (uint32_t)i); if (c->verbose) fprintf(stderr, "[crypt] CreateHash alg=%x -> %x\n", a[1], 0x8000 + i); return 1; }
@@ -276,24 +306,52 @@ H(BinkGetFrameBuffersInfo) {   // BINKFRAMEBUFFERS: TotalFrames, Y w/h, cR/cB w/
     }
     return 0;
 }
+
+// ---- real Bink (FFmpeg) glue: BINK_FAKE=1 keeps the old fake player ----------------------------------------------------------------------
+#include "bink_hle.h"
+static Ctx *bk_c;
+static uint32_t bkh_alloc(uint32_t n) { return guest_alloc(bk_c, n); }
+static int bkh_map(const char *n, char *host) { return map_path(n, host, 0) && access(host, R_OK) == 0; }
+static uint64_t bkh_now(void) { return real_us(); }
+static void bk_init_host(Ctx *c) { static int done; bk_c = c; if (done) return; done = 1; BkHost h = { bkh_alloc, bkh_map, bkh_now }; bk_set_host(&h); }
+#define BKR(name, fake) static uint32_t r_##name(Ctx *c, uint32_t *a) { if (getenv("BINK_FAKE")) return fake(c, a); bk_init_host(c); return bk_##name(a); }
 extern uint8_t g_keys[256]; void input_pump(Ctx *c);
 // XInput pad 0 is always "connected" and driven from the keyboard (the game's menus wait for a Start/A press): Enter = Start+A, Space = A, Esc/Backspace = B, arrows = dpad, WASD = left stick.
 H(XInputGetState) {
     if (a[0] != 0) return 1167;                                       // ERROR_DEVICE_NOT_CONNECTED
     input_pump(c);
-    uint16_t b = 0; int16_t lx = 0, ly = 0; static uint32_t packet;
+    uint16_t b = 0; int16_t lx = 0, ly = 0;
     if (g_keys[0xc8]) b |= 0x1; if (g_keys[0xd0]) b |= 0x2; if (g_keys[0xcb]) b |= 0x4; if (g_keys[0xcd]) b |= 0x8;
     if (g_keys[0x1c]) b |= 0x10 | 0x1000; if (g_keys[0x39]) b |= 0x1000; if (g_keys[0x01] || g_keys[0x0e]) b |= 0x2000; if (g_keys[0x0f]) b |= 0x20;
     if (g_keys[0x1e]) lx = -32767; if (g_keys[0x20]) lx = 32767; if (g_keys[0x1f]) ly = -32767; if (g_keys[0x11]) ly = 32767;
-    uint8_t buf[16] = {0}; uint32_t pk = ++packet; memcpy(buf, &pk, 4); memcpy(buf + 4, &b, 2); buf[6] = g_keys[0x2a] ? 255 : 0; buf[7] = g_keys[0x39] ? 0 : 0; memcpy(buf + 8, &lx, 2); memcpy(buf + 10, &ly, 2);
+    uint8_t buf[16] = {0}; uint32_t pk = ++packet; uint8_t lt = g_keys[0x2a] ? 255 : 0, rt = 0; int16_t rx = 0, ry = 0;
+    if (g_pad.active) { b |= g_pad.btn; if (g_pad.lt > lt) lt = g_pad.lt; rt = g_pad.rt; if (g_pad.lx || g_pad.ly) { lx = g_pad.lx; ly = g_pad.ly; } rx = g_pad.rx; ry = g_pad.ry; }
+    memcpy(buf, &pk, 4); memcpy(buf + 4, &b, 2); buf[6] = lt; buf[7] = rt; memcpy(buf + 8, &lx, 2); memcpy(buf + 10, &ly, 2); memcpy(buf + 12, &rx, 2); memcpy(buf + 14, &ry, 2);
     wrbuf(c, a[1], buf, 16); return 0;
 }
 H(Direct3DCreate9) { UNUSED; return com_create_direct3d9(c); }
 H(DirectInput8Create) { uint32_t o = com_create_directinput8(c); wr32(c, a[3], o); return 0; }
 
 #define E(n, na) { #n, na, 0, h_##n }
+extern uint32_t g_api_ret;     // Bink audio entry points: log (BLUR_AUDIOLOG) and answer; see README 'Bink movie audio'
+static uint32_t bl_BinkSetSoundSystem(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkSetSoundSystem(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 1; }
+static uint32_t bl_BinkOpenDirectSound(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkOpenDirectSound(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 1; }
+static uint32_t bl_BinkOpenWaveOut(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkOpenWaveOut(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 1; }
+static uint32_t bl_BinkSetSoundTrack(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkSetSoundTrack(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 1; }
+static uint32_t bl_BinkSetVolume(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkSetVolume(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 1; }
+static uint32_t bl_BinkGetTrackID(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkGetTrackID(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 0; }
+static uint32_t bl_BinkOpenTrack(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkOpenTrack(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 0; }
+static uint32_t bl_BinkPause(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkPause(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 0; }
+static uint32_t bl_BinkClose(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkClose(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 0; }
+static uint32_t bl_BinkGetTrackData(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkGetTrackData(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 0; }
+static uint32_t bl_BinkCloseTrack(Ctx *c, uint32_t *a) { static int k; static int on = -1; if (on < 0) on = getenv("BLUR_AUDIOLOG") != NULL; if (on && k++ < 60) fprintf(stderr, "[bink] BinkCloseTrack(%08x,%08x,%08x) caller=%08x\n", a[0], a[1], a[2], g_api_ret); (void)c; return 0; }
+static uint32_t t_0_(Ctx *c, uint32_t *a) { (void)c; (void)a; return 0; }
+BKR(BinkOpen, h_BinkOpen) BKR(BinkClose, bl_BinkClose) BKR(BinkGetFrameBuffersInfo, h_BinkGetFrameBuffersInfo) BKR(BinkRegisterFrameBuffers, t_0_)
+BKR(BinkDoFrame, h_BinkDoFrame) BKR(BinkNextFrame, h_BinkNextFrame) BKR(BinkWait, t_0_) BKR(BinkShouldSkip, t_0_) BKR(BinkPause, bl_BinkPause)
+BKR(BinkGetRects, t_1) BKR(BinkSetVolume, bl_BinkSetVolume) BKR(BinkOpenTrack, bl_BinkOpenTrack) BKR(BinkGetTrackData, bl_BinkGetTrackData)
+BKR(BinkGetTrackID, bl_BinkGetTrackID) BKR(BinkCloseTrack, bl_BinkCloseTrack)
 static const HleDef real[] = {
-    E(CreateFileA,7), E(CreateFileW,7), E(ReadFile,5), E(WriteFile,5), E(SetFilePointer,4), E(GetFileSize,2), E(GetFileAttributesA,1),
+    E(CreateDirectoryA,2), E(CreateDirectoryW,2), E(CreateFileA,7), E(CreateFileW,7), E(ReadFile,5), E(WriteFile,5), E(SetFilePointer,4), E(GetFileSize,2), E(GetFileAttributesA,1),
     E(FindFirstFileA,2), E(FindNextFileA,2), E(FindClose,1),
     E(GetSystemTime,1), E(GetLocalTime,1), E(GetTimeZoneInformation,1), E(GlobalMemoryStatusEx,1), E(GlobalMemoryStatus,1),
     E(GetCurrentDirectoryA,2), E(GetFullPathNameA,4), E(GetTempPathA,2), E(GetWindowsDirectoryA,2), E(GetSystemDirectoryA,2),
@@ -309,23 +367,28 @@ static const HleDef real[] = {
     { "select", 5, 0, t_m1 }, { "send", 4, 0, t_m1 }, { "sendto", 6, 0, t_m1 }, { "setsockopt", 5, 0, t_m1 }, { "shutdown", 2, 0, t_m1 },
     { "WSAEventSelect", 3, 0, t_m1 }, { "WSAEnumNetworkEvents", 3, 0, t_m1 }, { "WSACloseEvent", 1, 0, t_1 }, { "__WSAFDIsSet", 2, 0, t_0 },
     // Bink video: fake player (opens real files, reports a short black movie so the game's movie states complete)
-    { "_BinkPause@8", 2, 0, t_0 }, { "_BinkSetVolume@12", 3, 0, t_1 }, { "_BinkSetIOSize@4", 1, 0, t_0 }, { "_BinkGetTrackID@8", 2, 0, t_0 },
-    { "_BinkClose@4", 1, 0, t_0 }, { "_BinkCloseTrack@4", 1, 0, t_0 }, { "_BinkRegisterFrameBuffers@8", 2, 0, t_0 }, { "_BinkGetFrameBuffersInfo@8", 2, 0, h_BinkGetFrameBuffersInfo },
-    { "_BinkGetTrackData@8", 2, 0, t_0 }, { "_BinkOpenWaveOut@4", 1, 0, t_1 }, { "_BinkOpen@8", 2, 0, h_BinkOpen }, { "_BinkSetSoundSystem@8", 2, 0, t_1 },
-    { "_BinkOpenDirectSound@4", 1, 0, t_1 }, { "_BinkSetSoundTrack@8", 2, 0, t_1 }, { "_BinkNextFrame@4", 1, 0, h_BinkNextFrame }, { "_BinkShouldSkip@4", 1, 0, t_0 },
-    { "_BinkDoFrame@4", 1, 0, h_BinkDoFrame }, { "_BinkWait@4", 1, 0, t_0 }, { "_BinkGetRects@8", 2, 0, t_1 }, { "_BinkOpenTrack@8", 2, 0, t_0 },
+    { "_BinkPause@8", 2, 0, r_BinkPause }, { "_BinkSetVolume@12", 3, 0, r_BinkSetVolume }, { "_BinkSetIOSize@4", 1, 0, t_0 }, { "_BinkGetTrackID@8", 2, 0, r_BinkGetTrackID },
+    { "_BinkClose@4", 1, 0, r_BinkClose }, { "_BinkCloseTrack@4", 1, 0, r_BinkCloseTrack }, { "_BinkRegisterFrameBuffers@8", 2, 0, r_BinkRegisterFrameBuffers }, { "_BinkGetFrameBuffersInfo@8", 2, 0, r_BinkGetFrameBuffersInfo },
+    { "_BinkGetTrackData@8", 2, 0, r_BinkGetTrackData }, { "_BinkOpenWaveOut@4", 1, 0, bl_BinkOpenWaveOut }, { "_BinkOpen@8", 2, 0, r_BinkOpen }, { "_BinkSetSoundSystem@8", 2, 0, bl_BinkSetSoundSystem },
+    { "_BinkOpenDirectSound@4", 1, 0, bl_BinkOpenDirectSound }, { "_BinkSetSoundTrack@8", 2, 0, bl_BinkSetSoundTrack }, { "_BinkNextFrame@4", 1, 0, r_BinkNextFrame }, { "_BinkShouldSkip@4", 1, 0, r_BinkShouldSkip },
+    { "_BinkDoFrame@4", 1, 0, r_BinkDoFrame }, { "_BinkWait@4", 1, 0, r_BinkWait }, { "_BinkGetRects@8", 2, 0, r_BinkGetRects }, { "_BinkOpenTrack@8", 2, 0, r_BinkOpenTrack },
     // DirectX family: defined failures until the graphics/audio/input phases
     { "Direct3DCreate9", 1, 0, h_Direct3DCreate9 }, { "DirectInput8Create", 5, 0, h_DirectInput8Create }, { "XInputGetState", 2, 0, h_XInputGetState }, { "XInputSetState", 2, 0, t_nodev },
-    { "DirectSoundCreate", 3, 0, t_fail }, { "DirectSoundCreate8", 3, 0, t_fail }, { "DirectSoundEnumerateA", 2, 0, t_fail }, { "DirectSoundEnumerateW", 2, 0, t_fail },
+    { "DirectSoundCreate", 3, 0, h_DirectSoundCreate8 }, { "DirectSoundCreate8", 3, 0, h_DirectSoundCreate8 }, { "DirectSoundEnumerateA", 2, 0, h_DirectSoundEnumerateA }, { "DirectSoundEnumerateW", 2, 0, t_fail },
     // CryptCreateHash etc. and the rest are in the trivial table below
 };
 static const HleDef trivial[] = {
 #include "trivial.inc"
 };
 const HleDef *hle2_lookup(const char *name) {
+    { const HleDef *d = wsock_lookup(name); if (d) return d; }          // virtual-LAN winsock (wsock_hle.c); only active when BLUR_NET_ROOM / BLUR_NET_ID is set, otherwise the placeholder rows below are used
     { const HleDef *d = win_lookup(name); if (d) return d; }
     { const HleDef *d = d3dx_lookup(name); if (d) return d; }
     for (size_t i = 0; i < sizeof real / sizeof real[0]; i++) if (!strcmp(real[i].name, name)) return &real[i];
     for (size_t i = 0; i < sizeof trivial / sizeof trivial[0]; i++) if (!strcmp(trivial[i].name, name)) return &trivial[i];
     return NULL;
 }
+
+// ---- snapshot (see snap_ctx.c): crypto hash contexts hold host pointers and must not exist at the snapshot point ----
+int hle2_snap_busy(void) { int n = 0; for (int i = 0; i < MAXHASH; i++) n += hashes[i].used; return n; }
+void hle2_snap(void (*cb)(void *, void *, size_t), void *u) { cb(u, &packet, sizeof packet); }

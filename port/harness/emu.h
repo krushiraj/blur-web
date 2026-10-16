@@ -4,19 +4,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unicorn/unicorn.h>
 #include <pthread.h>
+#ifdef __EMSCRIPTEN__
+// ---- WebAssembly build (port/web): no Unicorn; guest address == wasm linear-memory address (G == 0) ------------------------------------
+#define G ((uint8_t *)0)
+typedef struct uc_engine uc_engine; typedef struct uc_context uc_context; typedef int uc_err;
+#define UC_ERR_OK 0
+#define UC_PROT_ALL 7
+#define uc_mem_map(uc, a, s, p) (UC_ERR_OK)
+#define uc_strerror(e) "n/a"
+static inline int uc_mem_write(void *uc, uint64_t a, const void *p, size_t n) { (void)uc; memcpy((void *)(uintptr_t)(uint32_t)a, p, n); return 0; }
+static inline int uc_mem_read(void *uc, uint64_t a, void *p, size_t n) { (void)uc; memcpy(p, (const void *)(uintptr_t)(uint32_t)a, n); return 0; }
+#else
+#include <unicorn/unicorn.h>
 
 // All guest memory lives in one flat 4 GB host mapping (guest address A = G + A). Unicorn maps the same bytes (uc_mem_map_ptr) so the boot
 // phase under emulation and the recompiled code see one memory.
 extern uint8_t *G;
 #define uc_mem_map(uc, a, s, p) uc_mem_map_ptr((uc), (a), (s), (p), G + (uint32_t)(a))
+#endif
 
 // ---- guest memory map -------------------------------------------------------
 #define STACK_TOP   0x0f800000u
 #define STACK_SIZE  0x00800000u
 #define HEAP_BASE   0x20000000u
-#define HEAP_SIZE   0x1f000000u   // 496 MB virtual; stays below the VirtualAlloc area at 0x40000000
+#define HEAP_SIZE   0x38000000u   // 896 MB virtual (0x20000000..0x58000000); the VirtualAlloc area starts at 0x58000000
 #define TEB_ADDR    0x7ffdf000u
 #define PEB_ADDR    0x7ffde000u
 #define KUSER_ADDR  0x7ffe0000u
@@ -29,9 +41,13 @@ extern uint8_t *G;
 typedef struct { uint8_t reg, usage, idx, tex; } IOEnt;
 typedef struct { char *glsl; uint32_t glsl_len; int is_ps; uint32_t version; int nin, nout, nsamp; IOEnt in[32], out[32], samp[16]; } ShaderXlat;
 int shader_translate(const uint8_t *code, uint32_t len, ShaderXlat *x);
+#include "shcache.h"
 typedef struct { uint32_t type; int32_t a, b, c, d; } NetInput;
+typedef struct { int active; uint16_t btn; uint8_t lt, rt; int16_t lx, ly, rx, ry; } PadState;      // browser Gamepad -> XInput (input type 6)
+typedef struct { int32_t dx, dy, dz; uint8_t btn[8]; } MouseState;                                  // DirectInput mouse (input types 4, 5, 7)
+extern PadState g_pad; extern MouseState g_mouse;
 int net_start(int port); void net_send(const void *data, size_t n); int net_client_connected(void); int net_poll_input(NetInput *out);
-enum { G_TEX_CREATE = 20, G_TEX_UPLOAD = 21, G_SURF_CREATE = 22, G_BUF_CREATE = 30, G_BUF_UPLOAD = 31, G_SHADER = 40, G_VDECL = 41,
+enum { G_TEX_CREATE = 20, G_TEX_UPLOAD = 21, G_SURF_CREATE = 22, G_BUF_CREATE = 30, G_BUF_UPLOAD = 31, G_SHADER = 40, G_VDECL = 41, G_SHADER_REF = 42,
        G_SET_RS = 50, G_SET_SS = 51, G_SET_TEX = 52, G_SET_VS = 53, G_SET_PS = 54, G_SET_VDECL = 55, G_SET_FVF = 56, G_SET_STREAM = 57, G_SET_INDICES = 58,
        G_SET_VSC = 59, G_SET_PSC = 60, G_SET_VIEWPORT = 61, G_SET_SCISSOR = 62, G_SET_RT = 63, G_SET_DS = 64, G_DRAW = 70, G_DRAW_UP = 71, G_CLEAR = 72,
        G_PRESENT = 73, G_STRETCH = 74, G_SET_VSCI = 75, G_SET_PSCI = 76, G_SET_VSCB = 77, G_SET_PSCB = 78 };
@@ -74,6 +90,7 @@ typedef struct {
     uint32_t handle;
     void *cpu; int rt_started;    // recompiled-code mode: register file and host thread of this guest thread
     pthread_t pth;
+    const char *last_api; uint32_t last_ret, last_a0, last_a1, n_api; uint64_t last_api_us;    // diagnostics: what the thread last called (BLUR_THREADS)
 } Thread;
 
 // A handler can ask the dispatcher to call guest code (e.g. a WndProc) and then resume the original caller.
@@ -105,7 +122,8 @@ static inline uint8_t  rd8 (Ctx *c, uint32_t a) { uint8_t  v = 0; uc_mem_read(c-
 static inline void wr32(Ctx *c, uint32_t a, uint32_t v) { uc_mem_write(c->uc, a, &v, 4); }
 static inline void wr16(Ctx *c, uint32_t a, uint16_t v) { uc_mem_write(c->uc, a, &v, 2); }
 static inline void wr8 (Ctx *c, uint32_t a, uint8_t v)  { uc_mem_write(c->uc, a, &v, 1); }
-static inline void wrbuf(Ctx *c, uint32_t a, const void *p, size_t n) { uc_err e = uc_mem_write(c->uc, a, p, n); if (e != UC_ERR_OK) { static int k; if (k++ < 20) fprintf(stderr, "[mem] guest write failed at %08x size %zu: %s\n", a, n, uc_strerror(e)); } }
+extern uint32_t g_hw_lo, g_hw_hi; extern const char *g_cur_api;
+static inline void wrbuf(Ctx *c, uint32_t a, const void *p, size_t n) { if (g_hw_hi && a < g_hw_hi && a + n > g_hw_lo) fprintf(stderr, "[hostw] %zu bytes at %08x by %s\n", n, a, g_cur_api ? g_cur_api : "?"); uc_err e = uc_mem_write(c->uc, a, p, n); if (e != UC_ERR_OK) { static int k; if (k++ < 20) fprintf(stderr, "[mem] guest write failed at %08x size %zu: %s\n", a, n, uc_strerror(e)); } }
 static inline void rdbuf(Ctx *c, uint32_t a, void *p, size_t n) { uc_err e = uc_mem_read(c->uc, a, p, n); if (e != UC_ERR_OK) { static int k; if (k++ < 20) fprintf(stderr, "[mem] guest read failed at %08x size %zu: %s\n", a, n, uc_strerror(e)); } }
 int  rd_cstr(Ctx *c, uint32_t a, char *out, int max);
 int  rd_wstr(Ctx *c, uint32_t a, char *out, int max);   // UTF-16 -> ASCII (lossy)
@@ -129,6 +147,7 @@ void d3d9_report(Ctx *c);
 void d3d9_set_const(Ctx *c, int ps, int set, uint32_t reg, const void *data, uint32_t nvec);
 void d3d9_get_const_f(int ps, uint32_t reg, float *out);
 Module  *find_module(Ctx *c, const char *name);
+void     load_sigs(const char *path);
 uint32_t load_module(Ctx *c, const char *path, const char *name);
 uint32_t find_export(Ctx *c, Module *m, const char *name);
 uint32_t call_guest(Ctx *c, uint32_t addr, int nargs, const uint32_t *args);
@@ -149,4 +168,5 @@ const HleDef *hle_lookup(const char *name);
 const HleDef *hle2_lookup(const char *name);
 const HleDef *d3dx_lookup(const char *name);
 const HleDef *win_lookup(const char *name);
+const HleDef *wsock_lookup(const char *name);
 extern char g_gamedir[512], g_savedir[512];

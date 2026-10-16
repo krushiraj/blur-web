@@ -105,7 +105,7 @@ H(GlobalAlloc) { return guest_alloc(c, a[1]); }
 H(GlobalFree) { guest_free(c, a[0]); return 0; }
 
 // ---- virtual memory -----------------------------------------------------------------------------
-static uint32_t virt_next = 0x40000000u;
+static uint32_t virt_next = 0x58000000u;
 static struct { uint32_t base, size; } vallocs[4096]; static int nvallocs;
 static void zero_range(Ctx *c, uint32_t addr, uint32_t size) {            // Windows returns zero pages after decommit/release
     static uint8_t z[1 << 16]; for (uint32_t o = 0; o < size; o += sizeof z) { uint32_t n = size - o < sizeof z ? size - o : (uint32_t)sizeof z; uc_mem_write(c->uc, addr + o, z, n); }
@@ -278,6 +278,7 @@ H(OpenEventA) { uint32_t h = named_lookup(c, H_EVENT, a[2], 0); if (!h) set_err(
 H(OpenMutexA) { uint32_t h = named_lookup(c, H_MUTEX, a[2], 0); if (!h) set_err(c, 2); return h; }
 H(CloseHandle) { Handle *o = hp(c, a[0]); if (o && o->type == H_FILE && o->fp) { fclose(o->fp); o->fp = NULL; } return 1; }
 H(SetEvent) { Handle *o = hp(c, a[0]); if (!o) return 0; o->signaled = 1; c->yield_req = 1; return 1; }
+void hle_signal_event(Ctx *c, uint32_t h) { Handle *o = hp(c, h); if (o && o->type == H_EVENT) o->signaled = 1; }
 H(ResetEvent) { Handle *o = hp(c, a[0]); if (!o) return 0; o->signaled = 0; return 1; }
 H(PulseEvent) { UNUSED; return 1; }
 H(ReleaseMutex) { Handle *o = hp(c, a[0]); if (!o) return 0; if (o->count > 0 && --o->count == 0) { o->owner = 0; c->yield_req = 1; } return 1; }     // hand off to a waiting thread
@@ -413,4 +414,11 @@ static const HleDef table[] = {
 const HleDef *hle_lookup(const char *name) {
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) if (!strcmp(table[i].name, name)) return &table[i];
     return hle2_lookup(name);
+}
+
+// ---- snapshot of the host-side state of this file (see snap_ctx.c) ------------------------------------------------
+void hle_snap(void (*cb)(void *, void *, size_t), void *u) {
+    cb(u, &virt_next, sizeof virt_next); cb(u, &nvallocs, sizeof nvallocs); cb(u, vallocs, sizeof vallocs);
+    cb(u, &nfake, sizeof nfake); cb(u, fake_mods, sizeof fake_mods); cb(u, &nnamed, sizeof nnamed); cb(u, named, sizeof named);
+    cb(u, &s_cmdA, 4); cb(u, &s_cmdW, 4); cb(u, &s_envW, 4); cb(u, &s_envA, 4);
 }
