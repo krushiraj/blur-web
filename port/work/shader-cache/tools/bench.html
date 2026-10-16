@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bench</title></head><body>
+<canvas id="c" width="1280" height="720"></canvas>
+<script src="renderer.js"></script>
+<script>
+// Shader cache benchmark: (1) cache parse, (2) the warm-list programs (those the showroom actually drew) linked one by one vs submitted in
+// parallel (KHR_parallel_shader_compile), (3) every GLSL in the cache compiled stand-alone (validation that all translations compile).
+const out = window.out = { done: false };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function main() {
+  const r = new D3D9Renderer(document.getElementById('c'), () => {});
+  out.parallelExt = !!r.ext.par; out.renderer = r.gl.getParameter(r.gl.RENDERER);
+  let t = performance.now(); await r.loadShaderCache(/gz/.test(location.hash) ? 'shaders.bin.gz' : 'shaders.bin'); out.cacheParseMs = performance.now() - t;
+  const warm = await (await fetch('warm.json')).json(); out.warmPrograms = warm.length;
+  let n = 1; const mk = (hk) => { const [lo, hi, len] = hk.split('_').map(Number); r.shaderRef(n++, 0, lo, hi, len); return r.byHk.get(hk); };
+  const mode = (location.hash.slice(1) || 'par').split(':')[0], poll = +(location.hash.split(':')[1] || 4);
+  const pairs = warm.map((w) => [mk(w[0]), mk(w[1]), w[2]]);
+  const gl = r.gl;
+  t = performance.now();
+  if (mode === 'parblock') { for (const [v, p, ck] of pairs) r.programFor(v, p, ck, false); out.submitMs = performance.now() - t; for (const [v, p, ck] of pairs) r.programFor(v, p, ck, true); out.totalMs = performance.now() - t; }
+  else if (mode === 'sync') { for (const [v, p, ck] of pairs) r.programFor(v, p, ck, true); out.totalMs = performance.now() - t; }
+  else {                                                          // submit all, then poll completion without blocking the main thread
+    for (const [v, p, ck] of pairs) r.programFor(v, p, ck, false);
+    out.submitMs = performance.now() - t; let polls = 0;
+    for (;;) { let pending = 0; for (const P of r.programs.values()) if (P && !P.ready && !gl.getProgramParameter(P.prog, r.ext.par ? r.ext.par.COMPLETION_STATUS_KHR : gl.LINK_STATUS)) pending++; polls++; if (!pending) break; await sleep(poll); }
+    out.totalMs = performance.now() - t; out.polls = polls;
+    t = performance.now(); for (const [v, p, ck] of pairs) r.programFor(v, p, ck, true); out.finishMs = performance.now() - t;   // reading status/uniform locations after completion
+  }
+  out.okPrograms = [...r.programs.values()].filter((P) => P && P.ready).length;
+  if (mode === 'all') {
+    // every shader in the cache, compiled stand-alone
+    const keys = [...r.cache.keys()], shs = []; t = performance.now(); let bad = 0; const bads = [];
+    for (const hk of keys) { const e = r.cache.get(hk); const sh = r.decodeShader(0, e.stage, e.glen, e.nin, e.nout, e.nsamp, r.cacheBuf.subarray(e.off, e.off + e.len));
+      const s = gl.createShader(e.stage ? gl.FRAGMENT_SHADER : gl.VERTEX_SHADER); gl.shaderSource(s, sh.glsl.replace('precision mediump float;', 'precision highp float;')); gl.compileShader(s); shs.push([hk, s]); }
+    out.allSubmitMs = performance.now() - t;
+    for (;;) { let pending = 0; for (const [, s] of shs) if (!gl.getShaderParameter(s, r.ext.par ? r.ext.par.COMPLETION_STATUS_KHR : gl.COMPILE_STATUS)) pending++; if (!pending) break; await sleep(10); }
+    out.allMs = performance.now() - t;
+    for (const [hk, s] of shs) if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { bad++; if (bads.length < 5) bads.push([hk, gl.getShaderInfoLog(s).slice(0, 200)]); }
+    out.allShaders = shs.length; out.allBad = bad; out.allBadSamples = bads;
+  }
+  out.done = true;
+}
+main().catch((e) => { out.error = String(e.stack || e); out.done = true; });
+</script></body></html>

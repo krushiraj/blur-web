@@ -1,0 +1,58 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>replay</title></head><body>
+<canvas id="c" width="1280" height="720"></canvas>
+<pre id="log"></pre>
+<script src="renderer.js"></script>
+<script>
+// Deterministic replay of a recorded harness->browser byte stream (BLUR_GFXDUMP) through the renderer.
+// #mode=live  : stream as recorded (full GLSL in G_SHADER messages)
+// #mode=cache : every G_SHADER message is replaced by a G_SHADER_REF looked up in shaders.bin by body content (IO tables + GLSL)
+// extra hash flags: warm (use warm.json prewarm), async
+const params = new URLSearchParams(location.hash.slice(1).replace(/;/g, '&'));
+const mode = params.get('mode') || 'live', url = params.get('url') || 'gfx.dump', every = +(params.get('every') || 0), at = +(params.get('at') || -1);
+const out = window.out = { mode, hashes: [], png: null };
+const logEl = document.getElementById('log'); const log = (m) => { logEl.textContent += m + '\n'; };
+async function main() {
+  const r = window.r = new D3D9Renderer(document.getElementById('c'), log);
+  const t0 = performance.now();
+  if (mode === 'cache') { await r.loadShaderCache('shaders.bin'); if (params.has('warm')) await r.loadWarm('warm.json'); }
+  out.loadMs = performance.now() - t0;
+  let bodyMap = null;
+  if (mode === 'cache') {
+    bodyMap = new Map(); const dec = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192)); return s; };
+    for (const e of r.cache.values()) bodyMap.set(dec(r.cacheBuf.subarray(e.off, e.off + e.len)), e);
+    r.bodyKey = (u8) => { const e = bodyMap.get(dec(u8)); return e ? e.hk : null; };
+  }
+  const res = await fetch(url), rd = res.body.getReader();
+  let carry = new Uint8Array(0), presents = 0, msgs = 0, bytes = 0, misses = 0, maxBatch = 0;
+  const t1 = performance.now();
+  const hashFb = () => { const gl = r.gl, w = 1280, h = 720, px = new Uint8Array(w * h * 4); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px); let hh = 2166136261; for (let i = 0; i < px.length; i += 7) hh = Math.imul(hh ^ px[i], 16777619); return (hh >>> 0).toString(16); };
+  const snap = () => { const c2 = document.createElement('canvas'); c2.width = 1280; c2.height = 720; c2.getContext('2d').drawImage(document.getElementById('c'), 0, 0); return c2.toDataURL('image/png'); };
+  const feed = (u8) => {                                          // u8 holds whole messages
+    const ab = u8.buffer, base = u8.byteOffset, dv = new DataView(ab, base, u8.length); let off = 0;
+    while (off + 8 <= u8.length) {
+      const len = dv.getUint32(off, true), type = dv.getUint32(off + 4, true), p = base + off + 8;
+      if (mode === 'cache' && type === G.SHADER) {
+        const w = new DataView(ab, p, len), body = new Uint8Array(ab, p + 24, len - 25), hk = r.bodyKey(body);
+        if (hk) { const [lo, hi, cl] = hk.split('_').map(Number); r.shaderRef(w.getUint32(0, true), w.getUint32(4, true), lo, hi, cl); } else { misses++; r.handle(type, ab, new DataView(ab), p, len); }
+      } else if (r.handle(type, ab, new DataView(ab), p, len)) { presents++; if (every && presents % every === 0) out.hashes.push([presents, hashFb()]); if (presents === at) { out.atHash = hashFb(); out.png = snap(); } }
+      off += 8 + len; msgs++;
+    }
+    if (params.has('hold')) {}
+  };
+  for (;;) {
+    const { value, done } = await rd.read(); if (done) break;
+    bytes += value.length; let buf = value;
+    if (carry.length) { buf = new Uint8Array(carry.length + value.length); buf.set(carry); buf.set(value, carry.length); }
+    let off = 0, dv = new DataView(buf.buffer, buf.byteOffset, buf.length);
+    while (off + 8 <= buf.length) { const len = dv.getUint32(off, true); if (off + 8 + len > buf.length) break; off += 8 + len; }
+    if (off) { feed(buf.slice(0, off)); }                         // copy so handle() may keep views safely
+    carry = buf.slice(off);
+    if (params.has('maxpresents') && presents >= +params.get('maxpresents')) break;
+  }
+  r.gl.finish();
+  out.replayMs = performance.now() - t1; out.presents = presents; out.msgs = msgs; out.bytes = bytes; out.misses = misses; out.stats = r.stats;
+  out.finalHash = hashFb(); out.done = true;
+}
+main().catch((e) => { out.error = String(e.stack || e); out.done = true; });
+</script></body></html>
