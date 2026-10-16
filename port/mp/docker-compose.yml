@@ -1,0 +1,47 @@
+# Lobby server + coturn (STUN/TURN) + Caddy (TLS termination for wss://). Written, NOT started or built in the prototype.
+#   1. cp deploy/.env.example .env   and fill in DOMAIN, TURN_SECRET, ADMIN_TOKEN, SHARED_SECRET (optional), EXTERNAL_IP
+#   2. docker compose up -d
+# The browser page is then served from https://$DOMAIN/demo/ and talks to wss://$DOMAIN/ws ; TURN at turn:$DOMAIN:3478 / turns:$DOMAIN:5349.
+services:
+  mp:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: 8786
+      HOST: 0.0.0.0
+      TRUST_PROXY: "1"
+      ALLOW_ORIGIN: https://${DOMAIN}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      SHARED_SECRET: ${SHARED_SECRET:-}
+      STUN_URLS: stun:${DOMAIN}:3478
+      TURN_URLS: turn:${DOMAIN}:3478?transport=udp,turns:${DOMAIN}:5349?transport=tcp
+      TURN_SECRET: ${TURN_SECRET}
+      DRAIN_MS: "15000"
+      LOG_LEVEL: info
+    expose: ["8786"]
+    stop_grace_period: 20s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [mp]
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    network_mode: host            # TURN needs the real addresses and a UDP relay port range
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./deploy/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - caddy_data:/certs:ro      # reuse Caddy's certificates for turns:
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

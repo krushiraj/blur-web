@@ -1,0 +1,175 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>virtual-lan test page</title>
+<body>virtual-lan test page (driven by run.js)</body>
+<script type="module">
+import { VirtualLan, ipToNum, numToIp } from '/client/virtual-lan.js';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const now = () => performance.timeOrigin + performance.now();                // wall-clock ms with sub-ms resolution (coarsened to 0.1 ms by the browser)
+const pct = (a, p) => { if (!a.length) return null; const s = Float64Array.from(a).sort(); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+
+let lan = null;
+const T = window.T = {
+  async init({ url, name, forceRelay }) { lan = new VirtualLan({ url, name, forceRelay }); window.lan = lan; await lan.connect(); return lan.id; },
+  async create(opts) { const j = await lan.createRoom(opts); return { code: j.room.code, vip: j.you.vip }; },
+  async join(code) { const j = await lan.joinRoom(code); return { vip: j.you.vip, peers: j.peers.length }; },
+  async waitPeers(n, ms = 10000) { const t0 = performance.now(); while (lan.peers.size < n) { if (performance.now() - t0 > ms) throw new Error('peers ' + lan.peers.size + '/' + n); await sleep(20); } return lan.peerInfo(); },
+  // wait until every peer is on the wanted path ('webrtc' or any non-connecting state)
+  async waitPaths(want, ms = 15000) { const t0 = performance.now(); for (;;) { const pi = lan.peerInfo(); if (pi.every((p) => (want === 'webrtc' ? (p.path === 'webrtc' || p.path === 'viahub') : p.path !== 'connecting'))) return pi; if (performance.now() - t0 > ms) return pi; await sleep(50); } },
+  peerInfo: () => lan.peerInfo(),
+  stats: () => lan.stats(),
+
+  // 60 Hz traffic: every node sends one datagram per tick to every other node (unicast), 200 B (every 60th: 1288 B).
+  async traffic({ startAt, seconds, pps, port = 6000 }) {
+    const sock = lan.socket(port), me = lan.slot, peers = lan.peerInfo();
+    const sentTo = {}, recv = {}; for (const p of peers) { sentTo[p.slot] = 0; recv[p.slot] = { n: 0, lat: [], lastSeq: -1, reorder: 0, dup: 0, seen: new Set() }; }
+    const buf = new Uint8Array(1288), dv = new DataView(buf.buffer); const meta = new Uint32Array(2), rb = new Uint8Array(1500);
+    while (now() < startAt) await sleep(1);
+    const t0 = now(), period = 1000 / pps, total = Math.round(seconds * pps); let seq = 0, polls = 0, maxPollGap = 0, lastPoll = performance.now();
+    const drain = () => {
+      for (;;) {
+        const n = lan.recvInto(sock, rb, meta); if (n < 0) break;
+        const t = now(), v = new DataView(rb.buffer), s = v.getUint8(12), r = recv[s]; if (!r) continue;
+        const sq = v.getUint32(0), lat = t - v.getFloat64(4);
+        if (r.seen.has(sq)) { r.dup++; continue; } r.seen.add(sq);
+        r.n++; r.lat.push(lat); if (sq < r.lastSeq) r.reorder++; else r.lastSeq = sq;
+      }
+    };
+    const poll = setInterval(() => { const p = performance.now(); maxPollGap = Math.max(maxPollGap, p - lastPoll); lastPoll = p; polls++; drain(); }, 2);
+    const cpu0 = performance.now();
+    while (seq < total) {
+      const due = t0 + seq * period; const wait = due - now(); if (wait > 1) { await sleep(wait - 1); continue; }
+      if (wait > 0) continue;                                                       // spin the last millisecond
+      const size = (seq % 60 === 59) ? 1288 : 200;
+      dv.setUint32(0, seq); dv.setFloat64(4, now()); dv.setUint8(12, me);
+      for (const p of peers) { if (lan.send(sock, p.vip, port, buf.subarray(0, size))) sentTo[p.slot]++; }
+      seq++;
+    }
+    await sleep(1500); drain(); clearInterval(poll); drain();                        // let in-flight packets land
+    const out = { me, seconds, pps, sent: sentTo, maxPollGap, flows: {} };
+    for (const [s, r] of Object.entries(recv)) out.flows[s] = { n: r.n, reorder: r.reorder, dup: r.dup, p50: pct(r.lat, 0.5), p90: pct(r.lat, 0.9), p99: pct(r.lat, 0.99), max: pct(r.lat, 1), min: pct(r.lat, 0) };
+    out.stats = lan.stats(); out.lanQueueDrops = out.stats.dropped.queue; lan.closeSocket(sock);
+    return out;
+  },
+
+  // ---- feature tests: everything runs in this page with several VirtualLan instances (each has its own websocket / peer connections)
+  async mk(url, name, opts = {}) { const l = new VirtualLan({ url, name, ...opts }); await l.connect(); return l; },
+  async waitUntil(f, ms = 15000, step = 25) { const t0 = performance.now(); while (!f()) { if (performance.now() - t0 > ms) return false; await sleep(step); } return true; },
+
+  // session resume: drop B's websocket, it must come back with the same id/slot/vip while the data channel keeps flowing
+  async resumeTest({ url }) {
+    const A = await T.mk(url, 'A'), B = await T.mk(url, 'B'); const out = {};
+    const j = await A.createRoom({ name: 'resume', max: 4 }); await B.joinRoom(j.room.code);
+    out.rtc = await T.waitUntil(() => B.peerInfo().every((p) => p.path === 'webrtc') && A.peerInfo().every((p) => p.path === 'webrtc'));
+    const sa = A.socket(9000), sb = B.socket(9000); const before = { id: B.id, slot: B.slot, vip: B.vip };
+    const ev = []; A.on('peer_offline', (id) => ev.push('off:' + id)); A.on('peer_online', (id) => ev.push('on:' + id)); B.on('offline', () => ev.push('B.offline')); B.on('resumed', () => ev.push('B.resumed'));
+    const t0 = performance.now(); B.ws.close();                                              // network drop on B
+    out.sawOffline = await T.waitUntil(() => ev.includes('B.offline'), 3000);
+    A.send(sa, B.vip, 9000, new Uint8Array([1, 2, 3]));                                      // data channel still alive during the outage
+    out.dcDuringOutage = await T.waitUntil(() => B.pending(sb) === 1, 2000);
+    out.resumed = await T.waitUntil(() => ev.includes('B.resumed'), 10000); out.resumeMs = Math.round(performance.now() - t0);
+    out.same = B.id === before.id && B.slot === before.slot && B.vip === before.vip; out.sameVip = B.vip; out.events = ev;
+    A.send(sa, B.vip, 9000, new Uint8Array([4])); B.send(sb, A.vip, 9000, new Uint8Array([5]));
+    out.afterBoth = await T.waitUntil(() => B.pending(sb) === 2 && A.pending(sa) === 1, 3000);
+    out.stillOneRoom = (await A.listRooms()).filter((r) => r.code === j.room.code)[0].players === 2;
+    out.resumes = B.stats().resumes; A.close(); B.close(); return out;
+  },
+
+  // star topology: leaf<->leaf traffic goes through the hub; exactly-once broadcast; fallback when a hub channel is down
+  async starTest({ url, n = 5 }) {
+    const L = []; for (let i = 0; i < n; i++) L.push(await T.mk(url, 'p' + i));
+    const j = await L[0].createRoom({ name: 'star', max: 12, topology: 'star' }); const out = { topology: j.room.topology };
+    for (let i = 1; i < n; i++) await L[i].joinRoom(j.room.code);
+    const hub = L[0]; const leaves = L.slice(1);
+    out.hubLinks = await T.waitUntil(() => hub.peerInfo().length === n - 1 && hub.peerInfo().every((p) => p.path === 'webrtc') && leaves.every((l) => l.peers.get(hub.id) && l.peerInfo().find((p) => p.id === hub.id).path === 'webrtc'));
+    out.leafPaths = leaves.map((l) => l.peerInfo().map((p) => p.path).sort().join('/'));
+    out.rtcCountLeaf = leaves.map((l) => l.peerInfo().filter((p) => p.path === 'webrtc').length);          // 1 each: only the hub
+    const socks = L.map((l) => l.socket(7000)), enc = new TextEncoder(), dec = new TextDecoder(), rd = (l, s) => { const r = []; for (let m = l.recv(s); m; m = l.recv(s)) r.push(m); return r; };
+    leaves[0].send(socks[1], leaves[2].vip, 7000, enc.encode('L2L')); await T.waitUntil(() => leaves[2].pending(socks[3]) >= 1, 3000);
+    const got = rd(leaves[2], socks[3]); out.l2l = got.length === 1 && got[0].srcIp === leaves[0].vip && dec.decode(got[0].data) === 'L2L'; out.hubFwdCount = hub.stats().hubFwd;
+    leaves[0].send(socks[1], '255.255.255.255', 7000, enc.encode('BC')); await sleep(400);
+    out.bcast = L.map((l, i) => rd(l, socks[i]).filter((m) => dec.decode(m.data) === 'BC').length);          // expect 1 for everybody (sender: its own loopback)
+    leaves[1].send(socks[2], hub.vip, 7000, enc.encode('UP')); hub.send(socks[0], leaves[1].vip, 7000, enc.encode('DOWN')); await sleep(300);
+    out.updown = [rd(hub, socks[0]).length, rd(leaves[1], socks[2]).length];
+    // fallback 1: leaf0's hub channel is down -> leaf0 uses the server relay for everything
+    const l0hub = leaves[0].peers.get(hub.id); l0hub.dc.close(); await T.waitUntil(() => !leaves[0]._rtcOpen(l0hub), 2000);
+    leaves[0].send(socks[1], leaves[3].vip, 7000, enc.encode('FB1')); await T.waitUntil(() => leaves[3].pending(socks[4]) >= 1, 3000);
+    out.fb1 = rd(leaves[3], socks[4]).map((m) => m.srcIp === leaves[0].vip);
+    // fallback 2: hub->leaf2 channel is down on the hub side only -> the hub forwards through the server (host-only FWD, source preserved)
+    const hubL2 = hub.peers.get(leaves[1].id); hubL2.dc.close(); await T.waitUntil(() => !hub._rtcOpen(hubL2), 2000);
+    leaves[2].send(socks[3], leaves[1].vip, 7000, enc.encode('FB2')); await T.waitUntil(() => leaves[1].pending(socks[2]) >= 1, 3000);
+    const fb2 = rd(leaves[1], socks[2]); out.fb2 = fb2.length === 1 && fb2[0].srcIp === leaves[2].vip;
+    out.hubStats = { hubFwd: hub.stats().hubFwd, spoof: hub.stats().dropped.spoof };
+    // host migration in a star: the hub leaves, the next lowest slot becomes the hub and links are rebuilt to it
+    await hub.leaveRoom(); const newHub = L[1];
+    out.migrated = await T.waitUntil(() => newHub.isHost && newHub.peerInfo().length === n - 2 && newHub.peerInfo().every((p) => p.path === 'webrtc'), 15000);
+    const s2 = L[2].socket(7100), s3 = L[3].socket(7100);
+    out.afterMigrate = await T.waitUntil(() => { L[2].send(s2, L[3].vip, 7100, enc.encode('AFTER')); return L[3].pending(s3) >= 1; }, 8000, 200);
+    for (const l of L) l.close(); return out;
+  },
+
+  // moderation: host kicks + bans a guest; the guest sees `kicked`, cannot rejoin; unban lets it back
+  async kickTest({ url }) {
+    const H = await T.mk(url, 'H'), G = await T.mk(url, 'G'), X = await T.mk(url, 'X'); const out = {}; const j = await H.createRoom({ name: 'k', max: 6 }); await G.joinRoom(j.room.code); await X.joinRoom(j.room.code);
+    let kicked = null; G.on('kicked', (m) => { kicked = m; }); let left = null; X.on('peer_left', (m) => { left = m; });
+    try { await X.kick(G.id); out.guestKickDenied = false; } catch (e) { out.guestKickDenied = e.code === 'not_host'; }
+    await H.kick(G.id, { ban: true, reason: 'bye' }); out.kicked = await T.waitUntil(() => kicked, 2000) && kicked.reason === 'bye'; out.peerLeft = await T.waitUntil(() => left, 2000) && left.reason === 'kicked';
+    const G2 = await T.mk(url, 'G2'); try { await G2.joinRoom(j.room.code); out.rejoin = 'allowed'; } catch (e) { out.rejoin = e.code; }
+    out.bans = await H.bans(); out.unban = await H.unban(out.bans[0]); try { await G2.joinRoom(j.room.code); out.rejoinAfterUnban = 'allowed'; } catch (e) { out.rejoinAfterUnban = e.code; }
+    for (const l of [H, G, X, G2]) l.close(); return out;
+  },
+
+  // Talks to a NATIVE harness instance (wsock_hle in native/native_peer.c) that joined the same room through the UDP gateway.
+  async interop({ pings = 20 }) {
+    const sock = lan.socket(50001), r = { discovery: null, pongs: 0, pingLatMs: [], announce: false };
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    for (let i = 0; i < 200 && lan.peers.size < 1; i++) await sleep(50);
+    const native = lan.peerInfo()[0]; r.nativePeer = native;
+    const q = new Uint8Array(24); q.set(enc.encode('QUERY')); const t0 = performance.now(); lan.send(sock, '255.255.255.255', 50001, q);
+    while (performance.now() - t0 < 2000 && !r.discovery) {
+      const m = lan.recv(sock);
+      if (m && m.data.length === 160 && dec.decode(m.data.subarray(0, 5)) === 'REPLY') r.discovery = { from: m.srcIp, ms: performance.now() - t0, name: dec.decode(m.data.subarray(8, 40)).replace(/\0.*/, '') }; else await sleep(2);
+    }
+    const sent = new Map();
+    for (let i = 0; i < pings; i++) {
+      const b = new Uint8Array(40); b.set(enc.encode('PING')); new DataView(b.buffer).setUint32(4, i); sent.set(i, performance.now()); lan.send(sock, native.vip, 50001, b);
+      for (const tEnd = performance.now() + 50; performance.now() < tEnd; await sleep(1)) for (let m = lan.recv(sock); m; m = lan.recv(sock)) if (m.data.length === 40) { r.pongs++; r.pingLatMs.push(performance.now() - sent.get(new DataView(m.data.buffer, m.data.byteOffset).getUint32(4))); }
+    }
+    lan.send(sock, native.vip, 50001, enc.encode('START'));
+    const t1 = performance.now(); while (performance.now() - t1 < 1500 && !r.announce) { const m = lan.recv(sock); if (m && dec.decode(m.data) === 'NATIVE-ANNOUNCE') r.announce = { from: m.srcIp }; else await sleep(5); }
+    r.pingLatMs = { p50: pct(r.pingLatMs, 0.5), p99: pct(r.pingLatMs, 0.99), n: r.pingLatMs.length };
+    return r;
+  },
+
+  // Emulates the game's EnumerateLanGames: broadcast a 24-byte query to 255.255.255.255:50001, accept replies for 2.0 s, keep at most 10 hosts.
+  async discovery({ url, hosts, forceRelay, windowMs = 2000, lateHost = true }) {
+    const code = (await T.create({ name: 'disc', public: false, max: 20 })).code;
+    const hs = [];
+    for (let i = 0; i < hosts; i++) {
+      const h = new VirtualLan({ url, name: 'host' + i, forceRelay }); await h.connect(); await h.joinRoom(code); const s = h.socket(50001);
+      hs.push({ h, s, i, delayMs: 0 });
+    }
+    for (let i = 0; i < 100 && lan.peers.size < hosts; i++) await sleep(50);
+    await T.waitPaths(forceRelay ? 'any' : 'webrtc', 20000);
+    for (let i = 0; i < 100 && hs.some((x) => x.h.peers.size < hosts); i++) await sleep(50);
+    if (!forceRelay) for (let i = 0; i < 200 && hs.some((x) => x.h.peerInfo().some((p) => p.path !== 'webrtc')); i++) await sleep(50);
+    const reply = new Uint8Array(160); reply.set([0x00, 0, 0, 0x0f]);
+    const answer = setInterval(() => { for (const x of hs) { const m = x.h.recv(x.s); if (m && m.data.length === 24) { reply[4] = x.i; if (lateHost && x.i === hosts - 1) setTimeout(() => x.h.send(x.s, m.srcIp, m.srcPort, reply), windowMs + 150); else x.h.send(x.s, m.srcIp, m.srcPort, reply); } } }, 2);
+    const sock = lan.socket(50001), q = new Uint8Array(24); q.set([0x0f, 0, 0, 0]);
+    const t0 = performance.now(); lan.send(sock, '255.255.255.255', 50001, q);
+    const list = [], times = []; let seen = 0, selfQuery = false, late = 0;
+    while (performance.now() - t0 < windowMs + 600) {
+      const m = lan.recv(sock);
+      if (!m) { await sleep(2); continue; }
+      const dt = performance.now() - t0;
+      if (m.data.length === 24) { selfQuery = true; continue; }                  // our own broadcast looped back
+      if (dt > windowMs) { late++; continue; }                                    // window closed
+      seen++; times.push(dt);
+      if (list.length < 10) list.push({ slot: m.data[4], ip: m.srcIp });         // the game's list is capped at 10
+    }
+    clearInterval(answer); for (const x of hs) x.h.close(); lan.closeSocket(sock);
+    return { hosts, seenInWindow: seen, accepted: list.length, late, selfQueryLoopback: selfQuery, firstMs: Math.min(...times), lastMs: Math.max(...times), windowMs };
+  },
+};
+window.TREADY = true;
+</script>

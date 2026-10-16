@@ -1,0 +1,21 @@
+# Caddy terminates TLS (automatic Let's Encrypt) and proxies HTTP + WebSocket to the lobby server. wss:// is mandatory for pages served over https.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# keep the admin API and metrics off the public internet (use an SSH tunnel or an allow-listed IP)
+	@private path /admin/* /metrics /metrics.json
+	handle @private {
+		@local remote_ip 127.0.0.1 ::1
+		reverse_proxy @local mp:8786
+		respond "forbidden" 403
+	}
+
+	# websocket + api + static client/demo all live on the one upstream; Caddy forwards the Upgrade headers automatically
+	handle {
+		reverse_proxy mp:8786 {
+			header_up X-Forwarded-For {remote_host}
+			health_uri /health
+			health_interval 15s
+		}
+	}
+}

@@ -1,0 +1,4 @@
+node_modules
+.git
+test/browser/results-*.json
+test/browser/run-*.log

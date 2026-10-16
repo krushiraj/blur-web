@@ -1,0 +1,21 @@
+{
+  "name": "blur-mp",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Virtual-LAN lobby, signalling and datagram relay for the Blur browser port (prototype)",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test --test-timeout=30000 server/test/*.test.js",
+    "test:browser": "node test/browser/run.js",
+    "test:interop": "node native/run_interop.js",
+    "test:demo": "node test/browser/demo-smoke.js",
+    "test:wasm": "node native/run_wasm_hle.js",
+    "test:features": "node test/browser/features.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.14.0"
+  }
+}

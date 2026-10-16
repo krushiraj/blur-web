@@ -1,0 +1,21 @@
+# systemd unit for a bare VPS without Docker: /etc/systemd/system/blur-mp.service
+[Unit]
+Description=Blur virtual-LAN lobby server
+After=network.target
+
+[Service]
+User=blurmp
+WorkingDirectory=/opt/blur-mp
+Environment=PORT=8786 HOST=127.0.0.1 TRUST_PROXY=1 DRAIN_MS=15000 LOG_LEVEL=info
+EnvironmentFile=/etc/blur-mp.env
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+KillSignal=SIGTERM
+TimeoutStopSec=25
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

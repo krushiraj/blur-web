@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blur virtual LAN demo</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --fg:#e6e8eb; --dim:#8b93a1; --acc:#ff8a3d; --ok:#4cc38a; --bad:#ef5b5b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0 12px 0 0; letter-spacing:.04em; }
+  main { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; padding:12px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; min-width:0; }
+  h2 { font-size:13px; margin:0 0 8px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); }
+  input, button { font:inherit; color:var(--fg); background:#252932; border:1px solid var(--line); border-radius:4px; padding:5px 8px; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); } button:disabled { opacity:.4; cursor:default; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:3px 6px; border-bottom:1px solid var(--line); } th { color:var(--dim); font-weight:500; }
+  .pill { padding:1px 7px; border-radius:9px; font-size:12px; background:#2b303a; } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  pre { margin:0; max-height:240px; overflow:auto; font:12px/1.4 ui-monospace, Menlo, monospace; color:#c4cad4; white-space:pre-wrap; }
+  .dim { color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>BLUR / VIRTUAL LAN</h1>
+  <label>Name <input id="name" size="10" value=""></label>
+  <label><input type="checkbox" id="relay"> force relay (no WebRTC)</label>
+  <button id="connect">Connect</button>
+  <span id="status" class="dim">disconnected</span>
+</header>
+<main>
+  <section>
+    <h2>Rooms</h2>
+    <div class="row"><button id="refresh" disabled>Refresh</button><span class="dim">auto-refresh every 3 s</span></div>
+    <table id="rooms"><thead><tr><th>Code</th><th>Name</th><th>Host</th><th>Players</th><th>Topology</th><th></th></tr></thead><tbody></tbody></table>
+    <div class="row" style="margin-top:10px">
+      <input id="rname" placeholder="room name" size="14"> <input id="rmax" type="number" min="2" max="20" value="8" style="width:56px" title="max players">
+      <input id="rpw" placeholder="password (optional)" size="14"> <label><input type="checkbox" id="rpub" checked> public</label> <select id="rtopo" title="topology"><option value="">auto</option><option>mesh</option><option>star</option></select>
+      <button id="create" disabled>Create room</button>
+    </div>
+    <div class="row"><input id="jcode" placeholder="code" size="7"> <input id="jpw" placeholder="password" size="10"> <button id="join" disabled>Join by code</button></div>
+  </section>
+  <section>
+    <h2>My room</h2>
+    <div id="myroom" class="dim">not in a room</div>
+    <div class="row"><button id="leave" disabled>Leave</button></div>
+    <table id="peers"><thead><tr><th>Peer</th><th>Virtual IP</th><th>Path</th><th>Tx / Rx</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+  <section>
+    <h2>Datagram ping-pong (UDP port 7000, like a game socket)</h2>
+    <div class="row"><button id="ping" disabled>Unicast ping all</button> <button id="bcast" disabled>Broadcast (255.255.255.255:7000)</button>
+      <label>stream <input type="checkbox" id="stream"> 60 Hz</label></div>
+    <div class="row dim">size <input id="size" type="number" value="200" min="1" max="1288" style="width:70px"> B (cap 1288)</div>
+    <pre id="pong"></pre>
+  </section>
+  <section>
+    <h2>LAN discovery (EnumerateLanGames emulation)</h2>
+    <div class="row"><button id="host" disabled>Answer discovery queries (be a host)</button> <button id="scan" disabled>Scan (2.0 s window, max 10)</button></div>
+    <pre id="scanout"></pre>
+  </section>
+  <section style="grid-column:1/-1">
+    <h2>Log</h2><pre id="log"></pre>
+  </section>
+</main>
+<script type="module">
+import { VirtualLan, MAX_PAYLOAD } from '../client/virtual-lan.js';
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+$('name').value = 'player' + Math.floor(Math.random() * 900 + 100);
+let lan = null, sock = 0, streamTimer = null, hosting = false, pollTimer = null, seq = 0;
+const log = (...a) => { const l = $('log'); l.textContent = (new Date().toLocaleTimeString() + ' ' + a.join(' ') + '\n' + l.textContent).slice(0, 8000); };
+const set = (ids, on) => ids.forEach((i) => ($(i).disabled = !on));
+
+$('connect').onclick = async () => {
+  if (lan) { lan.close(); lan = null; return; }
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  lan = new VirtualLan({ url, name: $('name').value, forceRelay: $('relay').checked });
+  lan.on('closed', () => { $('status').textContent = 'disconnected'; $('status').className = 'dim'; $('connect').textContent = 'Connect'; set(['refresh', 'create', 'join', 'leave', 'ping', 'bcast', 'host', 'scan'], false); clearInterval(pollTimer); lan = null; });
+  lan.on('room', () => { renderRoom(); startGameSocket(); });
+  lan.on('peer_joined', (p) => { log('peer joined', p.name, p.vip, p.relayOnly ? '(native, relay only)' : ''); renderRoom(); });
+  lan.on('peer_left', (p) => { log('peer left', p.id); renderRoom(); });
+  lan.on('host_changed', () => { log('host changed'); renderRoom(); });
+  lan.on('kicked', (m) => { log('you were kicked:', m.reason); renderRoom(); });
+  lan.on('offline', () => { log('connection lost - trying to resume your slot'); $('status').textContent = 'reconnecting...'; });
+  lan.on('resumed', () => { log('session resumed as', lan.vip); $('status').textContent = 'connected as ' + lan.id; renderRoom(); });
+  lan.on('peer_offline', (id) => log('peer offline (grace period)', id));
+  lan.on('peer_online', (id) => log('peer back', id));
+  lan.on('shutdown', (m) => log('server is shutting down in', m.inMs, 'ms'));
+  lan.on('transport', (t) => { log('transport', t.peer, t.state); renderRoom(); });
+  try { await lan.connect(); } catch (e) { log('connect failed', e.message); lan = null; return; }
+  $('status').textContent = 'connected as ' + lan.id; $('status').className = 'ok'; $('connect').textContent = 'Disconnect';
+  set(['refresh', 'create', 'join'], true); refreshRooms();
+  pollTimer = setInterval(() => { if (lan) { if (!lan.room) refreshRooms(); renderRoom(true); } }, 3000);
+};
+async function refreshRooms() {
+  if (!lan) return; let rooms = []; try { rooms = await lan.listRooms(); } catch (e) { return log('list failed', e.message); }
+  const tb = $('rooms').querySelector('tbody'); tb.textContent = '';
+  for (const r of rooms) {
+    const tr = tb.insertRow(); tr.insertCell().textContent = r.code; tr.insertCell().textContent = r.name; tr.insertCell().textContent = r.host;
+    tr.insertCell().textContent = `${r.players}/${r.max}` + (r.hasPassword ? ' (pw)' : ''); tr.insertCell().textContent = r.topology;
+    const b = document.createElement('button'); b.textContent = 'Join'; b.disabled = !!lan.room || r.players >= r.max;
+    b.onclick = async () => { let pw = ''; if (r.hasPassword) pw = prompt('Password for ' + r.name) || ''; join(r.code, pw); }; tr.insertCell().appendChild(b);
+  }
+  if (!rooms.length) { const tr = tb.insertRow(); const td = tr.insertCell(); td.colSpan = 6; td.className = 'dim'; td.textContent = 'no public rooms'; }
+}
+async function join(code, pw) { try { await lan.joinRoom(code, pw); log('joined', code); } catch (e) { log('join failed:', e.code || e.message); } }
+$('refresh').onclick = refreshRooms;
+$('create').onclick = async () => { try { const j = await lan.createRoom({ name: $('rname').value || undefined, max: +$('rmax').value, password: $('rpw').value, public: $('rpub').checked, topology: $('rtopo').value || undefined }); log('created', j.room.code); } catch (e) { log('create failed:', e.code || e.message); } };
+$('join').onclick = () => join($('jcode').value.trim().toUpperCase(), $('jpw').value);
+$('leave').onclick = async () => { clearInterval(streamTimer); $('stream').checked = false; hosting = false; sock = 0; await lan.leaveRoom(); renderRoom(); refreshRooms(); };
+
+function renderRoom(quiet) {
+  const inRoom = lan && lan.room; set(['leave', 'ping', 'bcast', 'host', 'scan'], !!inRoom); if (lan) set(['create', 'join'], !inRoom);
+  if (!inRoom) { $('myroom').textContent = 'not in a room'; $('peers').querySelector('tbody').textContent = ''; return; }
+  $('myroom').innerHTML = `<b>${lan.room.name}</b> <span class="pill">${lan.topology}</span> &nbsp;<span class="pill">${lan.room.code}</span> you are <b>${lan.vip}</b> (slot ${lan.slot})${lan.isHost ? ' <span class="pill ok">host</span>' : ''}${lan.room.hasPassword ? ' <span class="pill">password</span>' : ''} &nbsp;<span class="dim">server RTT ${lan.stat.rttMs.toFixed(1)} ms</span>`;
+  const tb = $('peers').querySelector('tbody'); tb.textContent = '';
+  for (const p of lan.peerInfo()) { const tr = tb.insertRow(); tr.insertCell().textContent = p.name + (p.id === lan.hostId ? ' (host)' : ''); tr.insertCell().textContent = p.vip; const c = tr.insertCell(); c.textContent = p.path; c.className = p.path === 'webrtc' ? 'ok' : p.path === 'connecting' ? 'dim' : ''; tr.insertCell().textContent = `${p.tx} / ${p.rx}`; const kc = tr.insertCell(); if (lan.isHost) { const kb = document.createElement('button'); kb.textContent = 'Kick'; kb.onclick = () => lan.kick(p.id, { ban: confirm('Also ban this IP?'), reason: 'kicked by host' }).catch((e) => log('kick failed', e.code)); kc.appendChild(kb); } }
+}
+
+// --- one game-like UDP socket on port 7000 for ping-pong, one on 50001 for discovery
+let gsock = 0, dsock = 0;
+function startGameSocket() {
+  gsock = lan.socket(7000, { reuse: true }); dsock = lan.socket(50001, { reuse: true });
+  clearInterval(pollTimer); pollTimer = setInterval(pump, 4); setInterval(() => lan && renderRoom(true), 2000);
+}
+function pump() {
+  if (!lan || !lan.room) return;
+  for (let m = lan.recv(gsock); m; m = lan.recv(gsock)) {
+    const t = dec.decode(m.data.subarray(0, 4));
+    if (t === 'PING') { const r = m.data.slice(); r.set(enc.encode('PONG')); lan.send(gsock, m.srcIp, m.srcPort, r); }
+    else if (t === 'PONG') { const rtt = performance.now() - new DataView(m.data.buffer, m.data.byteOffset).getFloat64(8); out('pong', `from ${m.srcIp}  ${m.data.length} B  rtt ${rtt.toFixed(1)} ms`); }
+    else out('rx', `${m.srcIp}:${m.srcPort}  ${m.data.length} B  "${dec.decode(m.data.subarray(0, 24)).replace(/[^\x20-\x7e]/g, '.')}"`);
+  }
+  for (let m = lan.recv(dsock); m; m = lan.recv(dsock)) {
+    if (m.data.length === 24 && dec.decode(m.data.subarray(0, 5)) === 'QUERY') { if (hosting) { const rep = new Uint8Array(160); rep.set(enc.encode('REPLY')); rep.set(enc.encode($('name').value), 8); lan.send(dsock, m.srcIp, m.srcPort, rep); out('scan', `answered query from ${m.srcIp}`); } }
+    else if (m.data.length === 160 && scanning) { const name = dec.decode(m.data.subarray(8, 40)).replace(/\0.*/, ''); if (scanList.length < 10) { scanList.push({ ip: m.srcIp, name }); } else scanDropped++; }
+  }
+}
+function out(kind, s) { const el = kind === 'scan' ? $('scanout') : $('pong'); el.textContent = (s + '\n' + el.textContent).slice(0, 6000); }
+function pingPayload() { const n = Math.max(24, Math.min(MAX_PAYLOAD, +$('size').value || 200)); const b = new Uint8Array(n); b.set(enc.encode('PING')); const v = new DataView(b.buffer); v.setUint32(4, seq++); v.setFloat64(8, performance.now()); return b; }
+$('ping').onclick = () => { for (const p of lan.peerInfo()) lan.send(gsock, p.vip, 7000, pingPayload()); out('tx', 'sent unicast PING to ' + lan.peers.size + ' peer(s)'); };
+$('bcast').onclick = () => { lan.send(gsock, '255.255.255.255', 7000, pingPayload()); out('tx', 'broadcast PING'); };
+$('stream').onchange = () => { clearInterval(streamTimer); if ($('stream').checked) streamTimer = setInterval(() => { for (const p of lan.peerInfo()) lan.send(gsock, p.vip, 7000, pingPayload()); }, 1000 / 60); };
+$('host').onclick = () => { hosting = !hosting; $('host').textContent = hosting ? 'Stop answering (hosting)' : 'Answer discovery queries (be a host)'; };
+let scanning = false, scanList = [], scanDropped = 0;
+$('scan').onclick = () => {
+  scanList = []; scanDropped = 0; scanning = true; $('scanout').textContent = 'scanning for 2.0 s...'; const t0 = performance.now();
+  const q = new Uint8Array(24); q.set(enc.encode('QUERY')); lan.send(dsock, '255.255.255.255', 50001, q);
+  setTimeout(() => { scanning = false; $('scanout').textContent = `${((performance.now() - t0) / 1000).toFixed(1)} s window closed: ${scanList.length} host(s)` + (scanDropped ? ` (+${scanDropped} over the 10-host cap)` : '') + '\n' + scanList.map((h) => `  ${h.ip}  ${h.name}`).join('\n'); }, 2000);
+};
+</script>
+</body>
+</html>
