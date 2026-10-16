@@ -41,15 +41,56 @@ static FreeList *freelist_for(uint32_t cap, int create) {
     for (int i = 0; i < nfree_lists; i++) if (free_lists[i].cap == cap) return &free_lists[i];
     if (!create || nfree_lists >= HEAP_CLASSES) return NULL; FreeList *f = &free_lists[nfree_lists++]; memset(f, 0, sizeof *f); f->cap = cap; return f;
 }
+// BLUR_HEAPCHK=1: every guest_alloc'd block gets HC_PAD canary bytes after its requested size; they are checked on free, every ~300 frames
+// (heapchk_scan from Present) and at exit/crash. A corrupted block is reported once with the API call that allocated it.
+#define HC_PAD 32
+typedef struct { uint32_t p, size, ret; const char *api; } HcEnt;
+static HcEnt *hc_ents; static size_t hc_n, hc_cap; static int hc_on = -1;
+extern const char *g_cur_api; extern uint32_t g_api_ret;
+static int hc_enabled(void) { if (hc_on < 0) hc_on = getenv("BLUR_HEAPCHK") != NULL; return hc_on; }
+static int hc_check(Ctx *c, HcEnt *e, const char *when) {
+    if (!e->p) return 0; uint8_t b[HC_PAD]; rdbuf(c, e->p + e->size, b, HC_PAD); int bad = 0; for (int i = 0; i < HC_PAD; i++) if (b[i] != 0xAB) bad++;
+    if (!bad) return 0;
+    fprintf(stderr, "[heapchk] OVERRUN of block %08x size=%u (alloc by %s ret=%08x) found %s: %d/%d canary bytes changed:", e->p, e->size, e->api ? e->api : "?", e->ret, when, bad, HC_PAD);
+    for (int i = 0; i < HC_PAD; i++) fprintf(stderr, " %02x", b[i]); fprintf(stderr, "\n"); e->p = 0; return 1;
+}
+int heapchk_scan(Ctx *c, const char *when) {
+    if (!hc_enabled()) return 0; int bad = 0;
+    for (size_t i = 0; i < hc_n; i++) { HcEnt *e = &hc_ents[i]; if (e->p && rd32(c, e->p - 12) && rd32(c, e->p - 16) == e->size) bad += hc_check(c, e, when); }
+    if (!strcmp(when, "at exit")) fprintf(stderr, "[heapchk] %zu allocations tracked, %d overruns reported in the final scan\n", hc_n, bad);
+    return bad;
+}
+// BLUR_STRICT=1: log (first 5 per api+reason) every call where real Windows/D3D9 would fail but this HLE reports success, or where an argument is suspicious
+void strict_log(const char *api, const char *why, uint32_t v0, uint32_t v1) {
+    static int on = -1; static struct { const char *api, *why; int n; } seen[256]; static int ns;
+    if (on < 0) on = getenv("BLUR_STRICT") != NULL; if (!on) return;
+    for (int i = 0; i < ns; i++) if (seen[i].api == api && seen[i].why == why) { if (++seen[i].n > 5) return; goto print; }
+    if (ns < 256) { seen[ns].api = api; seen[ns].why = why; seen[ns].n = 1; ns++; }
+print: fprintf(stderr, "[strict] %s: %s (%08x, %08x) ret=%08x\n", api, why, v0, v1, g_api_ret);
+}
+// BLUR_HEAPDBG: freed blocks are poisoned (0xdd), never reused, and logged (with BLUR_HEAPCHK also the allocation site) so a crash can say "this pointer was freed by <api ret> thread N"
+typedef struct { uint32_t p, size, cap, free_ret; const char *free_api; uint32_t alloc_ret; const char *alloc_api; int thr; } FreeEnt;
+static FreeEnt *fd; static size_t fd_n, fd_cap;
+void heapdbg_describe(Ctx *c, uint32_t v, const char *tag) {
+    (void)c; for (size_t i = fd_n; i-- > 0; ) if (v >= fd[i].p && v < fd[i].p + fd[i].cap) { FreeEnt *f = &fd[i];
+        fprintf(stderr, "[heapdbg] %s=%08x lies in FREED block %08x (+%x) size=%u: freed by %s ret=%08x thread %d; allocated by %s ret=%08x\n", tag, v, f->p, v - f->p, f->size, f->free_api ? f->free_api : "?", f->free_ret, f->thr, f->alloc_api ? f->alloc_api : "?(use BLUR_HEAPCHK=1)", f->alloc_ret); return; }
+}
 uint32_t guest_alloc(Ctx *c, uint32_t size) {
-    uint32_t cap = heap_class_size(size ? size : 1), p; FreeList *fl = freelist_for(cap, 0);
+    if (size > 0x7f000000u) { strict_log("guest_alloc", "request > 2 GB (rounding would wrap)", size, 0); return 0; }
+    uint32_t rsize = hc_enabled() ? size + HC_PAD : size;
+    uint32_t cap = heap_class_size(rsize ? rsize : 1), p; FreeList *fl = freelist_for(cap, 0);
     if (fl && fl->n) p = fl->v[--fl->n];
     else {
-        if (c->heap_next + cap + 16 > HEAP_BASE + HEAP_SIZE) { fprintf(stderr, "guest heap exhausted (%u MB used)\n", (c->heap_next - HEAP_BASE) >> 20); return 0; }
+        if (cap > HEAP_SIZE || c->heap_next + cap + 16 > HEAP_BASE + HEAP_SIZE) { fprintf(stderr, "guest heap exhausted (%u MB used)\n", (c->heap_next - HEAP_BASE) >> 20); return 0; }
         p = c->heap_next + 16; c->heap_next += cap + 16; c->heap_next = (c->heap_next + 15) & ~15u;
     }
     static uint8_t z[1 << 16]; for (uint32_t o = 0; o < cap; o += sizeof z) uc_mem_write(c->uc, p + o, z, cap - o < sizeof z ? cap - o : sizeof z);   // always zero-filled
     wr32(c, p - 16, size); wr32(c, p - 12, cap);
+    if (hc_enabled()) {
+        uint8_t pad[HC_PAD]; memset(pad, 0xAB, sizeof pad); wrbuf(c, p + size, pad, HC_PAD);
+        if (hc_n == hc_cap) { hc_cap = hc_cap ? hc_cap * 2 : 1 << 16; hc_ents = realloc(hc_ents, hc_cap * sizeof *hc_ents); }
+        hc_ents[hc_n++] = (HcEnt){ p, size, g_api_ret, g_cur_api };
+    }
     return p;
 }
 void guest_free(Ctx *c, uint32_t p) {
@@ -57,7 +98,12 @@ void guest_free(Ctx *c, uint32_t p) {
     { static int nf = -1; if (nf < 0) nf = getenv("BLUR_NOFREE") != NULL; if (nf) return; }      // debugging: never reuse memory (finds use-after-free)
     uint32_t cap = rd32(c, p - 12); if (!cap) return;                 // double free / foreign pointer
     FreeList *fl = freelist_for(cap, 1); if (!fl) return;
+    HcEnt fe = { p, rd32(c, p - 16), 0, "?" };
+    if (hc_enabled()) { for (size_t i = hc_n; i-- > 0 && i + 4096 > hc_n; ) if (hc_ents[i].p == p) { fe = hc_ents[i]; hc_ents[i].p = 0; break; } hc_check(c, &fe, "at free"); }
     wr32(c, p - 12, 0);
+    { static int dbg = -1; if (dbg < 0) dbg = getenv("BLUR_HEAPDBG") != NULL;
+      if (dbg) { if (fd_n == fd_cap) { fd_cap = fd_cap ? fd_cap * 2 : 1 << 16; fd = realloc(fd, fd_cap * sizeof *fd); } fd[fd_n++] = (FreeEnt){ p, fe.size, cap, g_api_ret, g_cur_api, fe.ret, fe.api, c->cur };
+        static uint8_t z[1 << 16]; memset(z, 0xdd, sizeof z); for (uint32_t o = 0; o < cap; o += sizeof z) uc_mem_write(c->uc, p + o, z, cap - o < sizeof z ? cap - o : sizeof z); return; } }
     if (fl->n == fl->alloc) { fl->alloc = fl->alloc ? fl->alloc * 2 : 64; fl->v = realloc(fl->v, fl->alloc * 4); }
     fl->v[fl->n++] = p;
 }
@@ -158,7 +204,7 @@ Thread *cur_thread(Ctx *c) { return &c->threads[c->cur]; }
 uint32_t new_handle(Ctx *c, int type) {
     if (c->nhandles == 0) c->nhandles = 1;                  // slot 0 unused so handle values are never 0
     if (c->nhandles >= MAX_HANDLES) { fprintf(stderr, "out of handles\n"); exit(1); }
-    int i = c->nhandles++; c->handles[i].type = type;
+    extern uint32_t g_api_ret; int i = c->nhandles++; c->handles[i].type = type; c->handles[i].cret = g_api_ret;
     return 0x100 + 4 * (uint32_t)i;
 }
 
