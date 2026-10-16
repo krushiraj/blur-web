@@ -14,7 +14,7 @@ from capstone import x86 as X
 
 BASE = 0x400000
 HERE = os.path.dirname(os.path.abspath(__file__))
-IMG = open(os.path.join(HERE, '..', '..', 're', 'dump', 'blur_runtime.bin'), 'rb').read()
+IMG = open(os.environ.get('LIFT_IMG') or os.path.join(HERE, '..', '..', 're', 'dump', 'blur_runtime.bin'), 'rb').read()
 FUNCS = {}   # entry -> (size, maxaddr, nranges, thunk)
 for line in open(os.path.join(HERE, 'funcs.tsv')):
     a, sz, hi, nr, th = line.split('\t')
@@ -85,8 +85,8 @@ COND = {'e': 'f.zf', 'ne': '!f.zf', 'b': 'f.cf', 'ae': '!f.cf', 'be': '(f.cf | f
         'z': 'f.zf', 'nz': '!f.zf', 'c': 'f.cf', 'nc': '!f.cf', 'nae': 'f.cf', 'nb': '!f.cf', 'na': '(f.cf | f.zf)', 'nbe': '!(f.cf | f.zf)', 'nge': '(f.sf != f.of)', 'nl': '(f.sf == f.of)',
         'ng': '(f.zf | (f.sf != f.of))', 'nle': '(!f.zf & (f.sf == f.of))', 'pe': 'f.pf', 'po': '!f.pf'}
 
-SPILL = 'c->eax = eax; c->ecx = ecx; c->edx = edx; c->ebx = ebx; c->esp = esp; c->ebp = ebp; c->esi = esi; c->edi = edi;'
-RELOAD = 'eax = c->eax; ecx = c->ecx; edx = c->edx; ebx = c->ebx; esp = c->esp; ebp = c->ebp; esi = c->esi; edi = c->edi;'
+SPILL = 'SAVE;'
+RELOAD = 'LOAD;'
 
 IMG_END = BASE + len(IMG)
 MSV_BASE = 0x78520000
@@ -118,7 +118,8 @@ def decode_at(a):
 class FnLifter:
     def __init__(self, entry):
         self.entry = entry; sz, hi, nr, th = FUNCS.get(entry, (0, 0, 2, 0))
-        self.linear = nr == 1
+        self.linear = False
+        self.retaddrs = set()
         self.direct = set()
         self.end = hi + 1
         self.ins = {}
@@ -200,40 +201,24 @@ class FnLifter:
                     if i is None: self.bad.add(a); break
                     self.ins[a] = i; self.endmap[a + i.size] = a; m = i.mnemonic; nxt = a + i.size
                     if m in ('ret', 'int3', 'ud2', 'hlt', 'iretd', 'retf'): break
+                    if m == 'call':
+                        self.retaddrs.add(nxt); break                  # the return address is an entry of its own: the callee returns by jumping to it
                     if (m == 'jmp' or m.startswith('j') or m.startswith('loop')) and i.operands[0].type == X.X86_OP_IMM:
-                        t = i.operands[0].imm; idi = self.jmp_idiom(i) if m == 'jmp' else None
-                        if idi: self._work.append(idi[1]); break
+                        t = i.operands[0].imm
                         if not (t != self.entry and t in FUNCS): self._work.append(t)
                         if m == 'jmp': break
-                    elif m == 'jmp':
-                        idi = self.jmp_idiom(i)
-                        if idi: self._work.append(idi[1])
-                        break
-                    if nxt in FUNCS and nxt != self.entry: break          # falls into another function: the emitted `continues outside` stub tail-calls it
+                    elif m == 'jmp': break
+                    if nxt in FUNCS and nxt != self.entry: break          # falls into another function: the emitted stub tail-calls it
                     a = nxt
             before = len(self.ins)
             self.order = sorted(self.ins)
             self.find_tables()
-            # push imm; ret  idiom
-            for k, a in enumerate(self.order):
-                i = self.ins[a]
-                if i.mnemonic == 'ret' and not i.operands and k >= 1:
-                    p1 = self.ins[self.order[k - 1]]
-                    if p1.mnemonic == 'push' and p1.operands[0].type == X.X86_OP_IMM:
-                        t = p1.operands[0].imm & 0xffffffff
-                        if in_img(t) and t not in FUNCS and t not in self.ins: self._work.append(t)
-                        if k >= 2:
-                            p2 = self.ins[self.order[k - 2]]
-                            if p2.mnemonic == 'push' and p2.operands[0].type == X.X86_OP_IMM:
-                                r = p2.operands[0].imm & 0xffffffff
-                                if in_img(r) and r not in FUNCS and r not in self.ins: self._work.append(r)
             if len(self.ins) == before and all(w in self.ins or w in self.bad for w in self._work): self._work = []
             if not self._work: break
         self.order = sorted(self.ins)
-        # an undecodable successor means the lifted body cannot be trusted
         for a in self.order:
             i = self.ins[a]
-            if i.mnemonic in ('ret', 'int3', 'ud2', 'hlt', 'jmp', 'iretd', 'retf'): continue
+            if i.mnemonic in ('ret', 'int3', 'ud2', 'hlt', 'jmp', 'iretd', 'retf', 'call'): continue
             if a + i.size not in self.ins and a + i.size in self.bad: raise Unsupported(f'undecodable at {a + i.size:#x}')
 
     def lines(self):
@@ -260,6 +245,7 @@ class FnLifter:
                 v = op.imm & 0xffffffff if op.type == X.X86_OP_IMM else ((op.mem.disp & 0xffffffff) if op.type == X.X86_OP_MEM and not op.mem.base and not op.mem.index else None)
                 if v is not None and in_text(v): self.direct.add(v)
         self.has_indirect_jmp = False
+        self.direct |= self.retaddrs
         for a in self.order:
             try: self.insn(self.ins[a])       # first pass only collects jump targets
             except Unsupported: pass
@@ -276,33 +262,28 @@ class FnLifter:
                 if str(ex) in GARBAGE or str(ex).startswith('reg ') or str(ex) == 'segment': raise Unsupported('garbage code: ' + str(ex))
                 TRAPS[str(ex)] += 1; stmts = [f'{{ {SPILL} rt_unsupported(c, {a:#x}u, "{str(ex)}"); }}']
             for s in stmts: body.append('    ' + s)
-            if i.mnemonic not in ('ret', 'jmp', 'int3', 'ud2', 'hlt', 'iretd', 'retf') and a + i.size not in self.ins:
-                body.append(f'    {SPILL} rt_call(c, {a + i.size:#x}u); return;  /* control continues outside the lifted region */')
+            if i.mnemonic not in ('ret', 'jmp', 'call', 'int3', 'ud2', 'hlt', 'iretd', 'retf') and a + i.size not in self.ins:
+                body.append(f'    {SPILL} {self.tail(a + i.size)}  /* control continues outside the lifted region */')
         return body
 
-    def after_call(self, R):
-        # the callee may have returned somewhere other than R (the protector rewrites return addresses): continue where it really returned
-        self.has_indirect_jmp = True
-        if R in self.ins: self.targets.add(R)             # the return address is a label: a continuation may come back to it
-        return f' if (__builtin_expect(c->lastret != {R:#x}u, 0)) {{ uint32_t tgt = c->lastret; if (rt_expected(c, tgt)) {{ {SPILL} return; }} JMP_DISPATCH(tgt) }}'
+    def tail(self, tgt):
+        # transfer control to a known address: a direct tail call if it is an entry we lift, the dispatcher otherwise
+        self.direct.add(tgt)
+        if is_known(tgt): self.calls.add(tgt); return f'MUSTTAIL return f_{tgt:08x}(c);'
+        return f'c->pc = {tgt:#x}u; MUSTTAIL return rt_dispatch(c);'
 
     def call_stmt(self, target_expr, ret_addr, direct=None):
-        if direct is not None: self.direct.add(direct)
-        tgt = f'{direct:#x}u' if direct is not None else 'tgt'
-        pre = '' if direct is not None else f'uint32_t tgt = {target_expr}; '
-        if direct is not None and is_known(direct): self.calls.add(direct); call = f'CALLF(f_{direct:08x}, {direct:#x}u);'
-        else: call = f'rt_call(c, {tgt});'
-        return [f'{{ {pre}esp -= 4; M32(esp) = {ret_addr:#x}u; {SPILL} c->rs[c->rn++] = {ret_addr:#x}u; {call} c->rn--; {RELOAD}{self.after_call(ret_addr)} }}']
+        self.direct.add(ret_addr)
+        if direct is not None:
+            return [f'{{ esp -= 4; M32(esp) = {ret_addr:#x}u; {SPILL} {self.tail(direct)} }}']
+        return [f'{{ uint32_t tgt = {target_expr}; esp -= 4; M32(esp) = {ret_addr:#x}u; {SPILL} c->pc = tgt; MUSTTAIL return rt_dispatch(c); }}']
 
     def jump_to(self, tgt_imm, cond=None):
         if tgt_imm in self.ins:
             self.targets.add(tgt_imm)
             g = f'goto L_{tgt_imm:08x};'
         else:
-            self.direct.add(tgt_imm)
-            if is_known(tgt_imm): self.calls.add(tgt_imm); call = f'f_{tgt_imm:08x}(c);'
-            else: call = f'rt_call(c, {tgt_imm:#x}u);'
-            g = f'{{ {SPILL} {call} return; }}'
+            g = f'{{ {SPILL} {self.tail(tgt_imm)} }}'
         return f'if ({cond}) {g}' if cond else g
 
     def insn(self, i):
@@ -311,8 +292,9 @@ class FnLifter:
         if m in ('repz ret', 'rep ret', 'repe ret'): m = 'ret'
         pfx = i.prefix
         # ---- data movement ----
-        if m in ('nop', 'int3', 'fnop', 'ud2', 'pause', 'endbr32', 'lfence', 'sfence', 'mfence', 'prefetchnta', 'prefetcht0', 'prefetcht1', 'prefetcht2', 'emms'):
+        if m in ('nop', 'int3', 'fnop', 'ud2', 'endbr32', 'lfence', 'sfence', 'mfence', 'prefetchnta', 'prefetcht0', 'prefetcht1', 'prefetcht2', 'emms'):
             return []
+        if m == 'pause': return ['rt_spin(c);']
         if m == 'mov' or m in ('movabs',):
             return [wr(ops[0], rd(ops[1]))]
         if m == 'lea': return [wr(ops[0], ea(ops[1].mem))]
@@ -335,18 +317,18 @@ class FnLifter:
                     return [f'{{ {T} v = {rd(ops[1], B)}; {T} o = __atomic_fetch_add((volatile {T} *)(G + {a}), v, __ATOMIC_SEQ_CST); fl_add(&f, o, v, 0, {B}); {wr(ops[1], "o")} }}']
                 if base == 'cmpxchg':
                     acc = {8: '(uint8_t)eax', 16: '(uint16_t)eax', 32: 'eax'}[B]
-                    return [f'{{ {T} e = {acc}; {T} nv = {rd(ops[1], B)}; int ok = __atomic_compare_exchange_n((volatile {T} *)(G + {a}), &e, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); fl_sub(&f, {acc}, e, 0, {B}); f.zf = ok; if (!ok) {{ {rwrite(X.X86_REG_EAX if B == 32 else (X.X86_REG_AX if B == 16 else X.X86_REG_AL), "e")} }} }}']
+                    return [f'{{ {T} e = {acc}; {T} nv = {rd(ops[1], B)}; int ok = __atomic_compare_exchange_n((volatile {T} *)(G + {a}), &e, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); fl_sub(&f, {acc}, e, 0, {B}); f.zf = ok; if (!ok) {{ rt_spin(c); {rwrite(X.X86_REG_EAX if B == 32 else (X.X86_REG_AX if B == 16 else X.X86_REG_AL), "e")} }} }}']
                 if base == 'cmpxchg8b':
-                    return [f'{{ uint64_t e = ((uint64_t)edx << 32) | eax; uint64_t nv = ((uint64_t)ecx << 32) | ebx; int ok = __atomic_compare_exchange_n((volatile uint64_t *)(G + {ea(ops[0].mem)}), &e, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); f.zf = ok; if (!ok) {{ eax = (uint32_t)e; edx = (uint32_t)(e >> 32); }} }}']
+                    return [f'{{ uint64_t e = ((uint64_t)edx << 32) | eax; uint64_t nv = ((uint64_t)ecx << 32) | ebx; int ok = __atomic_compare_exchange_n((volatile uint64_t *)(G + {ea(ops[0].mem)}), &e, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); f.zf = ok; if (!ok) {{ eax = (uint32_t)e; edx = (uint32_t)(e >> 32); rt_spin(c); }} }}']
             raise Unsupported(m)
         if m == 'cmpxchg':
             B = ops[0].size * 8; acc = {8: '(uint8_t)eax', 16: '(uint16_t)eax', 32: 'eax'}[B]
-            return [f'{{ uint{B}_t d = {rd(ops[0])}; fl_sub(&f, {acc}, d, 0, {B}); if (f.zf) {{ {wr(ops[0], rd(ops[1]))} }} else {{ {rwrite(X.X86_REG_EAX if B == 32 else (X.X86_REG_AX if B == 16 else X.X86_REG_AL), "d")} }} }}']
+            return [f'{{ uint{B}_t d = {rd(ops[0])}; fl_sub(&f, {acc}, d, 0, {B}); if (f.zf) {{ {wr(ops[0], rd(ops[1]))} }} else {{ rt_spin(c); {rwrite(X.X86_REG_EAX if B == 32 else (X.X86_REG_AX if B == 16 else X.X86_REG_AL), "d")} }} }}']
         if m == 'xadd':
             B = ops[0].size * 8
             return [f'{{ uint{B}_t d = {rd(ops[0])}, s = {rd(ops[1])}; uint{B}_t r = fl_add(&f, d, s, 0, {B}); {wr(ops[1], "d")} {wr(ops[0], "r")} }}']
         if m in ('wait', 'fwait'): return []
-        if m == 'rdtsc': return [f'{{ {SPILL} rt_call(c, 0xfffffff1u); {RELOAD} }}']
+        if m == 'rdtsc': return [f'{{ {SPILL} rt_rdtsc(c); {RELOAD} }}']
         if m == 'xchg' and ops[0].type == X.X86_OP_MEM and ops[0].size == 4:
             return [f'eax = eax; {{ uint32_t t = {rd(ops[1])}; t = __atomic_exchange_n((volatile uint32_t *)(G + {ea(ops[0].mem)}), t, __ATOMIC_SEQ_CST); {wr(ops[1], "t")} }}']
         if m == 'xchg' and ops[1].type == X.X86_OP_MEM and ops[1].size == 4:
@@ -383,7 +365,7 @@ class FnLifter:
         if m == 'cmc': return ['f.cf = !f.cf;']
         if m == 'sahf': return ['{ uint8_t a = (eax >> 8) & 0xff; f.cf = a & 1; f.pf = (a >> 2) & 1; f.af = (a >> 4) & 1; f.zf = (a >> 6) & 1; f.sf = (a >> 7) & 1; }']
         if m == 'lahf': return ['{ uint32_t e = fl_eflags(&f, 0); eax = (eax & 0xffff00ffu) | ((e & 0xd7u) << 8); }']
-        if m == 'cpuid': return [f'{{ SPILL_PLACEHOLDER rt_call(c, 0xfffffff0u); RELOAD_PLACEHOLDER }}'.replace('SPILL_PLACEHOLDER', SPILL).replace('RELOAD_PLACEHOLDER', RELOAD)]
+        if m == 'cpuid': return [f'{{ {SPILL} rt_cpuid(c); {RELOAD} }}']
         # ---- ALU ----
         alu = {'add': 'fl_add(&f, a, b, 0, B)', 'sub': 'fl_sub(&f, a, b, 0, B)', 'adc': 'fl_add(&f, a, b, f.cf, B)', 'sbb': 'fl_sub(&f, a, b, f.cf, B)',
                'and': 'fl_logic(&f, a & b, B)', 'or': 'fl_logic(&f, a | b, B)', 'xor': 'fl_logic(&f, a ^ b, B)'}
@@ -468,43 +450,16 @@ class FnLifter:
         if m.startswith('cmov') and m[4:] in COND:
             return [f'if ({COND[m[4:]]}) {{ {wr(ops[0], rd(ops[1]))} }}']
         # ---- control flow ----
-        if m == 'ret' and n == 0:
-            # protector idiom: `push retaddr; push target; ret` is `call target` returning to retaddr; `push target; ret` is `jmp target`
-            idx = self.order.index(i.address); p1 = self.ins[self.order[idx - 1]] if idx >= 1 else None; p2 = self.ins[self.order[idx - 2]] if idx >= 2 else None
-            def is_pushimm(x): return x is not None and x.mnemonic == 'push' and x.operands[0].type == X.X86_OP_IMM
-            if is_pushimm(p1) and is_pushimm(p2) and not (p1.address in self.targets or i.address in self.targets):
-                T = p1.operands[0].imm & 0xffffffff; X0 = p2.operands[0].imm & 0xffffffff
-                out = [f'esp += 4; /* pop target {T:#x}; return address {X0:#x} stays on the stack */']
-                if is_known(T): self.calls.add(T); call = f'CALLF(f_{T:08x}, {T:#x}u);'
-                else: call = f'rt_call(c, {T:#x}u);'
-                out.append(f'{{ {SPILL} c->rs[c->rn++] = {X0:#x}u; {call} c->rn--; {RELOAD}{self.after_call(X0) if X0 else ""} }}')
-                out.append(self.jump_to(X0) if X0 else 'return;')
-                return out
-            if is_pushimm(p1) and not (i.address in self.targets):
-                T = p1.operands[0].imm & 0xffffffff
-                return ['esp += 4; ' + self.jump_to(T)]
         if m == 'ret':
             pop = ops[0].imm if n else 0
-            return [f'c->lastret = M32(esp); esp += {4 + pop}; {SPILL} return;']
+            return [f'{{ uint32_t pc = M32(esp); esp += {4 + pop}; {SPILL} c->pc = pc; MUSTTAIL return rt_dispatch(c); }}']
         if m == 'call':
             op = ops[0]; ret = i.address + i.size
             if op.type == X.X86_OP_IMM: return self.call_stmt(None, ret, direct=op.imm)
             return self.call_stmt(rd(op, 32), ret)
         if m == 'jmp':
             op = ops[0]
-            if op.type == X.X86_OP_IMM:
-                idi = self.jmp_idiom(i)
-                if idi:
-                    T, R = idi; self.direct.add(T)
-                    call = f'CALLF(f_{T:08x}, {T:#x}u);' if is_known(T) else f'rt_call(c, {T:#x}u);'
-                    if is_known(T): self.calls.add(T)
-                    return [f'{{ {SPILL} c->rs[c->rn++] = {R:#x}u; {call} c->rn--; {RELOAD}{self.after_call(R)} }}', self.jump_to(R)]
-                return [self.jump_to(op.imm)]
-            idi = self.jmp_idiom(i)
-            if idi:                               # push R; jmp [target]  ==  call [target], continuing at R
-                T, R = idi
-                return [f'{{ uint32_t tgt = {rd(op, 32)}; {SPILL} c->rs[c->rn++] = {R:#x}u; rt_call(c, tgt); c->rn--; {RELOAD}{self.after_call(R).replace("uint32_t tgt = c->lastret;", "tgt = c->lastret;")} }}', self.jump_to(R)]
-            # indirect jump: switch table inside this function, or a tail call
+            if op.type == X.X86_OP_IMM: return [self.jump_to(op.imm)]
             self.has_indirect_jmp = True
             return [f'{{ uint32_t tgt = {rd(op, 32)}; JMP_DISPATCH(tgt) }}']
         if m.startswith('j') and m[1:] in COND:
@@ -550,10 +505,43 @@ class FnLifter:
         def xi(o): return o.reg - X.X86_REG_XMM0
         def isst(o): return o.type == X.X86_OP_REG and X.X86_REG_ST0 <= o.reg <= X.X86_REG_ST7
         def si(o): return o.reg - X.X86_REG_ST0
-        if any(o.type == X.X86_OP_REG and (X.X86_REG_XMM8 <= o.reg <= X.X86_REG_XMM15 or X.X86_REG_MM0 <= o.reg <= X.X86_REG_MM7) for o in ops): raise Unsupported('xmm8+/mmx')
+        if any(o.type == X.X86_OP_REG and X.X86_REG_XMM8 <= o.reg <= X.X86_REG_XMM15 for o in ops): raise Unsupported('xmm8+')
+        def ismm(o): return o.type == X.X86_OP_REG and X.X86_REG_MM0 <= o.reg <= X.X86_REG_MM7
+        def vecreg(o): return o.type == X.X86_OP_REG and (ismm(o) or X.X86_REG_XMM0 <= o.reg <= X.X86_REG_XMM7)
+        def vp(o):
+            if o.type == X.X86_OP_MEM: return f'(G + {ea(o.mem)})'
+            if ismm(o): return f'((uint8_t *)&c->mm[{o.reg - X.X86_REG_MM0}])'
+            return f'c->xmm[{o.reg - X.X86_REG_XMM0}]'
+        def vn(o): return 8 if ismm(o) else 16
+        VOPS = {k.lower(): 'V_' + k for k in ('PCMPEQB PCMPEQW PCMPEQD PCMPGTB PCMPGTW PCMPGTD PADDB PADDW PADDD PADDQ PSUBB PSUBW PSUBD PSUBQ PADDUSB PADDUSW PSUBUSB PSUBUSW '
+                'PADDSB PADDSW PSUBSB PSUBSW PMAXUB PMINUB PMAXSW PMINSW PAVGB PAVGW PMULLW PMULHW PMULHUW PMADDWD PSADBW PAND PANDN POR PXOR '
+                'PUNPCKLBW PUNPCKLWD PUNPCKLDQ PUNPCKHBW PUNPCKHWD PUNPCKHDQ PACKSSWB PACKUSWB PACKSSDW').split()}
+        VSH = {k.lower(): 'V_' + k for k in 'PSLLW PSLLD PSLLQ PSRLW PSRLD PSRLQ PSRAW PSRAD'.split()}
+        if n == 2 and vecreg(ops[0]):
+            if m in VOPS and not (m in ('pand', 'pandn', 'por', 'pxor') and not ismm(ops[0]) and False):
+                return [f'v_binop({VOPS[m]}, {vp(ops[0])}, {vp(ops[1])}, {vn(ops[0])});']
+            if m in VSH:
+                cnt = f'{ops[1].imm & 0xff}ull' if ops[1].type == X.X86_OP_IMM else f'(*(uint64_t *){vp(ops[1])})'
+                return [f'v_shift({VSH[m]}, {vp(ops[0])}, {cnt}, {vn(ops[0])});']
+            if m == 'movd' and ismm(ops[0]): return [f'c->mm[{ops[0].reg - X.X86_REG_MM0}] = (uint32_t)({rd(ops[1], 32)});']
+            if m == 'movq' and ismm(ops[0]): return [f'c->mm[{ops[0].reg - X.X86_REG_MM0}] = *(uint64_t *){vp(ops[1])};']
+        if n == 2 and ops[1].type == X.X86_OP_REG and ismm(ops[1]):
+            if m == 'movd': return [wr(ops[0], f'(uint32_t)c->mm[{ops[1].reg - X.X86_REG_MM0}]', 32)]
+            if m == 'movq': return [f'*(uint64_t *){vp(ops[0])} = c->mm[{ops[1].reg - X.X86_REG_MM0}];']
+        if m == 'pmovmskb' and n == 2: return [wr(ops[0], f'v_movmskb({vp(ops[1])}, {vn(ops[1])})', 32)]
+        if m == 'pextrw' and n == 3:
+            lane = ops[2].imm & (vn(ops[1]) // 2 - 1)
+            return [wr(ops[0], f'*(uint16_t *)({vp(ops[1])} + {2 * lane})', 32)]
+        if m == 'pinsrw' and n == 3:
+            lane = ops[2].imm & (vn(ops[0]) // 2 - 1)
+            return [f'*(uint16_t *)({vp(ops[0])} + {2 * lane}) = (uint16_t)({rd(ops[1], 16)});']
+        if m == 'pshufw' and n == 3 or m in ('pshuflw', 'pshufhw') and n == 3:
+            imm = ops[2].imm & 0xff; off = 8 if m == 'pshufhw' else 0
+            return [f'{{ uint16_t t[8]; memcpy(t, {vp(ops[1])}, {vn(ops[1])}); uint16_t *D = (uint16_t *){vp(ops[0])}; memcpy(D, t, {vn(ops[1])}); ' + ' '.join(f'D[{(off // 2) + k}] = t[{(off // 2) + ((imm >> (2 * k)) & 3)}];' for k in range(4)) + ' }']
+        if m in ('prefetchw', 'prefetch', 'emms', 'femms'): return []
         # ---- SSE ----
         if m.startswith('v'): raise Unsupported(m)
-        m = {'fcompi': 'fcomip', 'fucompi': 'fucomip'}.get(m, m)
+        m = {'fcompi': 'fcomip', 'fucompi': 'fucomip', 'movntps': 'movaps', 'movntpd': 'movapd', 'movntdq': 'movdqa'}.get(m, m)     # non-temporal stores are plain stores here
         import re as _re
         _cm = _re.fullmatch(r'cmp(eq|lt|le|unord|neq|nlt|nle|ord)(ss|sd|ps|pd)', m)
         if any(isx(o) for o in ops) or m in ('cvttss2si', 'cvttsd2si', 'cvtss2si', 'cvtsd2si'):
@@ -609,6 +597,11 @@ class FnLifter:
                 if m == 'sqrt' + suf:
                     lane = m32 if w == 32 else m64; x = f'XF({xi(d)}, 0)' if w == 32 else f'XD({xi(d)}, 0)'
                     return [f'{x} = {"sqrtf" if w == 32 else "sqrt"}({lane(sr)});']
+            if m == 'rcpss': return [f'XF({xi(d)}, 0) = 1.0f / {m32(sr)};']
+            if m == 'rsqrtss': return [f'XF({xi(d)}, 0) = 1.0f / sqrtf({m32(sr)});']
+            if m == 'rcpps': return ['{ ' + ' '.join(f'XF({xi(d)}, {k}) = 1.0f / {ps_lane(sr, k)};' for k in range(4)) + ' }']
+            if m == 'rsqrtps': return ['{ ' + ' '.join(f'XF({xi(d)}, {k}) = 1.0f / sqrtf({ps_lane(sr, k)});' for k in range(4)) + ' }']
+            if m == 'cvtpi2ps': return [f'{{ int32_t a = (int32_t)(c->mm[{sr.reg - X.X86_REG_MM0}] & 0xffffffffu), b = (int32_t)(c->mm[{sr.reg - X.X86_REG_MM0}] >> 32); XF({xi(d)}, 0) = (float)a; XF({xi(d)}, 1) = (float)b; }}'] if sr.type == X.X86_OP_REG else [f'{{ int32_t a = (int32_t)M32({ea(sr.mem)}), b = (int32_t)M32({ea(sr.mem)} + 4); XF({xi(d)}, 0) = (float)a; XF({xi(d)}, 1) = (float)b; }}']
             # packed arithmetic
             for suf, w, nl in (('ps', 32, 4), ('pd', 64, 2)):
                 if m.endswith(suf) and m[:-2] in ARITH:
@@ -644,6 +637,10 @@ class FnLifter:
             if m in ('cvttps2dq', 'cvtps2dq'):
                 fn = 'sse_cvtt' if m == 'cvttps2dq' else 'sse_cvt'
                 return [f'{{ float a[4]; ' + ' '.join(f'a[{k}] = {ps_lane(sr,k)};' for k in range(4)) + ' ' + ' '.join(f'XU({xi(d)}, {k}) = (uint32_t){fn}(a[{k}]);' for k in range(4)) + ' }']
+            if m in ('cvttpd2dq', 'cvtpd2dq'):
+                fn = 'sse_cvtt' if m == 'cvttpd2dq' else 'sse_cvt'
+                return [f'{{ double a = {pd_lane(sr, 0)}, b = {pd_lane(sr, 1)}; XU({xi(d)}, 0) = (uint32_t){fn}(a); XU({xi(d)}, 1) = (uint32_t){fn}(b); XQ({xi(d)}, 1) = 0; }}']
+            if m == 'pmuludq' and isx(d): return [f'{{ uint64_t p0 = (uint64_t)XU({xi(d)}, 0) * (uint32_t){u(sr,0)}, p1 = (uint64_t)XU({xi(d)}, 2) * (uint32_t){u(sr,2)}; XQ({xi(d)}, 0) = p0; XQ({xi(d)}, 1) = p1; }}']
             if m == 'cvtdq2pd': return [f'{{ int32_t a = (int32_t){u(sr,0)}, b = (int32_t){u(sr,1)}; XD({xi(d)}, 0) = a; XD({xi(d)}, 1) = b; }}']
             # shuffles
             if m == 'shufps':
@@ -752,6 +749,10 @@ class FnLifter:
         if m == 'fyl2x': return ['ST(1) = ST(1) * log2(ST(0)); fpop(c);']
         if m == 'f2xm1': return ['ST(0) = exp2(ST(0)) - 1.0;']
         if m == 'frndint': return ['ST(0) = x87_rint(c, ST(0));']
+        if m == 'fprem1': return ['ST(0) = remainder(ST(0), ST(1)); c->fsw &= ~0x400;']
+        if m == 'fxam': return ['{ double v = ST(0); c->fsw &= ~0x4700; if (signbit(v)) c->fsw |= 0x200; if (v != v) c->fsw |= 0x100; else if (isinf(v)) c->fsw |= 0x500; else if (v == 0) c->fsw |= 0x4000; else c->fsw |= 0x400; }']
+        if m in ('fnstenv', 'fstenv'): return [f'{{ uint32_t a = {ea(ops[0].mem)}; M32(a) = c->fcw; M32(a + 4) = x87_sw(c); M32(a + 8) = 0; M32(a + 12) = 0; M32(a + 16) = 0; M32(a + 20) = 0; M32(a + 24) = 0; }}']
+        if m == 'fldenv': return [f'{{ uint32_t a = {ea(ops[0].mem)}; c->fcw = M16(a); c->fsw = M16(a + 4) & ~0x3800; c->top = (M16(a + 4) >> 11) & 7; }}']
         if m == 'fscale': return ['ST(0) = ldexp(ST(0), (int)trunc(ST(1)));']
         if m == 'fprem': return ['ST(0) = fmod(ST(0), ST(1)); c->fsw &= ~0x400;']
         if m in ('fcom', 'fcomp', 'fucom', 'fucomp'):
@@ -781,18 +782,13 @@ def gen_function(entry, funcset=None):
     body = L.lines()
     hdr = [f'void f_{entry:08x}(Cpu *c) {{',
            '    uint32_t eax = c->eax, ecx = c->ecx, edx = c->edx, ebx = c->ebx, esp = c->esp, ebp = c->ebp, esi = c->esi, edi = c->edi;',
-           '    Fl f = {0}; uint32_t ra = M32(esp);',
+           '    Fl f = c->fl;',
+           f'    if (__builtin_expect(--c->budget < 0, 0)) rt_preempt(c);',
            f'    if (__builtin_expect(rt_trace, 0)) rt_enter(c, {entry:#x}u);']
     if L.has_indirect_jmp:
-        # one shared dispatcher per function (a copy at every call site made the code size quadratic)
         cases = ' '.join(f'case {t:#x}u: goto L_{t:08x};' for t in sorted(L.targets))
-        lab = ' '.join(f'case {t:#x}u:' for t in sorted(L.targets))
         hdr.append('    uint32_t dtgt = 0;')
-        body = list(body) + [
-            '    L_dispatch:',
-            f'    for (;;) {{ switch (dtgt) {{ {cases} default: break; }}',
-            f'        {SPILL} rt_call(c, dtgt); {RELOAD} dtgt = c->lastret;',
-            f'        switch (dtgt) {{ {lab} continue; default: return; }} }}']
+        body = list(body) + ['    L_dispatch:', f'    switch (dtgt) {{ {cases} default: {SPILL} c->pc = dtgt; MUSTTAIL return rt_dispatch(c); }}']
         disp = '#define JMP_DISPATCH(t) { dtgt = (t); goto L_dispatch; }'
     else: disp = '#define JMP_DISPATCH(t) { rt_unsupported(c, 0, "indirect jmp"); }'
     return disp, hdr, body, L
