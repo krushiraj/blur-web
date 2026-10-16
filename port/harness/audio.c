@@ -26,7 +26,7 @@ typedef struct {
     int primary; AmVoice v; int mixer_slot;
     uint8_t wfx[40]; uint32_t wfx_size;
     int nnot; struct { uint32_t off, ev; } not_[MAXNOT];
-    uint32_t last_pos; int was_playing;
+    uint32_t last_pos; int was_playing; uint32_t poll_pos; int poll_same;   // GetCurrentPosition poll throttling
     uint32_t play_calls, lock_bytes;
 } Buf;
 static Buf bufs[MAXBUF]; static int nbufs = 1;
@@ -86,7 +86,7 @@ static void ds_advance(Ctx *c) {
     if (!out_started) return;
     uint64_t now = audio_clock_us(); if (now <= t_last) return;
     uint64_t due = (now - t_last) * AM_RATE / 1000000ull;
-    if (due > AM_RATE / 2) { t_last = now - 250000; due = AM_RATE / 4; }       // the guest stalled (loading): do not replay seconds of device time
+    if (due > AM_RATE * 3 / 25) { t_last = now - 120000; due = AM_RATE * 3 / 25; }       // the guest stalled (loading): never burst more than 120 ms at the browser       // the guest stalled (loading): do not replay seconds of device time
     while (due >= 240) {
         float out[2 * 240];
         uint32_t before[MAXBUF];
@@ -116,6 +116,12 @@ static void ds_advance(Ctx *c) {
         fprintf(stderr, "[audio] t=%.1fs rms=%.4f peak=%.4f frames=%llu buffers=%d playing=%d sent=%llu game_wrote=%lluKB nonzero=%lluKB wpeak=%.3f\n", st_total_frames / (double)AM_RATE, rms, st_peak, (unsigned long long)st_frames, nv, np, (unsigned long long)st_sent_frames, (unsigned long long)(wr_total >> 10), (unsigned long long)(wr_nonzero >> 10), wr_peak);
         st_sum2 = 0; st_peak = 0; st_frames = 0; st_last_log = now;
     }
+}
+// process exit: flush what is mixed and tell the page to fade out (message 91) so the sound does not end with a crack
+void audio_shutdown(void) {
+    if (!out_started) return; out_flush();
+    if (net_client_connected()) { uint32_t m[2] = {0, 91}; net_send(m, sizeof m); usleep(120000); }      // give the writer thread time before _exit
+    if (wav) { wav_hdr(); fclose(wav); wav = NULL; }
 }
 // called by the dispatcher on (almost) every API call; cheap when nothing is playing
 void audio_tick(Ctx *c) {
@@ -223,6 +229,16 @@ static uint32_t pos_write(Buf *b) {
 static uint32_t b_getcaps(Ctx *c, uint32_t *a) { Buf *b = B(c, a[0]); if (!b || !a[1]) return DSERR_INVALIDPARAM; wr32(c, a[1], 20); wr32(c, a[1] + 4, b->flags); wr32(c, a[1] + 8, b->bytes); wr32(c, a[1] + 12, 0); wr32(c, a[1] + 16, 0); return DS_OK; }
 static uint32_t b_getcur(Ctx *c, uint32_t *a) {
     Buf *b = B(c, a[0]); if (!b) return DSERR_INVALIDPARAM; ds_advance(c);
+    // The game's device thread polls GetCurrentPosition + SwitchToThread in a tight loop until its ring has room (every poll is a baton switch and a few
+    // hundred thousand API calls per minute). A real driver would wake it at the next notification position: when the same position is seen twice in a
+    // row, put the caller to sleep until the cursor reaches the next notify offset (BLUR_AUDIO_NOSLEEP=1 restores the busy poll).
+    { static int nosleep = -1; if (nosleep < 0) nosleep = getenv("BLUR_AUDIO_NOSLEEP") != NULL; Thread *t = cur_thread(c);
+      if (!nosleep && b->nnot >= 2 && b->v.playing && !b->primary) {
+        if (t->wake_at) { if (now_us() < t->wake_at) { c->block = 1; return 0; } t->wake_at = 0; b->poll_same = 0; }
+        else { uint32_t p0 = pos_play(b); if (p0 == b->poll_pos) b->poll_same++; else { b->poll_same = 0; b->poll_pos = p0; }
+          if (b->poll_same >= 2) {
+            uint32_t step = b->not_[1].off > b->not_[0].off ? b->not_[1].off - b->not_[0].off : 512, bpf = buf_bpf(b) ? buf_bpf(b) : 4, next = (p0 / step + 1) * step - p0;
+            uint64_t us = (uint64_t)next / bpf * 1000000ull / (b->v.rate ? b->v.rate : 24000); if (us < 500) us = 500; t->wake_at = now_us() + us; c->block = 1; return 0; } } } }
     uint32_t p = pos_play(b), w = pos_write(b); if (a[1]) wr32(c, a[1], p); if (a[2]) wr32(c, a[2], w);
     LOG("GetCurrentPosition(#%d) play=%u write=%u (playing=%d)\n", (int)(b - bufs), p, w, b->v.playing); return DS_OK;
 }
