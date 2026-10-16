@@ -4,6 +4,7 @@
 #include "../recomp/rt.h"
 #include <unistd.h>
 #include <execinfo.h>
+#include <sys/mman.h>
 #include "apilog.h"
 #include "snap.h"
 void snapshot_write(Ctx *c, const char *dir, uint32_t oep);
@@ -12,9 +13,17 @@ extern const struct { uint32_t a; GuestFn f; } rt_table[];
 extern const unsigned rt_table_n;
 
 extern int g_det_on; extern double g_det_step; extern uint64_t (*audio_clock_us)(void);
+// BLUR_RING=1: cheap per-thread ring of the last RING_N function entries (addr, esp), printed when control reaches unrecompiled code.
+#define RING_N 256
+static uint32_t ring_a[MAX_THREADS][RING_N], ring_s[MAX_THREADS][RING_N]; static uint32_t ring_i[MAX_THREADS]; static int ring_on;
+extern int g_prof; extern uint64_t prof_api, prof_dispatch, prof_api_ns, prof_yield_ns;
+void prof_init(void); void prof_report(Ctx *c); void prof_note_api(Ctx *c, const Stub *s); uint64_t prof_now(void); void prof_thread_switch(int self); void prof_seg_begin(void), prof_seg_end(void), prof_seg_begin_stub(int);
 static Ctx *C;
 int rt_trace;
-void rt_enter(Cpu *c, uint32_t addr) { static uint64_t n; if (n++ < (getenv("RT_TRACE_MAX") ? strtoull(getenv("RT_TRACE_MAX"), 0, 0) : 2000)) fprintf(stderr, "[fn] %08x esp=%08x eax=%08x esi=%08x\n", addr, c->esp, c->eax, c->esi); }
+void rt_enter(Cpu *c, uint32_t addr) {
+    if (ring_on) { int t = C->cur; uint32_t i = ring_i[t]++ & (RING_N - 1); ring_a[t][i] = addr; ring_s[t][i] = c->esp; return; }
+    static uint64_t n; if (n++ < (getenv("RT_TRACE_MAX") ? strtoull(getenv("RT_TRACE_MAX"), 0, 0) : 2000)) fprintf(stderr, "[fn] %08x esp=%08x eax=%08x esi=%08x\n", addr, c->esp, c->eax, c->esi);
+}
 static GuestFn *htab; static uint32_t *hkey; static uint32_t hmask;
 
 static void build_table(void) {
@@ -37,25 +46,49 @@ static void cov_write(void) { const char *p = getenv("BLUR_COVER"); if (!p || !c
 // ---- thread hand-off ---------------------------------------------------------------------------------------------------------
 static pthread_mutex_t bm = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t bcv[MAX_THREADS];
+static struct { uint32_t pc, first; uint64_t n[32]; } pcc[8]; static int npcc;
 static uint64_t t_end;
 
+static void prof_dump(void);
 static void finish_process(Ctx *c) {
     cov_write();
     if (getenv("BLUR_DUMPMEM")) { FILE *f = fopen(getenv("BLUR_DUMPMEM"), "wb"); if (f) { fwrite(G + 0x20000000u, 1, 0x40000000u, f); fclose(f); fprintf(stderr, "[dumpmem] guest 0x20000000..0x60000000 written\n"); } }
     if (getenv("BLUR_STATS")) {
         fprintf(stderr, "[stats] most called APIs:\n");
-        for (int n = 0; n < 120; n++) { int best = -1; for (int i = 0; i < c->nstubs; i++) if (c->stubs[i].calls && (best < 0 || c->stubs[i].calls > c->stubs[best].calls)) best = i;
+        for (int n = 0; n < 3000; n++) { int best = -1; for (int i = 0; i < c->nstubs; i++) if (c->stubs[i].calls && (best < 0 || c->stubs[i].calls > c->stubs[best].calls)) best = i;
             if (best < 0) break; fprintf(stderr, "  %10llu  %s!%s\n", (unsigned long long)c->stubs[best].calls, c->stubs[best].dll, c->stubs[best].name); c->stubs[best].calls = 0; }
     }
     if (getenv("BLUR_THREADS")) for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (!t->used) continue;
-        fprintf(stderr, "[thread %2d] %s%s%s apis=%u last=%s(%08x,%08x) ret=%08x wake_at=%llu\n", i, t->done ? "done " : "", t->suspended ? "suspended " : "", t->blocked ? "blocked " : "", t->n_api, t->last_api ? t->last_api : "-", t->last_a0, t->last_a1, t->last_ret, (unsigned long long)t->wake_at); }
-    d3d9_report(c);
+        fprintf(stderr, "[thread %2d] entry=%08x param=%08x [p+4]=%08x [p+8]=%08x %s%s%s apis=%u last=%s(%08x,%08x) ret=%08x wake_at=%llu\n", i, t->entry, t->param, t->param > 0x10000 ? M32(t->param + 4) : 0, t->param > 0x10000 ? M32(t->param + 8) : 0, t->done ? "done " : "", t->suspended ? "suspended " : "", t->blocked ? "blocked " : "", t->n_api, t->last_api ? t->last_api : "-", t->last_a0, t->last_a1, t->last_ret, (unsigned long long)t->wake_at); }
+    if (getenv("BLUR_FINDBYTES")) {      // BLUR_FINDBYTES=<file>[,nprobe]: look for 32-byte probes of a (host-decompressed) file in guest memory at exit; probes are spread over the file, one per 64 KB chunk index
+        char fn[512]; snprintf(fn, sizeof fn, "%s", getenv("BLUR_FINDBYTES")); int np = 24; char *cm = strchr(fn, ','); if (cm) { *cm = 0; np = atoi(cm + 1); }
+        FILE *f = fopen(fn, "rb"); if (f) { fseek(f, 0, SEEK_END); long sz = ftell(f); uint8_t *d = malloc((size_t)sz); fseek(f, 0, SEEK_SET); if (fread(d, 1, (size_t)sz, f)) {}
+            fclose(f); long nch = sz / 65536; fprintf(stderr, "[findbytes] %s: %ld bytes, %ld chunks\n", fn, sz, nch);
+            for (int i = 0; i < np; i++) { long ch = nch > 1 ? (long)i * (nch - 1) / (np > 1 ? np - 1 : 1) : 0; long off = ch * 65536 + 1000; if (off + 32 > sz) continue;
+                uint8_t *base = G + 0x20000000u; size_t len = 0x40000000u, found = 0, hits = 0; uint8_t *q = base; uint32_t first = 0;
+                while (len >= 32 && (q = memmem(q, len, d + off, 32))) { hits++; if (!found) { found = (size_t)(q - G); first = (uint32_t)found; } q++; len = (size_t)(base + 0x40000000u - q); }
+                fprintf(stderr, "[findbytes] chunk %ld (file+%lx): %s first=%08x hits=%zu\n", ch, off, hits ? "FOUND" : "missing", first, hits); }
+            free(d); } }
+    if (getenv("BLUR_PCCOUNT")) for (int q = 0; q < 8 && pcc[q].pc; q++) { fprintf(stderr, "[pccount] %08x:", pcc[q].pc); for (int t = 0; t < 32; t++) if (pcc[q].n[t]) fprintf(stderr, " t%d=%llu", t, (unsigned long long)pcc[q].n[t]); fprintf(stderr, "\n"); }
+    if (getenv("BLUR_PCPROF")) prof_dump();
+    if (getenv("BLUR_SYNCSTAT")) hle_sync_report(c);
+    if (getenv("BLUR_DUMPAT")) { uint32_t a = (uint32_t)strtoul(getenv("BLUR_DUMPAT"), 0, 16), n = 64; const char *q = strchr(getenv("BLUR_DUMPAT"), ','); if (q) n = (uint32_t)strtoul(q + 1, 0, 10);
+        for (uint32_t i = 0; i < n; i += 8) { fprintf(stderr, "[dumpat] %08x:", a + 4 * i); for (uint32_t k = 0; k < 8 && i + k < n; k++) fprintf(stderr, " %08x", M32(a + 4 * (i + k))); fprintf(stderr, "\n"); } }
+    if (getenv("BLUR_FINDPTR")) {       // BLUR_FINDPTR=hexA,hexB: list every aligned dword in the guest heap/VirtualAlloc area equal to one of the values, with 16 words of context before/after
+        uint32_t v[4]; int nv = 0; const char *p = getenv("BLUR_FINDPTR"); while (*p && nv < 4) { v[nv++] = (uint32_t)strtoul(p, (char **)&p, 16); if (*p == ',') p++; }
+        int hits = 0; for (uint64_t a = 0x20000000u; a < 0x60000000u && hits < 80; a += 4) { uint32_t w = M32((uint32_t)a); for (int i = 0; i < nv; i++) if (w == v[i]) { hits++;
+            fprintf(stderr, "[findptr] %08x = %08x  words@-0x40..:", (uint32_t)a, w); for (int k = -16; k < 8; k++) fprintf(stderr, " %08x", M32((uint32_t)a + 4 * (uint32_t)k)); fprintf(stderr, "\n"); } } }
+    { extern void d3d9_texaudit(Ctx *, const char *); extern void io_report(void); if (getenv("BLUR_SYNCSTAT")) io_report(); d3d9_texaudit(c, "exit"); } heapchk_scan(c, "at exit");
+    d3d9_report(c); prof_report(c);
+    fprintf(stderr, "[heap] %u MB of the guest heap used\n", (c->heap_next - 0x20000000u) >> 20);
     fprintf(stderr, "[exit] status=%d code=%u\n", c->exited, c->exit_code);
     fflush(stderr); _exit(c->exited == 1 ? (int)c->exit_code : c->exited);
 }
 
+static int sched_filter = 1;     // BLUR_SCHED_NOFILTER=1: old behaviour (switch to every blocked thread so it can re-poll its wait)
 static int pick_next(Ctx *c, int self) {
-    for (int k = 1; k <= c->nthreads; k++) { int i = (self + k) % c->nthreads; Thread *t = &c->threads[i]; if (t->used && !t->done && !t->suspended) return i; }
+    g_sched_now = 0; { int need = 0; for (int i = 0; i < c->nthreads; i++) if (c->threads[i].blocked && c->threads[i].wake_at) need = 1; if (need) g_sched_now = now_us(); }
+    for (int k = 1; k <= c->nthreads; k++) { int i = (self + k) % c->nthreads; Thread *t = &c->threads[i]; if (t->used && !t->done && !t->suspended && (!sched_filter || thread_can_run(c, t))) return i; }
     return -1;
 }
 
@@ -68,9 +101,44 @@ static void give_turn(Ctx *c, int idx) {
     else pthread_cond_signal(&bcv[idx]);
     pthread_mutex_unlock(&bm);
 }
+// ---- coroutine hand-off (default; BLUR_NOCORO=1 for the pthread baton): each guest thread is a coroutine with its own host stack, all on the main host thread.
+// A switch is a register save/restore instead of condvar signal + OS context switch (~15 us, 54% of process time in the kernel before).  arm64 only; other hosts fall back.
+static int coro_mode; static void *coro_sp[MAX_THREADS]; static int coro_start_idx;
+#if defined(__aarch64__)
+__asm__(".text\n.globl _coro_switch\n.p2align 2\n_coro_switch:\n"
+        "sub sp, sp, #176\n stp x19, x20, [sp, #0]\n stp x21, x22, [sp, #16]\n stp x23, x24, [sp, #32]\n stp x25, x26, [sp, #48]\n stp x27, x28, [sp, #64]\n stp x29, x30, [sp, #80]\n"
+        "stp d8, d9, [sp, #96]\n stp d10, d11, [sp, #112]\n stp d12, d13, [sp, #128]\n stp d14, d15, [sp, #144]\n mov x9, sp\n str x9, [x0]\n mov sp, x1\n"
+        "ldp x19, x20, [sp, #0]\n ldp x21, x22, [sp, #16]\n ldp x23, x24, [sp, #32]\n ldp x25, x26, [sp, #48]\n ldp x27, x28, [sp, #64]\n ldp x29, x30, [sp, #80]\n"
+        "ldp d8, d9, [sp, #96]\n ldp d10, d11, [sp, #112]\n ldp d12, d13, [sp, #128]\n ldp d14, d15, [sp, #144]\n add sp, sp, #176\n ret\n");
+void coro_switch(void **save, void *to);
+#else
+static void coro_switch(void **save, void *to) { (void)save; (void)to; abort(); }
+#endif
+static void thread_body(int idx);
+static void coro_tramp(void) { thread_body(coro_start_idx); __builtin_trap(); }
+static void coro_prepare(int idx) {
+    size_t sz = 16u << 20; uint8_t *st = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (st == MAP_FAILED) { perror("coro stack"); exit(1); }
+    uint64_t *sp = (uint64_t *)(st + sz - 176); memset(sp, 0, 176); sp[11] = (uint64_t)(uintptr_t)coro_tramp; coro_sp[idx] = sp;     // x30 slot: the first `ret` enters the trampoline
+}
 static void wait_turn(Ctx *c, int idx) { pthread_mutex_lock(&bm); while (c->cur != idx) pthread_cond_wait(&bcv[idx], &bm); pthread_mutex_unlock(&bm); }
 
-static uint64_t g_switches;
+static void transfer(Ctx *c, int self, int n) {
+    if (coro_mode) { c->cur = n; if (!coro_sp[n]) { coro_prepare(n); coro_start_idx = n; } coro_switch(&coro_sp[self], coro_sp[n]); return; }
+    give_turn(c, n); wait_turn(c, self);
+}
+static void transfer_exit(Ctx *c, int n) {          // the calling thread is finished: never resumed
+    if (coro_mode) { void *dummy; c->cur = n; if (!coro_sp[n]) { coro_prepare(n); coro_start_idx = n; } coro_switch(&dummy, coro_sp[n]); }
+    give_turn(c, n);
+}
+uint64_t g_switches;
+// every thread waits: sleep until the earliest timer instead of polling.  nanosleep to ~BLUR_SPIN_US before the deadline (macOS timer coalescing makes wake-ups late and uneven), then spin.
+static uint64_t g_pace_until;      // deadline of the current vsync wait: only that one is worth spinning for
+static void sleep_until_us(uint64_t dl) {
+    static long spin = -1; if (spin < 0) spin = getenv("BLUR_SPIN_US") ? atol(getenv("BLUR_SPIN_US")) : 400;
+    long spin_now = dl == g_pace_until ? spin : 0;
+    for (;;) { uint64_t n = now_us(); if (n >= dl) return; uint64_t rem = dl - n;
+        if (rem > (uint64_t)spin_now + 50) { struct timespec ts = {0, (long)((rem - (uint64_t)spin_now) * 1000)}; nanosleep(&ts, NULL); } }
+}
 static uint64_t last_prog; static int idle_n; static uint64_t idle_since;
 static void rt_yield(Ctx *c) {
     if (t_end && real_us() > t_end) { c->exited = 5; finish_process(c); }
@@ -86,12 +154,18 @@ static void rt_yield(Ctx *c) {
         usleep(200);
     }
     int n = pick_next(c, self);
+    if (n < 0 && !g_det_on) { uint64_t dl = thread_next_deadline(c); if (dl) { sleep_until_us(dl); return; } }
     if (n < 0 || n == self) return;
     if (getenv("RT_SCHED")) fprintf(stderr, "[sched] n=%llu yield %d -> %d (nthreads=%d)\n", (unsigned long long)g_apilog_n, self, n, c->nthreads);
-    g_switches++; give_turn(c, n); wait_turn(c, self);
+    uint64_t py0 = 0; if (g_prof) { py0 = prof_now(); prof_seg_end(); }
+    if (g_prof) prof_thread_switch(self);
+    g_switches++; transfer(c, self, n);
+    if (g_prof) { prof_yield_ns += prof_now() - py0; prof_seg_begin(); }
 }
 
-void rt_preempt(Cpu *cpu) { cpu->budget = 200000; rt_yield(C); }
+static int g_budget = -1;
+static int get_budget(void) { if (g_budget < 0) g_budget = getenv("BLUR_BUDGET") ? atoi(getenv("BLUR_BUDGET")) : 200000; return g_budget; }   // BLUR_BUDGET=n: function entries per time slice (default 200000)
+void rt_preempt(Cpu *cpu) { cpu->budget = get_budget(); rt_yield(C); }
 void rt_spin(Cpu *cpu) { (void)cpu; Thread *t = cur_thread(C); if (++t->spin_n >= 40) { t->spin_n = 0; rt_yield(C); } }
 
 // ---- CPUID / RDTSC -----------------------------------------------------------------------------------------------------------
@@ -112,29 +186,72 @@ void rt_unsupported(Cpu *cpu, uint32_t a, const char *w) { (void)cpu; fprintf(st
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
-static uint32_t ww_lo, ww_hi; static int ww_hits;
+static uint32_t ww_lo, ww_hi; static int ww_hits, ww_prot = PROT_READ;
 static uintptr_t ww_open[512]; static int ww_nopen;
-void ww_rearm(void) { for (int i = 0; i < ww_nopen; i++) mprotect((void *)ww_open[i], 0x4000, PROT_READ); ww_nopen = 0; }
+void ww_rearm(void) { for (int i = 0; i < ww_nopen; i++) mprotect((void *)ww_open[i], 0x4000, ww_prot); ww_nopen = 0; }
 static void ww_handler(int sig, siginfo_t *si, void *uctx) {
     (void)sig; (void)uctx; uintptr_t fa = (uintptr_t)si->si_addr; uintptr_t base = (uintptr_t)G;
-    if (fa < base + ww_lo || fa >= base + ww_hi) { signal(SIGSEGV, SIG_DFL); return; }
+    if (fa < base + (ww_lo & ~0x3fffu) || fa >= base + ((ww_hi + 0x3fffu) & ~0x3fffu)) { signal(SIGSEGV, SIG_DFL); return; }
     void *bt[10]; int n = backtrace(bt, 10); int host = 0; char names[400] = ""; 
     for (int i = 0; i < n; i++) { Dl_info di; if (dladdr(bt[i], &di) && di.dli_sname) { if (!strcmp(di.dli_sname, "guest_alloc") || !strcmp(di.dli_sname, "rt_api") || !strncmp(di.dli_sname, "h_", 2) || !strncmp(di.dli_sname, "rd", 2) || !strncmp(di.dli_sname, "wr", 2) || strstr(di.dli_sname, "uc_mem")) host = 1; if (i > 1 && strlen(names) < 340) { strcat(names, " "); strcat(names, di.dli_sname); } } }
-    if (!host && ww_hits < 60) { ww_hits++; fprintf(stderr, "[watchw] write to %08x by:%s\n", (uint32_t)(fa - base), names); }
+    if (fa >= base + ww_lo && fa < base + ww_hi && ww_prot == PROT_NONE && ww_hits < 80) { ww_hits++; Thread *t = &C->threads[C->cur]; Cpu *cp = t->cpu;
+        fprintf(stderr, "[watchr] read %08x t%d pc=%08x esp=%08x stack:", (uint32_t)(fa - base), C->cur, cp ? cp->pc : 0, cp ? cp->esp : 0);
+        if (cp) for (int k = 0; k < 40; k++) { uint32_t w = *(uint32_t *)(G + cp->esp + 4 * k); if (w >= 0x401000 && w < 0xe40000) fprintf(stderr, " %08x", w); } fprintf(stderr, "\n"); }
+    else if (!host && ww_hits < (getenv("BLUR_WATCHMAX") ? atoi(getenv("BLUR_WATCHMAX")) : 60) && ww_prot != PROT_NONE && (uint32_t)(fa - base) >= ww_lo && (uint32_t)(fa - base) < ww_hi) { ww_hits++; fprintf(stderr, "[watchw] %s %08x (thread %d, val now %08x) by:%s\n", ww_prot == PROT_NONE ? "access to" : "write to", (uint32_t)(fa - base), C->cur, M32((uint32_t)(fa - base) & ~3u), names); }
     uintptr_t pg = fa & ~(uintptr_t)0x3fff; mprotect((void *)pg, 0x4000, PROT_READ | PROT_WRITE); if (ww_nopen < 512) ww_open[ww_nopen++] = pg;
 }
 void ww_arm(void) {
-    const char *e = getenv("BLUR_WATCHW"); if (!e) return; ww_lo = (uint32_t)strtoul(e, 0, 16); const char *d = strchr(e, '-'); ww_hi = d ? (uint32_t)strtoul(d + 1, 0, 16) : ww_lo + 4;
+    const char *e = getenv("BLUR_WATCHW"); if (!e) { e = getenv("BLUR_WATCHR"); if (!e) return; ww_prot = PROT_NONE; } ww_lo = (uint32_t)strtoul(e, 0, 16); const char *d = strchr(e, '-'); ww_hi = d ? (uint32_t)strtoul(d + 1, 0, 16) : ww_lo + 4;
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = ww_handler; sa.sa_flags = SA_SIGINFO; sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
-    uint32_t lo = ww_lo & ~0x3fffu, hi = (ww_hi + 0x3fff) & ~0x3fffu; mprotect(G + lo, hi - lo, PROT_READ);
+    uint32_t lo = ww_lo & ~0x3fffu, hi = (ww_hi + 0x3fff) & ~0x3fffu; mprotect(G + lo, hi - lo, ww_prot);
     fprintf(stderr, "[watchw] armed %08x-%08x\n", ww_lo, ww_hi);
 }
 // ---- API dispatch ------------------------------------------------------------------------------------------------------------
 uint32_t g_api_ret, g_api_esp;
+// BLUR_ARGREC=<frame>: per API stub call counts + the first 6 distinct (caller, args) tuples, dumped to stderr when that frame is presented
+extern uint64_t g_frames_pub;
+static struct { const void *s; const char *kind, *dll, *name; int nargs; uint64_t n; int nrec; struct { uint32_t ret, a[8]; } r[6]; } *argtab; static int nargtab, argrec_on = -1; static uint64_t argrec_frame;
+extern hle_fn g_triv_fns[]; extern uint32_t com_ok(Ctx *, uint32_t *);
+static const char *argrec_kind(const Stub *s) { static const char *nm[] = {"t_0","t_1","t_m1","t_handle","t_err2","t_fail","t_nodata","t_nodev"}; if (s->fn == com_ok) return "COM-OK-STUB"; for (int i = 0; i < 8; i++) if (s->fn == g_triv_fns[i]) return nm[i]; return ""; }
+static void argrec_dump(void) { for (int i = 0; i < nargtab; i++) { fprintf(stderr, "[argrec] %s!%s n=%llu nargs=%d %s\n", argtab[i].dll, argtab[i].name, (unsigned long long)argtab[i].n, argtab[i].nargs, argtab[i].kind); for (int k = 0; k < argtab[i].nrec; k++) { fprintf(stderr, "[argrec]    ret=%08x:", argtab[i].r[k].ret); for (int j = 0; j < argtab[i].nargs && j < 8; j++) fprintf(stderr, " %08x", argtab[i].r[k].a[j]); fprintf(stderr, "\n"); } } }
+static void argrec_note(const Stub *s, uint32_t ret, const uint32_t *a) {
+    if (argrec_on < 0) { const char *e = getenv("BLUR_ARGREC"); argrec_on = e != NULL; argrec_frame = e ? strtoull(e, 0, 0) : 0; if (argrec_on) argtab = calloc(8192, sizeof *argtab); }
+    if (!argrec_on) return;
+    if (argrec_on == 1 && g_frames_pub >= argrec_frame) { argrec_on = 2; argrec_dump(); return; }
+    if (argrec_on != 1) return;
+    int i; for (i = 0; i < nargtab; i++) if (argtab[i].s == s) break;
+    if (i == nargtab) { if (nargtab >= 8192) return; nargtab++; argtab[i].s = s; argtab[i].kind = argrec_kind(s); argtab[i].dll = s->dll; argtab[i].name = s->name; argtab[i].nargs = s->nargs; }
+    argtab[i].n++;
+    for (int k = 0; k < argtab[i].nrec; k++) { int same = argtab[i].r[k].ret == ret; for (int j = 0; j < 8 && same; j++) if (argtab[i].r[k].a[j] != a[j]) same = 0; if (same) return; }
+    if (argtab[i].nrec < 6) { argtab[i].r[argtab[i].nrec].ret = ret; memcpy(argtab[i].r[argtab[i].nrec].a, a, 32); argtab[i].nrec++; }
+}
+
 static uint32_t cont_addr;      // stub a guest callback returns to, when the API handler wants its result adjusted afterwards
 
 // Run one host API called with the guest stack [ret][args...]; returns the guest address to continue at.
 void audio_tick(Ctx *c);
+// vsync emulation: the game presents flat out in loading screens (2500 Present/s measured, thousands of D3D objects per second, a flooded viewer); a real
+// display would hold Present to the refresh rate.  The thread sleeps (other guest threads keep running) until the next refresh tick.  BLUR_NOVSYNC=1 disables, BLUR_REFRESH=<hz> (default 60).
+extern volatile uint32_t g_net_ack; extern volatile int g_net_ack_seen;
+static const Stub *present_stub;
+static void pace_present(Ctx *c) {
+    static uint32_t sent;
+    // viewer back-pressure: the page acks every presented frame; do not run more than BLUR_MAXLAG (4) frames ahead of it (it would only queue them in browser memory = latency). Gives up after 100 ms (hidden tab, old page).
+    if (g_net_ack_seen && net_client_connected()) { static int maxlag = -1; if (maxlag < 0) maxlag = getenv("BLUR_MAXLAG") ? atoi(getenv("BLUR_MAXLAG")) : 4; sent++;
+        if ((int32_t)(sent - g_net_ack) > maxlag) { uint64_t until = now_us() + 100000; Thread *t = cur_thread(c); t->wake_at = until; t->wk = 2; t->blocked = 1; g_pace_until = until;
+            while ((int32_t)(sent - g_net_ack) > maxlag && now_us() < until) { t->wake_at = now_us() + 1000; rt_yield(c); } g_pace_until = 0; t->blocked = 0; t->wake_at = 0; t->wk = 0; if (g_prof) prof_seg_end(); } }
+    static uint64_t next; static uint64_t period; static int on = -1;
+    if (on < 0) { on = !getenv("BLUR_NOVSYNC") && !g_det_on; uint32_t hz = getenv("BLUR_REFRESH") ? (uint32_t)atoi(getenv("BLUR_REFRESH")) : 60; period = 1000000ull / (hz ? hz : 60); }
+    if (!on) return;
+    { extern uint64_t g_last_draws; if (g_last_draws <= 8) { next = 0; return; } }       // loading screens (<= 8 draws): the game loads a slice per frame, so pacing them would triple the load time (wasm-core measured 51 s -> 69 s)
+    uint64_t n = now_us(); if (!next || n > next + 2 * period) next = n;       // behind by more than 2 frames: do not burst to catch up
+    next += period; if (n >= next) return;
+    Thread *t = cur_thread(c); t->wake_at = next; t->wk = 2; t->blocked = 1; g_pace_until = next;
+    while (now_us() < next) rt_yield(c);
+    g_pace_until = 0;
+    if (g_prof) prof_seg_end();
+    t->blocked = 0; t->wake_at = 0; t->wk = 0;
+}
 static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
     Ctx *c = C; Stub *s = &c->stubs[(addr - STUB_BASE) / 16];
     if (addr == cont_addr) {                                  // a callback requested by an API handler returned
@@ -145,15 +262,22 @@ static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
     }
     audio_tick(c);
     uint32_t esp = cpu->esp, ret = M32(esp), a[16]; memcpy(a, G + esp + 4, sizeof a);
+    if (g_prof) { prof_api++; prof_note_api(c, s); prof_seg_begin_stub((int)((addr - STUB_BASE) / 16)); }
     if (!s->fn) {
         fprintf(stderr, "\n[UNIMPLEMENTED] %s!%s  nargs=%d %s  ret=%08x\n  args:", s->dll, s->name, s->nargs, s->cdecl_ ? "cdecl" : "stdcall", ret);
         for (int i = 0; i < 6; i++) fprintf(stderr, " %08x", a[i]);
         fprintf(stderr, "\n"); c->exited = 2; finish_process(c);
     }
+    { static const char *lst = (const char *)1; if (lst == (const char *)1) lst = getenv("BLUR_APITRACE");      // BLUR_APITRACE=CreateFileA,GetFileSize: distinct call chains (code addresses on the guest stack) + first args
+      if (lst && strstr(lst, s->name)) { static struct { const Stub *s; uint32_t h; } seen[256]; static int ns; uint32_t ch[10]; int n = 0; uint32_t hh = 0;
+        for (int k = 0; k < 120 && n < 10; k++) { uint32_t w = M32(esp + 4 * k); if (w >= 0x401000 && w < 0xe40000) { ch[n++] = w; hh = hh * 31 + w; } }
+        int dup = 0; for (int i = 0; i < ns; i++) if (seen[i].s == s && seen[i].h == hh) dup = 1;
+        if (!dup && ns < 256) { seen[ns].s = s; seen[ns++].h = hh; { char nm[160] = ""; if (strstr(s->name, "File") || strstr(s->name, "Directory")) { rd_cstr(c, a[0], nm, sizeof nm); } fprintf(stderr, "[apitrace] t%d %s(%08x,%08x,%08x,%08x) \"%s\" chain:", c->cur, s->name, a[0], a[1], a[2], a[3], nm); } for (int i = 0; i < n; i++) fprintf(stderr, " %08x", ch[i]); fprintf(stderr, "\n"); } } }
     uint32_t r;
     for (;;) {
         if (c->verbose) fprintf(stderr, "[api t%d] %s!%s(%08x,%08x,%08x,%08x) ret=%08x esp=%08x\n", c->cur, s->dll, s->name, a[0], a[1], a[2], a[3], ret, esp);
-        g_api_ret = ret; g_api_esp = esp; g_cur_api = s->name; g_det_ticks++; apilog_call(c->cur, s->name, a); { Thread *tt = cur_thread(c); tt->last_api = s->name; tt->last_ret = ret; tt->last_a0 = a[0]; tt->last_a1 = a[1]; tt->n_api++; } s->calls++; r = s->fn(c, a);
+        cur_thread(c)->wk = 0;
+        g_api_ret = ret; g_api_esp = esp; g_cur_api = s->name; g_det_ticks++; apilog_call(c->cur, s->name, a); argrec_note(s, ret, a); { Thread *tt = cur_thread(c); tt->last_api = s->name; tt->last_ret = ret; tt->last_a0 = a[0]; tt->last_a1 = a[1]; tt->n_api++; } s->calls++; r = s->fn(c, a);
         if (c->exited) finish_process(c);
         if (!c->block) break;
         c->block = 0; cur_thread(c)->blocked = 1; rt_yield(c);
@@ -169,6 +293,9 @@ static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
         next = q.fn;
     } else cpu->eax = r;
     cpu->esp = nesp;
+    if (g_prof) prof_seg_end();
+    if (!present_stub) { if (s->name[0] == 'I' && !strcmp(s->name, "IDirect3DDevice9::Present")) present_stub = s; }
+    if (s == present_stub) pace_present(c);
     if (c->yield_req) { c->yield_req = 0; rt_yield(c); }
     else if (c->api_slice && ++c->api_since_switch >= c->api_slice) { c->api_since_switch = 0; rt_yield(c); }
     return next;
@@ -177,7 +304,18 @@ static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
 static void hook_dump(void);
 static void rt_missing(Cpu *cpu, uint32_t target) {
     fprintf(stderr, "\n[rt] jump to code that was not recompiled: %08x (esp=%08x [esp]=%08x eax=%08x ecx=%08x) [esp+4]=%08x [esp+8]=%08x\n", target, cpu->esp, M32(cpu->esp), cpu->eax, cpu->ecx, M32(cpu->esp + 4), M32(cpu->esp + 8));
+    {   // post-mortem: registers, last functions entered by this thread, and the guest stack with code-address candidates
+        Thread *ct = cur_thread(C); fprintf(stderr, "[miss] thread %d tid=%x entry=%08x stack=%08x-%08x teb=%08x last_api=%s ret=%08x n_api=%u\n", C->cur, ct->tid, ct->entry, ct->stack_lo, ct->stack_hi, ct->teb, ct->last_api ? ct->last_api : "-", ct->last_ret, ct->n_api);
+        fprintf(stderr, "[miss] regs eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", cpu->eax, cpu->ecx, cpu->edx, cpu->ebx, cpu->esp, cpu->ebp, cpu->esi, cpu->edi);
+        if (ring_on) { int t = C->cur; fprintf(stderr, "[miss] last functions (oldest first, addr@esp):"); for (int k = 48; k >= 1; k--) { uint32_t i = (ring_i[t] - k) & (RING_N - 1); fprintf(stderr, " %x@%x", ring_a[t][i], ring_s[t][i]); } fprintf(stderr, "\n"); }
+        fprintf(stderr, "[miss] stack:"); for (int k = 0; k < 48; k++) { uint32_t v = M32(cpu->esp + 4 * k); fprintf(stderr, " %s%08x", (v >= 0x401000 && v < 0x2070000) ? "*" : "", v); } fprintf(stderr, "\n");
+        for (int k = 0; k < C->nthreads; k++) { Thread *t = &C->threads[k]; if (!t->used) continue; Cpu *tc = t->cpu; fprintf(stderr, "[miss] thread %2d %s%s%s esp=%08x apis=%u last=%s(%08x,%08x) ret=%08x\n", k, t->done ? "done " : "", t->suspended ? "susp " : "", t->blocked ? "blocked " : "", tc ? tc->esp : 0, t->n_api, t->last_api ? t->last_api : "-", t->last_a0, t->last_a1, t->last_ret); }
+    }
+    { extern void d3d9_dbg_obj(Ctx *, uint32_t, const char *); d3d9_dbg_obj(C, cpu->esi, "esi"); d3d9_dbg_obj(C, cpu->edi, "edi"); for (int k = 0; k < 16; k++) { uint32_t v = M32(cpu->esp + 4 * k); if (v >= 0x20000000u && v < 0x58000000u) d3d9_dbg_obj(C, v, "stk"); } }
     if (getenv("RT_DUMP")) { uint32_t a = (uint32_t)strtoul(getenv("RT_DUMP"), 0, 16); fprintf(stderr, "[dump %08x]", a); for (int k = 0; k < 24; k++) fprintf(stderr, " %08x", M32(a + 4 * k)); fprintf(stderr, "\n"); }
+    heapchk_scan(C, "at crash");
+    { uint32_t rv[8] = { cpu->eax, cpu->ecx, cpu->edx, cpu->ebx, cpu->ebp, cpu->esi, cpu->edi, target }; static const char *rn[8] = { "eax", "ecx", "edx", "ebx", "ebp", "esi", "edi", "target" };
+      for (int k = 0; k < 8; k++) heapdbg_describe(C, rv[k], rn[k]); for (int k = 0; k < 32; k++) { char tg[16]; snprintf(tg, sizeof tg, "[esp+%d]", 4 * k); heapdbg_describe(C, M32(cpu->esp + 4 * k), tg); } }
     // only image/msvcr90 addresses are recompile candidates (garbage targets from heap corruption are not); BLUR_LEARNED overrides the output file
     if ((target >= 0x400000 && target < 0x2070000) || (target >= 0x78520000 && target < 0x78600000)) { const char *lp = getenv("BLUR_LEARNED"); FILE *lf = fopen(lp ? lp : "../recomp/learned_x.txt", "a"); if (lf) { fprintf(lf, "%08x\n", target); fclose(lf); } }
     hook_dump(); fflush(stderr); C->exited = 6; finish_process(C);
@@ -186,30 +324,65 @@ static void rt_missing(Cpu *cpu, uint32_t target) {
 // The trampoline every lifted function ends in (as a tail call): continue at cpu->pc.
 // BLUR_HOOK=addr[,addr..]: log entries (cdecl args) and return values of the guest functions at those addresses
 static void lua_init(void);
-static uint32_t hook_addr[16]; static int nhook = -1; static struct { uint32_t ret, esp, fn; } hook_pend[256]; static int nhook_pend; static int hook_budget = 400;
-static void hook_init(void) { nhook = (getenv("BLUR_POKE") || getenv("BLUR_LUATRACE")) ? 1 : 0; if (getenv("BLUR_LUATRACE")) lua_init(); hook_addr[0] = 0; const char *e = getenv("BLUR_HOOK"); if (nhook) { nhook = 1; hook_addr[0] = 0xffffffffu; } while (e && *e && nhook < 16) { hook_addr[nhook++] = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; } }
+static uint32_t hook_addr[16]; static int nhook = -1; static struct { uint32_t ret, esp, fn; } hook_pend[256]; static int nhook_pend; static int hook_budget = 400; static int hook_budget_init;
+static void hook_init(void) { nhook = 1; lua_init(); hook_addr[0] = 0; const char *e = getenv("BLUR_HOOK"); if (nhook) { nhook = 1; hook_addr[0] = 0xffffffffu; } while (e && *e && nhook < 16) { hook_addr[nhook++] = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; } }
 // BLUR_LUATRACE=1: log every entry into one of the 255 Lua C bindings (table from ../work/net-re/script_bindings.txt: <slot> <name> <fn address>)
-static struct { uint32_t a; char name[48]; uint32_t n; } lua_b[300]; static int nlua; extern uint64_t g_frames_pub;
-static void lua_init(void) { const char *p = getenv("BLUR_LUATRACE_TABLE"); FILE *f = fopen(p ? p : "../work/net-re/script_bindings.txt", "r"); char l[256]; if (!f) { fprintf(stderr, "[lua] no binding table\n"); return; }
-    while (fgets(l, sizeof l, f) && nlua < 300) { unsigned slot, fn; char nm[64]; if (sscanf(l, "%x %63s %x", &slot, nm, &fn) == 3) { lua_b[nlua].a = fn; snprintf(lua_b[nlua].name, 48, "%s", nm); nlua++; } } fclose(f); fprintf(stderr, "[lua] tracing %d bindings\n", nlua); }
-static void lua_check(Cpu *cpu, uint32_t pc) { for (int i = 0; i < nlua; i++) if (lua_b[i].a == pc) { lua_b[i].n++; static uint64_t t0; uint64_t t = real_us(); if (!t0) t0 = t;
-    if (lua_b[i].n <= 40 || (lua_b[i].n & (lua_b[i].n - 1)) == 0) fprintf(stderr, "[lua] %s #%u frame=%llu t=%llums thread=%d L=%08x\n", lua_b[i].name, lua_b[i].n, (unsigned long long)g_frames_pub, (unsigned long long)((t - t0) / 1000), C->cur, M32(cpu->esp + 4)); return; } }
+static struct { uint32_t a; char name[48]; uint32_t n; long first; } lua_b[300]; static int nlua, lua_quiet; extern uint64_t g_frames_pub;
+long lua_binding_first_frame(const char *nm) { for (int i = 0; i < nlua; i++) if (lua_b[i].n && !strcmp(lua_b[i].name, nm)) return lua_b[i].first; return -1; }
+static void lua_init(void) { const char *p = getenv("BLUR_LUATRACE_TABLE"); FILE *f = fopen(p ? p : "../work/net-re/script_bindings.txt", "r"); char l[256]; if (!f) { if (getenv("BLUR_LUATRACE")) fprintf(stderr, "[lua] no binding table\n"); return; }
+    while (fgets(l, sizeof l, f) && nlua < 300) { unsigned slot, fn; char nm[64]; if (sscanf(l, "%x %63s %x", &slot, nm, &fn) == 3) { lua_b[nlua].a = fn; snprintf(lua_b[nlua].name, 48, "%s", nm); nlua++; } } fclose(f); if (getenv("BLUR_LUATRACE")) fprintf(stderr, "[lua] tracing %d bindings\n", nlua); else lua_quiet = 1; }
+static void seed_account(void) {       // BLUR_SEEDACCT=1: give the primary profile an account name/password (UTF-16 at profile+0xff9 / +0x1019) so ReadOnlineAccountDetails returns true
+    int32_t idx = *(int32_t *)(G + 0x10e5874); if (idx < 0 || idx >= 7) { fprintf(stderr, "[seed] no primary profile yet (idx=%d)\n", idx); return; }
+    uint32_t prof = 0x1212180u + 0x10 + (uint32_t)idx * 0x2100u; const char *nm = "BlurPlayer", *pw = "blurpass1";
+    for (int k = 0; ; k++) { *(uint16_t *)(G + prof + 0xff9 + 2 * k) = (uint8_t)nm[k]; if (!nm[k]) break; } for (int k = 0; ; k++) { *(uint16_t *)(G + prof + 0x1019 + 2 * k) = (uint8_t)pw[k]; if (!pw[k]) break; }
+    fprintf(stderr, "[seed] account name/password written into profile %08x\n", prof); }
+static void lua_check(Cpu *cpu, uint32_t pc) { for (int i = 0; i < nlua; i++) if (lua_b[i].a == pc) { lua_b[i].n++; if (lua_b[i].n == 1) lua_b[i].first = (long)g_frames_pub; if (!strcmp(lua_b[i].name, "ReadOnlineAccountDetails") && !(getenv("BLUR_SEEDACCT") && getenv("BLUR_SEEDACCT")[0] == '0')) seed_account(); static uint64_t t0; uint64_t t = real_us(); if (!t0) t0 = t;
+    if (!lua_quiet && (lua_b[i].n <= 40 || (lua_b[i].n & (lua_b[i].n - 1)) == 0)) fprintf(stderr, "[lua] %s #%u frame=%llu t=%llums thread=%d L=%08x\n", lua_b[i].name, lua_b[i].n, (unsigned long long)g_frames_pub, (unsigned long long)((t - t0) / 1000), C->cur, M32(cpu->esp + 4)); return; } }
 static struct { uint32_t pc, ret, a[4]; int t; } hook_ring[128]; static unsigned hook_n;    // BLUR_HOOK_TAIL=1: keep the last 128 entries, dumped when the run dies on a missing target
 static void hook_dump(void) { for (unsigned i = hook_n > 128 ? hook_n - 128 : 0; i < hook_n; i++) { typeof(hook_ring[0]) *e = &hook_ring[i & 127]; fprintf(stderr, "[hooktail] %08x t%d ret=%08x args %08x %08x %08x %08x\n", e->pc, e->t, e->ret, e->a[0], e->a[1], e->a[2], e->a[3]); } }
 static void hook_check(Cpu *cpu, uint32_t pc) {
+    if (!hook_budget_init) { hook_budget_init = 1; if (getenv("BLUR_HOOKMAX")) hook_budget = atoi(getenv("BLUR_HOOKMAX")); }
     if (nlua) lua_check(cpu, pc);
     { static uint32_t pat = 1, pa, pv; static uint32_t ppc; if (pat == 1) { pat = 0; const char *e = getenv("BLUR_POKE"); if (e) { ppc = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') pa = (uint32_t)strtoul(e + 1, (char **)&e, 16); if (*e == ',') pv = (uint32_t)strtoul(e + 1, 0, 16); pat = 2; } }
       if (pat == 2 && pc == ppc) { G[pa] = (uint8_t)pv; fprintf(stderr, "[poke] at pc %08x: [%08x] = %02x\n", pc, pa, pv); } }
     for (int i = 0; i < nhook_pend; i++) if (hook_pend[i].ret == pc && hook_pend[i].esp == cpu->esp) { if (hook_budget > 0) { hook_budget--; fprintf(stderr, "[hook] ret from %08x eax=%08x (t%d)\n", hook_pend[i].fn, cpu->eax, C->cur); } hook_pend[i] = hook_pend[--nhook_pend]; break; }
     for (int k = 0; k < nhook; k++) if (pc == hook_addr[k]) {
         if (getenv("BLUR_HOOK_TAIL")) { typeof(hook_ring[0]) *e = &hook_ring[hook_n++ & 127]; e->pc = pc; e->t = C->cur; e->ret = M32(cpu->esp); for (int q = 0; q < 4; q++) e->a[q] = M32(cpu->esp + 4 + 4 * q); }
-        else if (hook_budget > 0) { hook_budget--; fprintf(stderr, "[hook] enter %08x t%d ret=%08x args %08x %08x %08x %08x\n", pc, C->cur, M32(cpu->esp), M32(cpu->esp + 4), M32(cpu->esp + 8), M32(cpu->esp + 12), M32(cpu->esp + 16)); }
+        else if (hook_budget > 0) { hook_budget--; fprintf(stderr, "[hook] enter %08x t%d ecx=%08x edx=%08x ret=%08x args %08x %08x %08x %08x\n", pc, C->cur, cpu->ecx, cpu->edx, M32(cpu->esp), M32(cpu->esp + 4), M32(cpu->esp + 8), M32(cpu->esp + 12), M32(cpu->esp + 16)); }
         if (nhook_pend < 256) { hook_pend[nhook_pend].ret = M32(cpu->esp); hook_pend[nhook_pend].esp = cpu->esp + 4; hook_pend[nhook_pend++].fn = pc; }
+    }
+}
+static struct { uint32_t pc; uint32_t n; } prof_t[MAX_THREADS][512]; static int prof_on = -1;
+static void prof_hit(int t, uint32_t pc) { pc &= ~0xfu; unsigned h = (pc >> 4) * 2654435761u >> 23; for (int k = 0; k < 512; k++) { unsigned i = (h + (unsigned)k) & 511; if (prof_t[t][i].pc == pc || !prof_t[t][i].pc) { prof_t[t][i].pc = pc; prof_t[t][i].n++; return; } } }
+static void prof_dump(void) { for (int t = 0; t < MAX_THREADS; t++) { int any = 0; for (int i = 0; i < 512; i++) if (prof_t[t][i].pc) any = 1; if (!any) continue;
+    unsigned long long tot = 0; for (int i = 0; i < 512; i++) tot += prof_t[t][i].n; fprintf(stderr, "[pcprof] thread %d total=%llu top return/entry blocks (16-byte buckets):", t, tot);
+    for (int r = 0; r < 12; r++) { int b = -1; for (int i = 0; i < 512; i++) if (prof_t[t][i].n && (b < 0 || prof_t[t][i].n > prof_t[t][b].n)) b = i; if (b < 0) break; fprintf(stderr, " %08x:%u", prof_t[t][b].pc, prof_t[t][b].n); prof_t[t][b].n = 0; } fprintf(stderr, "\n"); } }
+// fast dispatch table: interleaved {key, fn}, multiplicative hash, linear probing into a padded tail (no wrap, no mask); used unless a diagnostic hook is on
+typedef struct { uint32_t k; GuestFn f; } FEnt;
+static FEnt *ftab; static unsigned fshift; static int rt_slow;
+static void build_fast(void) {
+    unsigned total = rt_table_n + rt_table_x_n, bits = 4; while ((1u << bits) < total * 2) bits++;
+    fshift = 32 - bits; ftab = calloc((size_t)(1u << bits) + 512, sizeof(FEnt));
+    for (unsigned i = 0; i < total; i++) {
+        uint32_t a = i < rt_table_n ? rt_table[i].a : rt_table_x[i - rt_table_n].a; GuestFn f = i < rt_table_n ? rt_table[i].f : rt_table_x[i - rt_table_n].f;
+        { int special = 0; for (int q = 0; q < nlua; q++) if (lua_b[q].a == a) special = 1; if (special) continue; }     // Lua binding entries must reach hook_check() (account seeding / tracing)
+        FEnt *e = &ftab[(a * 2654435761u) >> fshift]; while (e->k && e->k != a) e++;
+        if (e - ftab >= (long)(1u << bits) + 500) { fprintf(stderr, "[rt] fast table overflow\n"); exit(1); }
+        e->k = a; e->f = f;
     }
 }
 void rt_dispatch(Cpu *cpu) {
     for (;;) {
         uint32_t pc = cpu->pc;
+        if (__builtin_expect(!rt_slow, 1)) {                 // hot path: one probe sequence, tail call (stubs and RET_MAGIC miss and fall through)
+            FEnt *e = &ftab[(pc * 2654435761u) >> fshift];
+            while (e->k && e->k != pc) e++;
+            if (__builtin_expect(e->k == pc, 1)) MUSTTAIL return e->f(cpu);
+        }
+        if (g_prof) prof_dispatch++;
+        if (prof_on < 0) { prof_on = getenv("BLUR_PCPROF") != NULL; const char *e = getenv("BLUR_PCCOUNT"); while (e && *e && npcc < 8) { pcc[npcc++].pc = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; } }
+        if (prof_on) prof_hit(C->cur, pc);
+        if (npcc) for (int q = 0; q < npcc; q++) if (pcc[q].pc == pc) { pcc[q].n[C->cur & 31]++; if (!pcc[q].first) pcc[q].first = 1; }
         if (nhook < 0) hook_init();
         if (nhook) hook_check(cpu, pc);
         if (pc - STUB_BASE < STUB_SLOTS * 16u) { cpu->pc = rt_api(cpu, pc); continue; }
@@ -221,43 +394,50 @@ void rt_dispatch(Cpu *cpu) {
 }
 
 // ---- threads -----------------------------------------------------------------------------------------------------------------
-static void init_cpu(Cpu *cpu, uint32_t teb) { memset(cpu, 0, sizeof *cpu); cpu->budget = 200000; cpu->teb = teb; cpu->fcw = 0x27f; cpu->mxcsr = 0x1f80; }
+static void init_cpu(Cpu *cpu, uint32_t teb) { memset(cpu, 0, sizeof *cpu); cpu->budget = get_budget(); cpu->teb = teb; cpu->fcw = 0x27f; cpu->mxcsr = 0x1f80; }
 
 static void thread_done(Ctx *c, int idx, uint32_t code) {
-    Thread *t = &c->threads[idx]; t->done = 1; t->exit_code = code;
+    Thread *t = &c->threads[idx]; t->done = 1; t->exit_code = code; hle_thread_exit(c, t);
     if (t->handle) c->handles[(t->handle - 0x100) / 4].signaled = 1;
     if (c->verbose) fprintf(stderr, "[thread] tid=%x finished code=%u\n", t->tid, code);
     if (idx == 0) { c->exited = 1; c->exit_code = code; finish_process(c); }
     c->api_progress++;
     int n = pick_next(c, idx);
     if (n < 0) { c->exited = 1; finish_process(c); }
-    give_turn(c, n);
+    transfer_exit(c, n);
 }
 
-static void *thread_main(void *arg) {
-    Ctx *c = C; int idx = (int)(intptr_t)arg; Thread *t = &c->threads[idx];
-    wait_turn(c, idx);
+static void thread_body(int idx) {
+    Ctx *c = C; Thread *t = &c->threads[idx];
     Cpu *cpu = calloc(1, sizeof(Cpu)); t->cpu = cpu; init_cpu(cpu, t->teb);
     uint32_t esp = t->stack_hi - 0x40; esp -= 4; M32(esp) = t->param; esp -= 4; M32(esp) = RET_MAGIC; cpu->esp = esp;
     cpu->pc = t->entry; rt_dispatch(cpu);
     thread_done(c, idx, cpu->eax);
-    return NULL;
 }
+static void *thread_main(void *arg) { int idx = (int)(intptr_t)arg; wait_turn(C, idx); thread_body(idx); return NULL; }
 
 static void *watchdog(void *arg) {
     Ctx *c = arg; uint64_t last = 0; int still = 0;
-    for (;;) { sleep(2); uint64_t now = g_switches + c->api_progress; if (now == last) { if (++still >= 2) { fprintf(stderr, "[watchdog] no scheduling progress; cur=%d nthreads=%d\n", c->cur, c->nthreads); for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; fprintf(stderr, "  #%d used=%d done=%d susp=%d blocked=%d started=%d\n", i, t->used, t->done, t->suspended, t->blocked, t->rt_started); } still = 0; } } else still = 0; last = now; }
+    for (;;) { sleep(2); uint64_t now = g_switches + c->api_progress; if (now == last) { if (++still >= 2) { fprintf(stderr, "[watchdog] no scheduling progress; cur=%d nthreads=%d\n", c->cur, c->nthreads);
+            { Thread *ct = &c->threads[c->cur]; Cpu *cp = ct->cpu; if (cp) { fprintf(stderr, "[watchdog] thread %d last Cpu snapshot: pc=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x last_api=%s\n", c->cur, cp->pc, cp->eax, cp->ecx, cp->edx, cp->ebx, cp->esp, cp->ebp, cp->esi, cp->edi, ct->last_api ? ct->last_api : "-");
+                fprintf(stderr, "[watchdog] stack:"); for (int k = 0; k < 24; k++) fprintf(stderr, " %08x", M32(cp->esp + 4 * k)); fprintf(stderr, "\n"); if (cp->esi > 0x10000) { for (int k = 0; k < c->nthreads; k++) { Thread *t = &c->threads[k]; if (t->used) fprintf(stderr, "[watchdog] thread %2d %s%s%s apis=%u last=%s(%08x,%08x) ret=%08x\n", k, t->done ? "done " : "", t->suspended ? "susp " : "", t->blocked ? "blocked " : "", t->n_api, t->last_api ? t->last_api : "-", t->last_a0, t->last_a1, t->last_ret); }
+                fprintf(stderr, "[watchdog] [esi]:"); for (int k = 0; k < 40; k++) fprintf(stderr, " %08x", M32(cp->esi + 4 * k)); fprintf(stderr, "\n"); uint32_t n = M32(cp->esi + 0x44); fprintf(stderr, "[watchdog] list from [esi+0x44]:"); for (int k = 0; k < 12; k++) { fprintf(stderr, " %08x", n); if (n < 0x1000) break; n = M32(n + 4); } fprintf(stderr, "\n"); } } } for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; fprintf(stderr, "  #%d used=%d done=%d susp=%d blocked=%d started=%d\n", i, t->used, t->done, t->suspended, t->blocked, t->rt_started); } still = 0; if (getenv("BLUR_HANGEXIT")) { hle_sync_report(c); fprintf(stderr, "[watchdog] BLUR_HANGEXIT: exiting\n"); fflush(stderr); _exit(8); } } } else still = 0; last = now; }
     return NULL;
 }
 
 void rt_main(Ctx *c) {
     C = c;
     if (getenv("BLUR_DET")) { g_det_step = atof(getenv("BLUR_DET")); g_time_base = 0; g_det_on = 1; g_det_ticks = 0; audio_clock_us = now_us; fprintf(stderr, "[det] deterministic clock: %g us per API call\n", g_det_step); }
-    build_table(); cov_init(); rt_trace = getenv("RT_TRACE") != NULL; cont_addr = cont_stub_addr(c);
+    prof_init(); if (nhook < 0) hook_init(); build_table(); build_fast(); cov_init(); ring_on = getenv("BLUR_RING") != NULL; rt_trace = getenv("RT_TRACE") != NULL || ring_on; cont_addr = cont_stub_addr(c);
+    if (getenv("BLUR_SCHED_NOFILTER")) sched_filter = 0;
+#if defined(__aarch64__)
+    coro_mode = !getenv("BLUR_NOCORO");
+#endif
+    rt_slow = cov_on > 0 || getenv("BLUR_PROFCNT") || getenv("BLUR_HOOK") || getenv("BLUR_POKE") || getenv("BLUR_PCPROF") || getenv("BLUR_PCCOUNT") || getenv("BLUR_LUATRACE") || getenv("BLUR_SLOWDISP");
     if (getenv("BLUR_DUMP_OEP")) { Module *m = find_module(c, "Blur.exe"); FILE *f = fopen(getenv("BLUR_DUMP_OEP"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] exe image at OEP: base=%08x size=%x\n", m->base, m->size); } exit(0); }
     if (getenv("BLUR_DUMP_MSV")) { Module *m = find_module(c, "msvcr90.dll"); FILE *f = fopen(getenv("BLUR_DUMP_MSV"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] msvcr90 base=%08x size=%x\n", m->base, m->size); } exit(0); }
     if (getenv("BLUR_SECONDS")) t_end = real_us() + (uint64_t)atof(getenv("BLUR_SECONDS")) * 1000000ull;
-    c->api_slice = getenv("BLUR_API_SLICE") ? (uint32_t)atoi(getenv("BLUR_API_SLICE")) : 50;
+    c->api_slice = getenv("BLUR_API_SLICE") ? (uint32_t)atoi(getenv("BLUR_API_SLICE")) : 300;   // was 50: every forced yield is a scheduler pass (pick_next over all threads)
     for (int i = 0; i < MAX_THREADS; i++) pthread_cond_init(&bcv[i], NULL);
     { pthread_t wd; pthread_create(&wd, NULL, watchdog, c); pthread_detach(wd); }
     if (!getenv("BLUR_WATCHW_AFTER_FRAME1")) ww_arm();

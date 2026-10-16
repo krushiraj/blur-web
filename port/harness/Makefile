@@ -19,9 +19,14 @@ clean:
 
 OBJDIR ?= obj4
 RT_OBJS=$(wildcard ../recomp/$(OBJDIR)/*.o) $(wildcard ../recomp/obj_x/*.o)
-blurrt: ../recomp/rt_vec.c snapshot.c $(WEBSRC)/snap_ctx.c $(SRCS) rt.c $(HDRS) $(RT_OBJS)
-	$(CC) $(CFLAGS) -I../recomp -I. -I$(WEBSRC) $(SRCS) snapshot.c $(WEBSRC)/snap_ctx.c rt.c ../recomp/rt_vec.c $(RT_OBJS) -lm -o blurrt $(LDFLAGS)
+blurrt: ../recomp/rt_vec.c rtprof.c snapshot.c $(WEBSRC)/snap_ctx.c $(SRCS) rt.c $(HDRS) $(RT_OBJS)
+	$(CC) $(CFLAGS) -I../recomp -I. -I$(WEBSRC) $(SRCS) rtprof.c snapshot.c $(WEBSRC)/snap_ctx.c rt.c ../recomp/rt_vec.c $(RT_OBJS) -lm -o blurrt $(LDFLAGS)
 
 # offline D3D9 bytecode -> GLSL translator (shaders.bin for the browser renderer, see shcache.h)
 shadertool: shadertool.c shadercvt.c shcache.h emu.h
 	$(CC) $(CFLAGS) shadertool.c shadercvt.c -o shadertool $(LDFLAGS)
+
+# host-side unit tests of the Win32 sync/thread/time/file HLE (port/work/audio/SYNC_AUDIT.md); the guest clock now_us() is replaced by a fake one
+test_sync: test_sync.c main.c hostcommon.c $(SRCS) rt_stub.c $(HDRS)
+	$(CC) $(CFLAGS) -c -Dnow_us=real_clock_now_us hostcommon.c -o hostcommon_test.o
+	$(CC) $(CFLAGS) test_sync.c $(filter-out main.c hostcommon.c,$(SRCS)) hostcommon_test.o rt_stub.c -lm -o test_sync $(LDFLAGS)
