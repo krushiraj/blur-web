@@ -1,0 +1,62 @@
+{
+  "det": 5,
+  "frames": 3150,
+  "keys": [
+    {
+      "key": "Enter",
+      "frame": 750
+    },
+    {
+      "key": "Down",
+      "frame": 1250
+    },
+    {
+      "key": "Enter",
+      "frame": 1450
+    },
+    {
+      "key": "Enter",
+      "frame": 1850
+    },
+    {
+      "key": "Right",
+      "frame": 2550
+    }
+  ],
+  "checkpoints": [
+    {
+      "name": "01_frontend",
+      "frame": 250
+    },
+    {
+      "name": "02_online_account",
+      "frame": 1150
+    },
+    {
+      "name": "03_account_skipped",
+      "frame": 1800
+    },
+    {
+      "name": "04_main_menu",
+      "frame": 2350
+    },
+    {
+      "name": "05_menu_right",
+      "frame": 3050
+    }
+  ],
+  "maxMae": 0.06,
+  "minSsim": 0.8,
+  "maxHeapMB": 650,
+  "steadyFromFrame": 500,
+  "maxSteadyGrowthMB": 25,
+  "minTexturesFilled": 600,
+  "maxTexturesZero": 120,
+  "drawsPerFrame": [
+    150,
+    700
+  ],
+  "allowStrict": [],
+  "rel": true,
+  "detFrames": 400
+}
