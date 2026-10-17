@@ -22,7 +22,11 @@ typedef struct Cpu {
     uint32_t last_eflags;            // eflags image for pushfd/popfd round trips
 } Cpu;
 
+#ifdef BLUR_G_FIXED
+#define G ((uint8_t *)(uintptr_t)(BLUR_G_FIXED))    // guest memory base as a compile-time constant (the host maps it there, see main.c): no reload of the base after every store (-fno-strict-aliasing makes the compiler assume stores may change it)
+#else
 extern uint8_t *G;                   // guest memory base: guest address A lives at G + A
+#endif
 // Guest memory and register-file accessors go through may_alias types: the lifted code freely mixes widths and types on the same bytes
 // (e.g. a movq store followed by a comiss load of its high half), which is undefined under C strict aliasing. Without this, clang/arm64
 // hoists such loads (and the compare) out of loops -- see port/work/fp-edge/FP_EDGE.md (native race stall in f_004d1310).
