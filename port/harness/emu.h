@@ -50,7 +50,7 @@ int net_start(int port); void net_send(const void *data, size_t n); int net_clie
 enum { G_TEX_CREATE = 20, G_TEX_UPLOAD = 21, G_SURF_CREATE = 22, G_BUF_CREATE = 30, G_BUF_UPLOAD = 31, G_SHADER = 40, G_VDECL = 41, G_SHADER_REF = 42,
        G_SET_RS = 50, G_SET_SS = 51, G_SET_TEX = 52, G_SET_VS = 53, G_SET_PS = 54, G_SET_VDECL = 55, G_SET_FVF = 56, G_SET_STREAM = 57, G_SET_INDICES = 58,
        G_SET_VSC = 59, G_SET_PSC = 60, G_SET_VIEWPORT = 61, G_SET_SCISSOR = 62, G_SET_RT = 63, G_SET_DS = 64, G_DRAW = 70, G_DRAW_UP = 71, G_CLEAR = 72,
-       G_PRESENT = 73, G_STRETCH = 74, G_SET_VSCI = 75, G_SET_PSCI = 76, G_SET_VSCB = 77, G_SET_PSCB = 78 };
+       G_PRESENT = 73, G_STRETCH = 74, G_SET_VSCI = 75, G_SET_PSCI = 76, G_SET_VSCB = 77, G_SET_PSCB = 78, G_DESTROY = 95 };
 int gfx_on(void); void gfx_flush(void);
 void gfx_msg(uint32_t type, const uint32_t *w, int nw, const void *data, uint32_t ndata);
 uint8_t *gfx_msg_alloc(uint32_t type, const uint32_t *w, int nw, uint32_t ndata);

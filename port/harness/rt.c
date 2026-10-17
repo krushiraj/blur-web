@@ -152,8 +152,58 @@ static void sleep_until_us(uint64_t dl) {
         if (rem > (uint64_t)spin_now + 50) { struct timespec ts = {0, (long)((rem - (uint64_t)spin_now) * 1000)}; nanosleep(&ts, NULL); } }
 }
 static uint64_t last_prog; static int idle_n; static uint64_t idle_since;
+// ---- BLUR_PAR=1: guest threads run in parallel on host threads --------------------------------------------------------------------------------------------
+// The cooperative scheduler runs every guest thread on one host thread (3 heavy threads x ~15 ms per race frame = 46 ms).  In parallel mode each guest thread is a host
+// pthread running lifted code concurrently; a global lock is held only while inside a host API handler (the HLE is not thread-safe), so HLE state, c->cur and the
+// handlers' "block and retry" protocol are unchanged.  A blocked thread parks on its own condition variable (releases the lock) and is woken by par_wake() after any
+// API that can make a wait satisfiable, or by a timeout (sleep deadlines, 2 ms safety).  Guest atomics are real __atomic ops (lift.py), so lock-free code keeps working.
+int par_mode;
+static pthread_mutex_t par_lock = PTHREAD_MUTEX_INITIALIZER; static __thread int t_idx = -1;
+static uint8_t par_flag[STUB_SLOTS];            // 0 unknown, 1 plain, 2 may unblock waiters, 4 may start threads (|)
+static __thread int t_depth;
+static uint64_t par_lockwait_ns[MAX_THREADS], par_parked_ns[MAX_THREADS], par_held_ns[MAX_THREADS], par_acq_t[MAX_THREADS]; static int par_stat = -1;
+static void par_enter(Ctx *c) {
+    if (t_depth++ == 0) { if (par_stat < 0) par_stat = getenv("BLUR_PARSTAT") != NULL ? 1 : 0;
+        if (par_stat) { uint64_t t0 = real_us(); pthread_mutex_lock(&par_lock); uint64_t t1 = real_us(); par_lockwait_ns[t_idx] += t1 - t0; par_acq_t[t_idx] = t1; } else pthread_mutex_lock(&par_lock); }
+    c->cur = t_idx; }
+static void par_leave(void) { if (--t_depth == 0) { if (par_stat > 0) par_held_ns[t_idx] += real_us() - par_acq_t[t_idx]; pthread_mutex_unlock(&par_lock); } }
+static void par_wake(Ctx *c) {
+    for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (i != t_idx && t->used && !t->done && t->par_waiting && ((!t->wk && t->wake_at) ? now_us() >= t->wake_at : thread_can_run(c, t))) pthread_cond_signal(&bcv[i]); }
+}
+static void *par_thread_main(void *arg);
+static void par_start_pending(Ctx *c) {
+    for (int i = 1; i < c->nthreads; i++) { Thread *t = &c->threads[i];
+        if (t->used && !t->done && !t->suspended && !t->rt_started) { t->rt_started = 1; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 16u << 20);
+            if (pthread_create(&t->pth, &at, par_thread_main, (void *)(intptr_t)i)) { fprintf(stderr, "[par] pthread_create failed for guest thread %d\n", i); exit(1); } pthread_detach(t->pth); } }
+}
+static void par_wait(Ctx *c) {             // called with par_lock held, from inside an API handler that wants to block: park until woken / deadline, then retry
+    int self = t_idx; Thread *t = &c->threads[self];
+    if (t->done) { par_wake(c); t_depth = 0; pthread_mutex_unlock(&par_lock); pthread_exit(NULL); }
+    uint64_t wait_us = 2000;
+    if (t->wake_at) { uint64_t n = now_us(); if (t->wake_at <= n) return; if (t->wake_at - n < wait_us) wait_us = t->wake_at - n; }
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += (long)(wait_us * 1000); if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    uint64_t pw0 = par_stat > 0 ? real_us() : 0; if (par_stat > 0) par_held_ns[self] += pw0 - par_acq_t[self];
+    t->par_waiting = 1; int rc = pthread_cond_timedwait(&bcv[self], &par_lock, &ts); t->par_waiting = 0; c->cur = self; if (par_stat > 0) { uint64_t n = real_us(); par_parked_ns[self] += n - pw0; par_acq_t[self] = n; }
+    { static int on = -1; if (on < 0) on = getenv("BLUR_PARSTAT") != NULL;
+      if (on) { static struct { int t; const char *api; uint8_t wk; uint64_t sig, to, us; } h[96]; static int nh; static uint64_t last; int k = 0; uint64_t dur = real_us() - pw0;
+        for (; k < nh; k++) if (h[k].t == self && h[k].api == t->last_api && h[k].wk == t->wk) break;
+        if (k == nh && nh < 96) { h[nh].t = self; h[nh].api = t->last_api; h[nh].wk = t->wk; nh++; } if (k < 96) { if (rc) h[k].to++; else h[k].sig++; h[k].us += dur; }
+        uint64_t n = real_us(); if (n - last > 5000000) { last = n; fprintf(stderr, "[parstat] per thread (ms over the last period): lock-wait / parked / lock-held:"); for (int q = 0; q < c->nthreads; q++) if (par_parked_ns[q] || par_held_ns[q] || par_lockwait_ns[q]) { fprintf(stderr, " t%d=%.0f/%.0f/%.0f", q, par_lockwait_ns[q] / 1e3, par_parked_ns[q] / 1e3, par_held_ns[q] / 1e3); par_lockwait_ns[q] = par_parked_ns[q] = par_held_ns[q] = 0; } fprintf(stderr, "\n");
+          fprintf(stderr, "[parstat] top waits (thread api wk: signalled/timeouts, parked ms, avg us):");
+          for (int r = 0; r < 12; r++) { int b = -1; uint64_t bu = 0; for (int q = 0; q < nh; q++) if (h[q].us > bu) { bu = h[q].us; b = q; } if (b < 0) break; fprintf(stderr, " | t%d %s wk%d: %llu/%llu %.0fms avg %.0fus", h[b].t, h[b].api ? h[b].api : "?", h[b].wk, (unsigned long long)h[b].sig, (unsigned long long)h[b].to, h[b].us / 1e3, (double)h[b].us / (double)(h[b].sig + h[b].to)); h[b].us = 0; h[b].sig = h[b].to = 0; }
+          fprintf(stderr, "\n"); } } }
+}
+static void par_flags_for(const Stub *s, int idx) {
+    // Any API may complete a wait (events set from IO/audio handlers, handle state changes...), so waiters are re-checked after every API except those known to be irrelevant
+    // (graphics/input/clock/TLS calls: ~60% of all calls).  par_wake costs one thread_can_run() per parked thread.
+    static const char *quiet[] = { "IDirect3D", "IDirectInput", "D3DX", "XInput", "QueryPerformanceCounter", "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue", "GetCurrentThreadId", "GetTickCount", "timeGetTime", "FlsGetValue", "FlsSetValue", "HeapAlloc", "HeapFree", "HeapSize", "GetProcessHeap", "EnterCriticalSection", "TryEnterCriticalSection", NULL };
+    uint8_t f = 1 | 2; for (int i = 0; quiet[i]; i++) if (!strncmp(s->name, quiet[i], strlen(quiet[i]))) f = 1;
+    if (!strcmp(s->name, "CreateThread") || !strcmp(s->name, "ResumeThread")) f |= 4; par_flag[idx] = f;
+}
+
 static void rt_yield(Ctx *c) {
     if (t_end && real_us() > t_end) { c->exited = 5; finish_process(c); }
+    if (par_mode) { if (cur_thread(c)->blocked) par_wait(c); return; }          // forced fairness yields (api_slice) are pointless with real threads; only a blocked thread parks
     int self = c->cur;
     if (c->api_progress != last_prog) { last_prog = c->api_progress; idle_n = 0; idle_since = 0; }
     else if (++idle_n > 2 * c->nthreads + 2) {
@@ -163,6 +213,13 @@ static void rt_yield(Ctx *c) {
             for (int i = 0; i < c->nthreads; i++) if (c->threads[i].used && !c->threads[i].done) fprintf(stderr, "  thread %d tid=%x entry=%08x %s\n", i, c->threads[i].tid, c->threads[i].entry, c->threads[i].suspended ? "suspended" : "blocked");
             c->exited = 4; finish_process(c);
         }
+        { static int on = -1; if (on < 0) on = getenv("BLUR_IDLESTAT") != NULL;       // which APIs are the blocked threads sitting in while the whole process idles (usleep below)?
+          if (on) { static struct { const char *api; uint32_t a0; uint64_t n; } tab[64]; static int nt; static uint64_t tot, t_last;
+            for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (!t->used || t->done || !t->blocked) continue; int k = 0; for (; k < nt; k++) if (tab[k].api == t->last_api && tab[k].a0 == t->last_a0) break;
+              if (k == nt && nt < 64) { tab[nt].api = t->last_api; tab[nt].a0 = t->last_a0; tab[nt++].n = 0; } if (k < 64) tab[k].n++; }
+            tot++; uint64_t now = real_us(); if (now - t_last > 5000000) { t_last = now; fprintf(stderr, "[idlestat] %llu idle polls in the last period; blocked-thread API histogram:", (unsigned long long)tot);
+              for (int r = 0; r < 6; r++) { int b = -1; uint64_t bn = 0; for (int k = 0; k < nt; k++) if (tab[k].n > bn) { bn = tab[k].n; b = k; } if (b < 0) break; fprintf(stderr, " %s(%08x)=%llu", tab[b].api ? tab[b].api : "?", tab[b].a0, (unsigned long long)bn); tab[b].n = 0; }
+              fprintf(stderr, "\n"); tot = 0; } } }
         usleep(200);
     }
     int n = pick_next(c, self);
@@ -177,8 +234,8 @@ static void rt_yield(Ctx *c) {
 
 static int g_budget = -1;
 static int get_budget(void) { if (g_budget < 0) g_budget = getenv("BLUR_BUDGET") ? atoi(getenv("BLUR_BUDGET")) : 200000; return g_budget; }   // BLUR_BUDGET=n: function entries per time slice (default 200000)
-void rt_preempt(Cpu *cpu) { cpu->budget = get_budget(); rt_yield(C); }
-void rt_spin(Cpu *cpu) { (void)cpu; Thread *t = cur_thread(C); if (++t->spin_n >= 40) { t->spin_n = 0; rt_yield(C); } }
+void rt_preempt(Cpu *cpu) { cpu->budget = get_budget(); if (par_mode) return; rt_yield(C); }
+void rt_spin(Cpu *cpu) { (void)cpu; if (par_mode) { static __thread int n; if (++n >= 40) { n = 0; sched_yield(); } return; } Thread *t = cur_thread(C); if (++t->spin_n >= 40) { t->spin_n = 0; rt_yield(C); } }
 
 // ---- CPUID / RDTSC -----------------------------------------------------------------------------------------------------------
 void rt_cpuid(Cpu *cpu) {
@@ -265,7 +322,7 @@ static void pace_present(Ctx *c) {
     if (g_prof) prof_seg_end();
     t->blocked = 0; t->wake_at = 0; t->wk = 0;
 }
-static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
+static uint32_t rt_api_locked(Cpu *cpu, uint32_t addr) {
     Ctx *c = C; Stub *s = &c->stubs[(addr - STUB_BASE) / 16];
     if (addr == cont_addr) {                                  // a callback requested by an API handler returned
         Thread *t = cur_thread(c); Cont k = t->cont[--t->ncont];
@@ -313,6 +370,15 @@ static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
     else if (c->api_slice && ++c->api_since_switch >= c->api_slice) { c->api_since_switch = 0; rt_yield(c); }
     return next;
 }
+static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
+    if (!par_mode) return rt_api_locked(cpu, addr);
+    Ctx *c = C; int si = (int)((addr - STUB_BASE) / 16); par_enter(c);
+    uint32_t r = rt_api_locked(cpu, addr);
+    uint8_t f = par_flag[si]; if (!f) { par_flags_for(&c->stubs[si], si); f = par_flag[si]; }
+    if (f & 4) par_start_pending(c);
+    if (f & 2) par_wake(c);
+    par_leave(); return r;
+}
 
 static void hook_dump(void);
 static void rt_missing(Cpu *cpu, uint32_t target) {
@@ -337,8 +403,8 @@ static void rt_missing(Cpu *cpu, uint32_t target) {
 // The trampoline every lifted function ends in (as a tail call): continue at cpu->pc.
 // BLUR_HOOK=addr[,addr..]: log entries (cdecl args) and return values of the guest functions at those addresses
 static void lua_init(void);
-static uint32_t hook_addr[16]; static int nhook = -1; static struct { uint32_t ret, esp, fn; } hook_pend[256]; static int nhook_pend; static int hook_budget = 400; static int hook_budget_init;
-static void hook_init(void) { nhook = 1; lua_init(); hook_addr[0] = 0; const char *e = getenv("BLUR_HOOK"); if (nhook) { nhook = 1; hook_addr[0] = 0xffffffffu; } while (e && *e && nhook < 16) { hook_addr[nhook++] = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; } }
+static uint32_t hook_addr[16]; static int nhook = -1, hook_user; static struct { uint32_t ret, esp, fn; } hook_pend[256]; static int nhook_pend; static int hook_budget = 400; static int hook_budget_init;
+static void hook_init(void) { nhook = 1; lua_init(); hook_addr[0] = 0; const char *e = getenv("BLUR_HOOK"); if (nhook) { nhook = 1; hook_addr[0] = 0xffffffffu; } while (e && *e && nhook < 16) { hook_addr[nhook++] = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; } hook_user = nhook > 1 || getenv("BLUR_HOOK_TAIL") != NULL; }
 // BLUR_LUATRACE=1: log every entry into one of the 255 Lua C bindings (table from ../work/net-re/script_bindings.txt: <slot> <name> <fn address>)
 static struct { uint32_t a; char name[48]; uint32_t n; long first; double first_t; } lua_b[300]; static int nlua, lua_quiet; extern uint64_t g_frames_pub;
 double lua_binding_first_time(const char *nm) { for (int i = 0; i < nlua; i++) if (lua_b[i].n && !strcmp(lua_b[i].name, nm)) return lua_b[i].first_t; return -1; }
@@ -388,7 +454,12 @@ static void build_fast(void) {
 void rt_dispatch(Cpu *cpu) {
     for (;;) {
         uint32_t pc = cpu->pc;
-        if (__builtin_expect(!rt_slow, 1)) {                 // hot path: one probe sequence, tail call (stubs and RET_MAGIC miss and fall through)
+        if (__builtin_expect(!rt_slow, 1)) {                 // hot path: one probe sequence, tail call (RET_MAGIC misses and falls through)
+            if (pc - STUB_BASE < STUB_SLOTS * 16u) {         // host API stub (~44k calls per race frame): straight to the handler; no failed hash probe, no hook_check
+                if (__builtin_expect(g_prof != 0, 0)) prof_dispatch++;
+                if (nhook < 0) hook_init();
+                if (hook_user) hook_check(cpu, pc);          // BLUR_HOOK may name stub addresses
+                cpu->pc = rt_api(cpu, pc); continue; }
             FEnt *e = &ftab[(pc * 2654435761u) >> fshift];
             while (e->k && e->k != pc) e++;
             if (__builtin_expect(e->k == pc, 1)) MUSTTAIL return e->f(cpu);
@@ -398,13 +469,13 @@ void rt_dispatch(Cpu *cpu) {
         if (prof_on) prof_hit(C->cur, pc);
         if (npcc) for (int q = 0; q < npcc; q++) if (pcc[q].pc == pc) { pcc[q].n[C->cur & 31]++; if (!pcc[q].first) pcc[q].first = 1; }
         if (nhook < 0) hook_init();
-        if (nhook) hook_check(cpu, pc);
+        if (nhook && (hook_user || pc - STUB_BASE >= STUB_SLOTS * 16u)) hook_check(cpu, pc);      // stubs are never Lua bindings: skip the 255-entry scan on every API call
         if (pc - STUB_BASE < STUB_SLOTS * 16u) { cpu->pc = rt_api(cpu, pc); continue; }
         if (pc == RET_MAGIC) return;                         // the thread's start routine returned
         GuestFn f = lookup(pc);
         if (!f) {
             if (cold_mode < 0) cold_mode = getenv("BLUR_COLD") ? atoi(getenv("BLUR_COLD")) : 1;
-            if (cold_mode && rt_cold(cpu)) continue;          // interpreter fallback
+            if (cold_mode) { int ok; if (par_mode) par_enter(C); ok = rt_cold(cpu); if (par_mode) par_leave(); if (ok) continue; }          // interpreter fallback (one shared interpreter: serialised in parallel mode)
             rt_missing(cpu, pc);
         }
         MUSTTAIL return f(cpu);
@@ -415,6 +486,8 @@ void rt_dispatch(Cpu *cpu) {
 static void init_cpu(Cpu *cpu, uint32_t teb) { memset(cpu, 0, sizeof *cpu); cpu->budget = get_budget(); cpu->teb = teb; cpu->fcw = 0x27f; cpu->mxcsr = 0x1f80; }
 
 static void thread_done(Ctx *c, int idx, uint32_t code) {
+    if (par_mode) { par_enter(c); Thread *t = &c->threads[idx]; t->done = 1; t->exit_code = code; hle_thread_exit(c, t); if (t->handle) c->handles[(t->handle - 0x100) / 4].signaled = 1;
+        c->api_progress++; if (idx == 0) { c->exited = 1; c->exit_code = code; finish_process(c); } par_wake(c); par_leave(); return; }
     Thread *t = &c->threads[idx]; t->done = 1; t->exit_code = code; hle_thread_exit(c, t);
     if (t->handle) c->handles[(t->handle - 0x100) / 4].signaled = 1;
     if (c->verbose) fprintf(stderr, "[thread] tid=%x finished code=%u\n", t->tid, code);
@@ -433,6 +506,7 @@ static void thread_body(int idx) {
     thread_done(c, idx, cpu->eax);
 }
 static void *thread_main(void *arg) { int idx = (int)(intptr_t)arg; wait_turn(C, idx); thread_body(idx); return NULL; }
+static void *par_thread_main(void *arg) { t_idx = (int)(intptr_t)arg; thread_body(t_idx); return NULL; }
 
 // Spin diagnosis: a guest loop that stays inside one lifted function never reaches a scheduler check, so the stale Cpu snapshot below says nothing about it. The watchdog
 // therefore signals the host thread running the guest (SIGUSR2) and the handler prints the host PC with its symbol (f_<guest address> = the lifted function that spins).
@@ -466,6 +540,7 @@ void rt_main(Ctx *c) {
 #if defined(__aarch64__)
     coro_mode = !getenv("BLUR_NOCORO");
 #endif
+    par_mode = getenv("BLUR_PAR") != NULL && atoi(getenv("BLUR_PAR")) != 0; if (par_mode) { coro_mode = 0; t_idx = 0; fprintf(stderr, "[par] parallel guest threads: one host thread per guest thread, API handlers serialised by a global lock\n"); }
     rt_slow = cov_on > 0 || getenv("BLUR_PROFCNT") || getenv("BLUR_HOOK") || getenv("BLUR_POKE") || getenv("BLUR_PCPROF") || getenv("BLUR_PCCOUNT") || getenv("BLUR_LUATRACE") || getenv("BLUR_SLOWDISP");
     if (getenv("BLUR_DUMP_OEP")) { Module *m = find_module(c, "Blur.exe"); FILE *f = fopen(getenv("BLUR_DUMP_OEP"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] exe image at OEP: base=%08x size=%x\n", m->base, m->size); } exit(0); }
     if (getenv("BLUR_DUMP_MSV")) { Module *m = find_module(c, "msvcr90.dll"); FILE *f = fopen(getenv("BLUR_DUMP_MSV"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] msvcr90 base=%08x size=%x\n", m->base, m->size); } exit(0); }
