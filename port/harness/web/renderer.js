@@ -19,7 +19,7 @@ void main()
     gl_Position = vec4(v0.x / u_vpsz.x * 2.0 - 1.0, 1.0 - v0.y / u_vpsz.y * 2.0, v0.z, 1.0);
 }
 `;
-const G = { TEX_CREATE: 20, TEX_UPLOAD: 21, SURF_CREATE: 22, BUF_CREATE: 30, BUF_UPLOAD: 31, SHADER: 40, VDECL: 41, SHADER_REF: 42,
+const G = { DESTROY: 95, TEX_CREATE: 20, TEX_UPLOAD: 21, SURF_CREATE: 22, BUF_CREATE: 30, BUF_UPLOAD: 31, SHADER: 40, VDECL: 41, SHADER_REF: 42,
   SET_RS: 50, SET_SS: 51, SET_TEX: 52, SET_VS: 53, SET_PS: 54, SET_VDECL: 55, SET_FVF: 56, SET_STREAM: 57, SET_INDICES: 58, SET_VSC: 59, SET_PSC: 60,
   SET_VIEWPORT: 61, SET_SCISSOR: 62, SET_RT: 63, SET_DS: 64, DRAW: 70, DRAW_UP: 71, CLEAR: 72, PRESENT: 73, STRETCH: 74 };
 const FOURCC = (s) => s.charCodeAt(0) | s.charCodeAt(1) << 8 | s.charCodeAt(2) << 16 | s.charCodeAt(3) << 24;
@@ -35,6 +35,28 @@ class D3D9Renderer {
     this.canvas = canvas; this.log = log || console.log;
     const gl = this.gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
     if (!gl) throw new Error('WebGL2 not available');
+    // Redundant-call filter: the draw path issues >100 GL calls per draw and Chrome's GPU process (ANGLE) pays for every one even when the state is
+    // unchanged. All call sites go through these wrappers, so the shadow state is always exact. BLUR 'glcache=0' in the URL hash disables it.
+    if (!/glcache=0/.test(location.hash)) {
+      const o = {}; for (const k of ['activeTexture', 'bindTexture', 'bindSampler', 'useProgram', 'bindBuffer', 'bindBufferRange', 'samplerParameteri', 'samplerParameterf', 'uniform1i', 'uniform1f', 'uniform2f',
+        'deleteTexture', 'deleteBuffer', 'deleteSampler', 'deleteProgram']) o[k] = gl[k].bind(gl);
+      let unit = 0; const tex = new Map(), smp = new Array(32).fill(null); let prog = null, arr = null, ubo = null; const uboR = new Array(16).fill(null);   // tex: (unit<<16|target) -> texture
+      gl.activeTexture = (u) => { const n = u - gl.TEXTURE0; if (n !== unit) { unit = n; o.activeTexture(u); } };
+      gl.bindTexture = (t, x) => { const k = (unit << 16) | t; if (tex.get(k) !== x) { tex.set(k, x); o.bindTexture(t, x); } };
+      gl.bindSampler = (u, x) => { if (smp[u] !== x) { smp[u] = x; o.bindSampler(u, x); } };
+      gl.useProgram = (x) => { if (prog !== x) { prog = x; o.useProgram(x); } };
+      gl.bindBuffer = (t, b) => { if (t === gl.ARRAY_BUFFER) { if (arr === b) return; arr = b; } else if (t === gl.UNIFORM_BUFFER) { if (ubo === b) return; ubo = b; } o.bindBuffer(t, b); };
+      gl.bindBufferRange = (t, i, b, off, sz) => { if (t === gl.UNIFORM_BUFFER) { const r = uboR[i]; if (r && r.b === b && r.off === off && r.sz === sz) { return; } uboR[i] = { b, off, sz }; ubo = b; } o.bindBufferRange(t, i, b, off, sz); };
+      const sp = (name) => (s_, pn, v) => { const c = s_.__c || (s_.__c = new Map()); if (c.get(pn) === v) return; c.set(pn, v); o[name](s_, pn, v); };
+      gl.samplerParameteri = sp('samplerParameteri'); gl.samplerParameterf = sp('samplerParameterf');
+      gl.uniform1i = (l, v) => { if (l && l.__a === v) return; if (l) l.__a = v; o.uniform1i(l, v); };
+      gl.uniform1f = (l, v) => { if (l && l.__a === v) return; if (l) l.__a = v; o.uniform1f(l, v); };
+      gl.uniform2f = (l, a, b) => { if (l && l.__a === a && l.__b === b) return; if (l) { l.__a = a; l.__b = b; } o.uniform2f(l, a, b); };
+      gl.deleteTexture = (x) => { for (const [k, v] of tex) if (v === x) tex.delete(k); o.deleteTexture(x); };
+      gl.deleteBuffer = (b) => { if (arr === b) arr = null; if (ubo === b) ubo = null; for (let i = 0; i < 16; i++) if (uboR[i] && uboR[i].b === b) uboR[i] = null; o.deleteBuffer(b); };
+      gl.deleteSampler = (x) => { for (let i = 0; i < smp.length; i++) if (smp[i] === x) smp[i] = null; o.deleteSampler(x); };
+      gl.deleteProgram = (x) => { if (prog === x) prog = null; o.deleteProgram(x); };
+    }
     this.ext = {
       cbf: gl.getExtension('EXT_color_buffer_float'), cbh: gl.getExtension('EXT_color_buffer_half_float'),
       s3tc: gl.getExtension('WEBGL_compressed_texture_s3tc'), aniso: gl.getExtension('EXT_texture_filter_anisotropic'),
@@ -164,6 +186,7 @@ class D3D9Renderer {
       case 86: this.auditRun(u(0)); break;
       case G.PRESENT: this.present(); return true;
       case G.STRETCH: this.stretch(Array.from({ length: 19 }, (_, i) => u(i))); break;
+      case 95: this.destroyRes(u(0), u(1)); break;     // host freed the D3D object: release the GL texture / buffer (kind 0 texture, 1 vertex/index buffer)
       case 90: if (this.onAudio) this.onAudio(u(0), u(1), u(2), ab.slice(p + 12, p + len)); break;      // host-mixed PCM: rate, channels, frames, int16 data
       default: this.warn('type' + type, 'unknown message type ' + type);
     }
@@ -206,6 +229,11 @@ class D3D9Renderer {
   }
 
   // ---- textures & surfaces -------------------------------------------------------------------------------------------------------------------------
+  destroyRes(kind, id) {
+    const gl = this.gl;
+    if (kind === 0) { const t = this.textures.get(id); if (!t || t.isRT || t.isDS) return; gl.deleteTexture(t.tex); if (t.snap) gl.deleteTexture(t.snap); this.textures.delete(id); this.stats.freed = (this.stats.freed || 0) + 1; }
+    else { const b = this.buffers.get(id); if (!b) return; gl.deleteBuffer(b.buf); this.buffers.delete(id); this.stats.freed = (this.stats.freed || 0) + 1; }
+  }
   texCreate(id, kind, w, h, d, levels, fmt, usage) {
     const gl = this.gl, info = this.fmtInfo(fmt), target = kind === 1 ? gl.TEXTURE_CUBE_MAP : kind === 2 ? gl.TEXTURE_3D : gl.TEXTURE_2D;
     const t = { id, kind, w, h, d, levels, fmt, usage, info, target, tex: gl.createTexture(), isRT: !!(usage & 1), isDS: !!(usage & 2) };
@@ -549,11 +577,12 @@ class D3D9Renderer {
     }
   }
   setupAttribs(P, vsInfo, decl, base) {
-    const gl = this.gl; let used = 0;
+    const gl = this.gl; let used = 0; const AC0 = this.attrC || (this.attrC = new Array(16).fill(null));
     for (const e of vsInfo.ins) {
       const el = decl.elems.find((x) => x.usage === e.usage && x.idx === e.idx), loc = e.reg;
-      if (!el) { gl.disableVertexAttribArray(loc); gl.vertexAttrib4f(loc, 0, 0, 0, 1); continue; }
-      const st = this.streams[el.stream], b = this.buffers.get(st.buf); if (!b) { gl.disableVertexAttribArray(loc); continue; }
+      const AC = this.attrC || (this.attrC = new Array(16).fill(null));               // shadow of the default VAO's per-location state (skip identical enable/pointer calls)
+      if (!el) { if (AC[loc] !== 'c') { AC[loc] = 'c'; gl.disableVertexAttribArray(loc); gl.vertexAttrib4f(loc, 0, 0, 0, 1); } continue; }
+      const st = this.streams[el.stream], b = this.buffers.get(st.buf); if (!b) { if (AC[loc] !== 'd') { AC[loc] = 'd'; gl.disableVertexAttribArray(loc); } continue; }
       const T = el.type, F = gl.FLOAT, off = st.offset + el.offset + base * st.stride;
       let size = 4, type = F, norm = false;
       switch (T) { case 0: size = 1; break; case 1: size = 2; break; case 2: size = 3; break; case 3: size = 4; break; case 4: size = 4; type = gl.UNSIGNED_BYTE; norm = true; break;
@@ -561,9 +590,11 @@ class D3D9Renderer {
         case 9: size = 2; type = gl.SHORT; norm = true; break; case 10: size = 4; type = gl.SHORT; norm = true; break; case 11: size = 2; type = gl.UNSIGNED_SHORT; norm = true; break;
         case 12: size = 4; type = gl.UNSIGNED_SHORT; norm = true; break; case 13: size = 4; type = gl.UNSIGNED_INT_2_10_10_10_REV; break; case 14: size = 4; type = gl.INT_2_10_10_10_REV; norm = true; break;
         case 15: size = 2; type = gl.HALF_FLOAT; break; case 16: size = 4; type = gl.HALF_FLOAT; break; default: this.warn('vt' + T, 'unsupported vertex type ' + T); }
-      gl.bindBuffer(gl.ARRAY_BUFFER, b.buf); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, type, norm, st.stride, off); used |= 1 << loc;
+      const c = AC[loc]; used |= 1 << loc;
+      if (!(c && c.b === b.buf && c.size === size && c.type === type && c.norm === norm && c.stride === st.stride && c.off === off)) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, b.buf); if (!c || !c.b) gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, type, norm, st.stride, off); AC[loc] = { b: b.buf, size, type, norm, stride: st.stride, off }; }
     }
-    for (let i = 0; i < 16; i++) if (!(used & (1 << i)) && !vsInfo.ins.some((e) => e.reg === i)) gl.disableVertexAttribArray(i);
+    for (let i = 0; i < 16; i++) if (!(used & (1 << i)) && !vsInfo.ins.some((e) => e.reg === i)) { if (AC0[i] !== 'd') { AC0[i] = 'd'; gl.disableVertexAttribArray(i); } }
   }
   primCount(type, n) { switch (type) { case 1: return n; case 2: return 2 * n; case 3: return n + 1; case 4: return 3 * n; case 5: case 6: return n + 2; } return n; }
   glMode(type) { const gl = this.gl; return [gl.POINTS, gl.POINTS, gl.LINES, gl.LINE_STRIP, gl.TRIANGLES, gl.TRIANGLE_STRIP, gl.TRIANGLE_FAN][type] ?? gl.TRIANGLES; }

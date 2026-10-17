@@ -725,6 +725,8 @@ static void d3d_reap(Ctx *c) {
         uint32_t g = zq[zq_head++].g, i = rd32(c, g + 8);
         if (!i || i >= (uint32_t)nobjs || objs[i].guest != g || rd32(c, g + 4) != 0 || is_bound(g)) continue;       // resurrected (AddRef from 0 never happens in practice) or still bound
         Obj *o = &objs[i];
+        { int tk = (o->kind == K_TEXTURE || o->kind == K_CUBE || o->kind == K_VOLUME) && !(o->usage & 3), bk = o->kind == K_VB || o->kind == K_IB;      // tell the renderer to free its GL object (it never did: every texture/buffer ever created stayed in WebGL memory)
+          if (tk || bk) GFXW(G_DESTROY, (uint32_t)bk, (uint32_t)i); }
         if (o->sc) { for (int k = 0; k < 96; k++) if (o->sc[k]) { uint32_t sg = o->sc[k], si = rd32(c, sg + 8); if (si && si < (uint32_t)nobjs) memset(&objs[si], 0, sizeof objs[si]); wr32(c, sg + 8, 0); d3d_free(c, sg); } free(o->sc); }
         if (o->own && o->data) { bytes_freed += o->len; d3d_free(c, o->data); }
         if (o->code) d3d_free(c, o->code);
