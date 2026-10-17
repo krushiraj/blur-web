@@ -37,15 +37,26 @@ class D3D9Renderer {
     if (!gl) throw new Error('WebGL2 not available');
     // Redundant-call filter: the draw path issues >100 GL calls per draw and Chrome's GPU process (ANGLE) pays for every one even when the state is
     // unchanged. All call sites go through these wrappers, so the shadow state is always exact. BLUR 'glcache=0' in the URL hash disables it.
+    if (/diag=1/.test(location.hash)) {       // count the GL calls that are really issued (this wrapper sits below the redundant-call filter), per frame, by function
+      const cnt = this.glCalls = {}; for (const k of Object.getOwnPropertyNames(WebGL2RenderingContext.prototype)) { if (k === 'constructor' || typeof gl[k] !== 'function') continue; const f = gl[k].bind(gl); gl[k] = (...a) => { cnt[k] = (cnt[k] || 0) + 1; return f(...a); }; }
+    }
     if (!/glcache=0/.test(location.hash)) {
       gl.__glc = true; const o = {}; for (const k of ['activeTexture', 'bindTexture', 'bindSampler', 'useProgram', 'bindBuffer', 'bindBufferRange', 'samplerParameteri', 'samplerParameterf', 'uniform1i', 'uniform1f', 'uniform2f',
         'deleteTexture', 'deleteBuffer', 'deleteSampler', 'deleteProgram']) o[k] = gl[k].bind(gl);
       let unit = 0; const tex = new Map(), smp = new Array(32).fill(null); let prog = null, arr = null, ubo = null; const uboR = new Array(16).fill(null);   // tex: (unit<<16|target) -> texture
-      gl.activeTexture = (u) => { const n = u - gl.TEXTURE0; if (n !== unit) { unit = n; o.activeTexture(u); } };
-      gl.bindTexture = (t, x) => { const k = (unit << 16) | t; if (tex.get(k) !== x) { tex.set(k, x); o.bindTexture(t, x); } };
+      // lazy active texture unit: activeTexture only records the wanted unit; it is issued when a bind really changes or before any call that acts on the bound texture
+      let want = 0; const syncUnit = () => { if (unit !== want) { unit = want; o.activeTexture(gl.TEXTURE0 + want); } };
+      gl.activeTexture = (u) => { want = u - gl.TEXTURE0; };
+      gl.bindTexture = (t, x) => { const k = (want << 16) | t; if (tex.get(k) !== x) { tex.set(k, x); syncUnit(); o.bindTexture(t, x); } };
+      for (const k of ['texImage2D', 'texImage3D', 'texSubImage2D', 'texSubImage3D', 'texStorage2D', 'texStorage3D', 'compressedTexImage2D', 'compressedTexImage3D', 'compressedTexSubImage2D', 'compressedTexSubImage3D',
+        'copyTexImage2D', 'copyTexSubImage2D', 'copyTexSubImage3D', 'texParameteri', 'texParameterf', 'generateMipmap', 'getTexParameter']) { const f = gl[k].bind(gl); gl[k] = (...a) => { syncUnit(); return f(...a); }; }
       gl.bindSampler = (u, x) => { if (smp[u] !== x) { smp[u] = x; o.bindSampler(u, x); } };
       gl.useProgram = (x) => { if (prog !== x) { prog = x; o.useProgram(x); } };
-      gl.bindBuffer = (t, b) => { if (t === gl.ARRAY_BUFFER) { if (arr === b) return; arr = b; } else if (t === gl.UNIFORM_BUFFER) { if (ubo === b) return; ubo = b; } o.bindBuffer(t, b); };
+      // element-array binding is vertex-array state: shadow it per VAO (the renderer binds the index buffer before every indexed draw)
+      let curVao = null; const vaos = new Set(); let eabNull;
+      const eabGet = () => (curVao ? curVao.__eab : eabNull), eabSet = (b) => { if (curVao) curVao.__eab = b; else eabNull = b; };
+      const bvao = gl.bindVertexArray.bind(gl); gl.bindVertexArray = (v) => { if (curVao === v) return; curVao = v; if (v) vaos.add(v); bvao(v); };
+      gl.bindBuffer = (t, b) => { if (t === gl.ARRAY_BUFFER) { if (arr === b) return; arr = b; } else if (t === gl.UNIFORM_BUFFER) { if (ubo === b) return; ubo = b; } else if (t === gl.ELEMENT_ARRAY_BUFFER) { if (eabGet() === b) return; eabSet(b); } o.bindBuffer(t, b); };
       gl.bindBufferRange = (t, i, b, off, sz) => { if (t === gl.UNIFORM_BUFFER) { const r = uboR[i]; if (r && r.b === b && r.off === off && r.sz === sz) { return; } uboR[i] = { b, off, sz }; ubo = b; } o.bindBufferRange(t, i, b, off, sz); };
       const sp = (name) => (s_, pn, v) => { const c = s_.__c || (s_.__c = new Map()); if (c.get(pn) === v) return; c.set(pn, v); o[name](s_, pn, v); };
       gl.samplerParameteri = sp('samplerParameteri'); gl.samplerParameterf = sp('samplerParameterf');
@@ -53,7 +64,7 @@ class D3D9Renderer {
       gl.uniform1f = (l, v) => { if (l && l.__a === v) return; if (l) l.__a = v; o.uniform1f(l, v); };
       gl.uniform2f = (l, a, b) => { if (l && l.__a === a && l.__b === b) return; if (l) { l.__a = a; l.__b = b; } o.uniform2f(l, a, b); };
       gl.deleteTexture = (x) => { for (const [k, v] of tex) if (v === x) tex.delete(k); o.deleteTexture(x); };
-      gl.deleteBuffer = (b) => { if (arr === b) arr = null; if (ubo === b) ubo = null; for (let i = 0; i < 16; i++) if (uboR[i] && uboR[i].b === b) uboR[i] = null; o.deleteBuffer(b); };
+      gl.deleteBuffer = (b) => { if (arr === b) arr = null; if (ubo === b) ubo = null; if (eabNull === b) eabNull = undefined; for (const v of vaos) if (v.__eab === b) v.__eab = undefined; for (let i = 0; i < 16; i++) if (uboR[i] && uboR[i].b === b) uboR[i] = null; o.deleteBuffer(b); };
       gl.deleteSampler = (x) => { for (let i = 0; i < smp.length; i++) if (smp[i] === x) smp[i] = null; o.deleteSampler(x); };
       gl.deleteProgram = (x) => { if (prog === x) prog = null; o.deleteProgram(x); };
       // fixed-function state: exact shadows of what is set on the context (every call site goes through these wrappers)
@@ -99,6 +110,7 @@ class D3D9Renderer {
     this.rt = [{ kind: 3 }, { kind: 3 }, { kind: 3 }, { kind: 3 }]; this.ds = { kind: 3 };
     this.stats = { draws: 0, frameDraws: 0, clears: 0, progs: 0, shaders: 0, skipped: 0, tex: 0, deferred: 0, refs: 0, warmed: 0, held: 0 };
     this.fbWarn = true; this.initDefaults(); this.initGL(); if (this.q.hud) this.initHud();
+    this.diag = /diag=1/.test(location.hash); this.diagFrames = []; this.rtCount = {};      // #diag=1: per-frame draw counts by render target (see tools/shot/diag.js)
     window.addEventListener('keydown', (e) => { if (e.code === 'F2') { const first = !this.hud; this.initHud(); if (!first) this.hud.c.style.display = this.hud.c.style.display === 'none' ? '' : 'none'; } });
   }
   initDefaults() {
@@ -660,6 +672,7 @@ class D3D9Renderer {
   }
   draw(type, indexed, base, minIdx, numVerts, start, primCount) {
     const gl = this.gl, ctx = this.prepareDraw(); if (!ctx) return;
+    if (this.diag) { const r0 = this.rt[0], k = r0.kind + ':' + (r0.id || 0); this.rtCount[k] = (this.rtCount[k] || 0) + 1; }
     const count = this.primCount(type, primCount), mode = this.glMode(type);
     const dn = this.dn = (this.dn || 0) + 1 - 1; this.dn++;
     if (window.__only && !(dn >= window.__only[0] && dn <= window.__only[1]) && this.rt[0].kind !== 0 && this.rt[0].id === window.__only[2]) return;
@@ -802,6 +815,7 @@ class D3D9Renderer {
   present() { this.auditPresent = (this.auditPresent || 0) + 1;
     const gl = this.gl;
     this.pollReadbacks();
+    if (this.diag) { let d = 0; for (const k in this.rtCount) d += this.rtCount[k]; this.diagFrames.push({ d, t: performance.now(), rts: this.rtCount, gl: Object.assign({}, this.glCalls) }); for (const k in this.glCalls) this.glCalls[k] = 0; if (this.diagFrames.length > 4000) this.diagFrames.shift(); this.rtCount = {}; }
     this.dn = 0;
     { const fd = this.stats.frameDraws; if (this.cap) { window.__cap = this.cap; this.cap = null; window.__capNext = false; console.log('renderer: capture done'); }
       else if (!window.__cap && (window.__capNext || (window.__capAuto && fd >= 300))) this.cap = []; this.capTexMap = null; } if (this.dbg && (this.dbgF = (this.dbgF || 0) + 1) % 600 === 0) { for (const id of (window.DBG_RT || [2795, 2798])) this.dbgReadRT(id); } this.stats.frameDraws = this.stats.draws - (this.lastDraws || 0); this.lastDraws = this.stats.draws;
