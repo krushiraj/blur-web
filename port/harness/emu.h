@@ -53,6 +53,8 @@ enum { G_TEX_CREATE = 20, G_TEX_UPLOAD = 21, G_SURF_CREATE = 22, G_BUF_CREATE = 
        G_PRESENT = 73, G_STRETCH = 74, G_SET_VSCI = 75, G_SET_PSCI = 76, G_SET_VSCB = 77, G_SET_PSCB = 78 };
 int gfx_on(void); void gfx_flush(void);
 void gfx_msg(uint32_t type, const uint32_t *w, int nw, const void *data, uint32_t ndata);
+uint8_t *gfx_msg_alloc(uint32_t type, const uint32_t *w, int nw, uint32_t ndata);
+extern volatile uint32_t g_net_epoch;   // incremented each time a viewer attaches: source-side state filters must forget what they believe the renderer holds
 #define GFXW(type, ...) do { if (gfx_on()) { uint32_t _w[] = {__VA_ARGS__}; gfx_msg(type, _w, (int)(sizeof _w / 4), NULL, 0); } } while (0)
 void md5_digest(const uint8_t *m, size_t n, uint8_t out[16]); void sha1_digest(const uint8_t *m, size_t n, uint8_t out[20]); void sha256_digest(const uint8_t *m, size_t n, uint8_t out[32]);
 typedef struct Ctx Ctx;
@@ -78,7 +80,7 @@ typedef struct {
 #define MAX_THREADS 64
 #define MAX_HANDLES 4096
 enum { H_NONE = 0, H_EVENT, H_MUTEX, H_SEMAPHORE, H_THREAD, H_FILE, H_FIND };
-typedef struct { int type, signaled, manual; uint32_t owner; int count, max, thread; void *fp; char pat[260]; } Handle;
+typedef struct { int type, signaled, manual; uint32_t owner; int count, max, thread; void *fp; char pat[260]; int abandoned; uint32_t cret; uint64_t nset, nacq; char nm[48]; uint32_t setter[4], setter_n[4]; } Handle;
 typedef struct { uint32_t real_ret, value; int use_result; } Cont;
 typedef struct {
     Cont cont[16]; int ncont;
@@ -86,6 +88,7 @@ typedef struct {
     uint32_t spin_ret, spin_addr; int spin_n;
     uc_context *ctx;
     uint32_t teb, stack_lo, stack_hi, entry, param, tid, exit_code;
+    uint8_t wk, nwh, wall; uint32_t wh[8], wcs;   // what a blocked thread waits for (scheduler skips it until satisfiable): 1 handles, 2 sleep, 3 critical section
     uint64_t wake_at;     // Sleep / timed wait deadline in microseconds (0 = none)
     uint32_t handle;
     void *cpu; int rt_started;    // recompiled-code mode: register file and host thread of this guest thread
@@ -116,20 +119,35 @@ struct Ctx {
 };
 
 // ---- guest memory helpers -----------------------------------------------------
+#ifndef SLOW_MEM
+// guest memory is one flat host mapping that Unicorn shares (uc_mem_map_ptr), so the HLE can access it directly instead of through uc_mem_read/uc_mem_write
+static inline uint32_t rd32(Ctx *c, uint32_t a) { (void)c; uint32_t v; memcpy(&v, G + a, 4); return v; }
+static inline uint16_t rd16(Ctx *c, uint32_t a) { (void)c; uint16_t v; memcpy(&v, G + a, 2); return v; }
+static inline uint8_t  rd8 (Ctx *c, uint32_t a) { (void)c; return G[a]; }
+static inline void wr32(Ctx *c, uint32_t a, uint32_t v) { (void)c; memcpy(G + a, &v, 4); }
+static inline void wr16(Ctx *c, uint32_t a, uint16_t v) { (void)c; memcpy(G + a, &v, 2); }
+static inline void wr8 (Ctx *c, uint32_t a, uint8_t v)  { (void)c; G[a] = v; }
+#else
 static inline uint32_t rd32(Ctx *c, uint32_t a) { uint32_t v = 0; uc_mem_read(c->uc, a, &v, 4); return v; }
 static inline uint16_t rd16(Ctx *c, uint32_t a) { uint16_t v = 0; uc_mem_read(c->uc, a, &v, 2); return v; }
 static inline uint8_t  rd8 (Ctx *c, uint32_t a) { uint8_t  v = 0; uc_mem_read(c->uc, a, &v, 1); return v; }
 static inline void wr32(Ctx *c, uint32_t a, uint32_t v) { uc_mem_write(c->uc, a, &v, 4); }
 static inline void wr16(Ctx *c, uint32_t a, uint16_t v) { uc_mem_write(c->uc, a, &v, 2); }
 static inline void wr8 (Ctx *c, uint32_t a, uint8_t v)  { uc_mem_write(c->uc, a, &v, 1); }
+#endif
 extern uint32_t g_hw_lo, g_hw_hi; extern const char *g_cur_api;
+#ifndef SLOW_MEM
+static inline void wrbuf(Ctx *c, uint32_t a, const void *p, size_t n) { (void)c; if (g_hw_hi && a < g_hw_hi && a + n > g_hw_lo) fprintf(stderr, "[hostw] %zu bytes at %08x by %s\n", n, a, g_cur_api ? g_cur_api : "?"); memcpy(G + a, p, n); }
+static inline void rdbuf(Ctx *c, uint32_t a, void *p, size_t n) { (void)c; memcpy(p, G + a, n); }
+#else
 static inline void wrbuf(Ctx *c, uint32_t a, const void *p, size_t n) { if (g_hw_hi && a < g_hw_hi && a + n > g_hw_lo) fprintf(stderr, "[hostw] %zu bytes at %08x by %s\n", n, a, g_cur_api ? g_cur_api : "?"); uc_err e = uc_mem_write(c->uc, a, p, n); if (e != UC_ERR_OK) { static int k; if (k++ < 20) fprintf(stderr, "[mem] guest write failed at %08x size %zu: %s\n", a, n, uc_strerror(e)); } }
 static inline void rdbuf(Ctx *c, uint32_t a, void *p, size_t n) { uc_err e = uc_mem_read(c->uc, a, p, n); if (e != UC_ERR_OK) { static int k; if (k++ < 20) fprintf(stderr, "[mem] guest read failed at %08x size %zu: %s\n", a, n, uc_strerror(e)); } }
+#endif
 int  rd_cstr(Ctx *c, uint32_t a, char *out, int max);
 int  rd_wstr(Ctx *c, uint32_t a, char *out, int max);   // UTF-16 -> ASCII (lossy)
 
 // ---- allocator & loader (main.c) -------------------------------------------------
-uint32_t guest_alloc(Ctx *c, uint32_t size);
+uint32_t guest_alloc(Ctx *c, uint32_t size); int heapchk_scan(Ctx *c, const char *when); void heapdbg_describe(Ctx *c, uint32_t v, const char *tag); void strict_log(const char *api, const char *why, uint32_t v0, uint32_t v1);
 void     guest_free(Ctx *c, uint32_t p);
 uint32_t guest_blocksize(Ctx *c, uint32_t p);
 uint32_t guest_blockcap(Ctx *c, uint32_t p);
@@ -156,7 +174,9 @@ uint32_t spawn_thread(Ctx *c, uint32_t start, uint32_t param, int suspended, uin
 void     run_scheduler(Ctx *c);
 uint64_t now_us(void); uint64_t real_us(void);
 uint32_t new_handle(Ctx *c, int type);
-Thread  *cur_thread(Ctx *c);
+void hle_thread_exit(Ctx *c, Thread *t);   // release the mutexes the thread owned (abandoned), signal nothing else
+void hle_sync_report(Ctx *c);
+Thread  *cur_thread(Ctx *c); int thread_can_run(Ctx *c, Thread *t); uint64_t thread_next_deadline(Ctx *c); extern uint64_t g_sched_now;
 void     register_main_thread(Ctx *c, uint32_t entry);
 uint32_t cur_esp(Ctx *c);   // stack pointer of the calling guest thread (valid inside an API handler)
 void rt_main(Ctx *c);       // recompiled-code scheduler (rt.c)
