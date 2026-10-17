@@ -40,6 +40,16 @@ static GuestFn lookup(uint32_t a) {
     while (hkey[h]) { if (hkey[h] == a) { if (cov_on > 0) cov[h] = 1; return htab[h]; } h = (h + 1) & hmask; }
     return NULL;
 }
+// interpreter fallback (port/work/interp): code that is not in the recompiled table is run by interp.c until control reaches compiled code / an API stub / RET_MAGIC
+int rt_is_native(uint32_t pc) {
+    if (pc - STUB_BASE < STUB_SLOTS * 16u || pc == RET_MAGIC) return 1;
+    uint32_t h = (pc * 2654435761u) >> 7 & hmask;
+    while (hkey[h]) { if (hkey[h] == pc) return 1; h = (h + 1) & hmask; }
+    return 0;
+}
+extern int rt_cold(Cpu *cpu);
+uint64_t rt_api_count(void) { return 0; }      // used only by the interpreter's optional call-trace window
+static int cold_mode = -1;      // BLUR_COLD=0 disables the fallback (the old 'learn' behaviour), default on
 static void cov_init(void) { cov_on = getenv("BLUR_COVER") != NULL; if (cov_on) cov = calloc(hmask + 1, 1); }
 static void cov_write(void) { const char *p = getenv("BLUR_COVER"); if (!p || !cov) return; FILE *f = fopen(p, "w"); if (!f) return; uint32_t n = 0; for (uint32_t h = 0; h <= hmask; h++) if (cov[h]) { fprintf(f, "%08x\n", hkey[h]); n++; } fclose(f); fprintf(stderr, "[cover] %u functions entered -> %s\n", n, p); }
 
@@ -50,7 +60,9 @@ static struct { uint32_t pc, first; uint64_t n[32]; } pcc[8]; static int npcc;
 static uint64_t t_end;
 
 static void prof_dump(void);
+void audio_shutdown(void);
 static void finish_process(Ctx *c) {
+    audio_shutdown();
     cov_write();
     if (getenv("BLUR_DUMPMEM")) { FILE *f = fopen(getenv("BLUR_DUMPMEM"), "wb"); if (f) { fwrite(G + 0x20000000u, 1, 0x40000000u, f); fclose(f); fprintf(stderr, "[dumpmem] guest 0x20000000..0x60000000 written\n"); } }
     if (getenv("BLUR_STATS")) {
@@ -238,7 +250,8 @@ static void pace_present(Ctx *c) {
     static uint32_t sent;
     // viewer back-pressure: the page acks every presented frame; do not run more than BLUR_MAXLAG (4) frames ahead of it (it would only queue them in browser memory = latency). Gives up after 100 ms (hidden tab, old page).
     if (g_net_ack_seen && net_client_connected()) { static int maxlag = -1; if (maxlag < 0) maxlag = getenv("BLUR_MAXLAG") ? atoi(getenv("BLUR_MAXLAG")) : 4; sent++;
-        if ((int32_t)(sent - g_net_ack) > maxlag) { uint64_t until = now_us() + 100000; Thread *t = cur_thread(c); t->wake_at = until; t->wk = 2; t->blocked = 1; g_pace_until = until;
+        if (g_det_on && (int32_t)(sent - g_net_ack) > maxlag) { uint64_t until = real_us() + 100000; while ((int32_t)(sent - g_net_ack) > maxlag && real_us() < until) usleep(200); }   // BLUR_DET: wait in REAL time without yielding/ticking the virtual clock, otherwise the number of virtual ticks (= guest progress) would depend on when the viewer's acks arrive
+        else if ((int32_t)(sent - g_net_ack) > maxlag) { uint64_t until = now_us() + 100000; Thread *t = cur_thread(c); t->wake_at = until; t->wk = 2; t->blocked = 1; g_pace_until = until;
             while ((int32_t)(sent - g_net_ack) > maxlag && now_us() < until) { t->wake_at = now_us() + 1000; rt_yield(c); } g_pace_until = 0; t->blocked = 0; t->wake_at = 0; t->wk = 0; if (g_prof) prof_seg_end(); } }
     static uint64_t next; static uint64_t period; static int on = -1;
     if (on < 0) { on = !getenv("BLUR_NOVSYNC") && !g_det_on; uint32_t hz = getenv("BLUR_REFRESH") ? (uint32_t)atoi(getenv("BLUR_REFRESH")) : 60; period = 1000000ull / (hz ? hz : 60); }
@@ -327,7 +340,8 @@ static void lua_init(void);
 static uint32_t hook_addr[16]; static int nhook = -1; static struct { uint32_t ret, esp, fn; } hook_pend[256]; static int nhook_pend; static int hook_budget = 400; static int hook_budget_init;
 static void hook_init(void) { nhook = 1; lua_init(); hook_addr[0] = 0; const char *e = getenv("BLUR_HOOK"); if (nhook) { nhook = 1; hook_addr[0] = 0xffffffffu; } while (e && *e && nhook < 16) { hook_addr[nhook++] = (uint32_t)strtoul(e, (char **)&e, 16); if (*e == ',') e++; } }
 // BLUR_LUATRACE=1: log every entry into one of the 255 Lua C bindings (table from ../work/net-re/script_bindings.txt: <slot> <name> <fn address>)
-static struct { uint32_t a; char name[48]; uint32_t n; long first; } lua_b[300]; static int nlua, lua_quiet; extern uint64_t g_frames_pub;
+static struct { uint32_t a; char name[48]; uint32_t n; long first; double first_t; } lua_b[300]; static int nlua, lua_quiet; extern uint64_t g_frames_pub;
+double lua_binding_first_time(const char *nm) { for (int i = 0; i < nlua; i++) if (lua_b[i].n && !strcmp(lua_b[i].name, nm)) return lua_b[i].first_t; return -1; }
 long lua_binding_first_frame(const char *nm) { for (int i = 0; i < nlua; i++) if (lua_b[i].n && !strcmp(lua_b[i].name, nm)) return lua_b[i].first; return -1; }
 static void lua_init(void) { const char *p = getenv("BLUR_LUATRACE_TABLE"); FILE *f = fopen(p ? p : "../work/net-re/script_bindings.txt", "r"); char l[256]; if (!f) { if (getenv("BLUR_LUATRACE")) fprintf(stderr, "[lua] no binding table\n"); return; }
     while (fgets(l, sizeof l, f) && nlua < 300) { unsigned slot, fn; char nm[64]; if (sscanf(l, "%x %63s %x", &slot, nm, &fn) == 3) { lua_b[nlua].a = fn; snprintf(lua_b[nlua].name, 48, "%s", nm); nlua++; } } fclose(f); if (getenv("BLUR_LUATRACE")) fprintf(stderr, "[lua] tracing %d bindings\n", nlua); else lua_quiet = 1; }
@@ -336,7 +350,7 @@ static void seed_account(void) {       // BLUR_SEEDACCT=1: give the primary prof
     uint32_t prof = 0x1212180u + 0x10 + (uint32_t)idx * 0x2100u; const char *nm = "BlurPlayer", *pw = "blurpass1";
     for (int k = 0; ; k++) { *(uint16_t *)(G + prof + 0xff9 + 2 * k) = (uint8_t)nm[k]; if (!nm[k]) break; } for (int k = 0; ; k++) { *(uint16_t *)(G + prof + 0x1019 + 2 * k) = (uint8_t)pw[k]; if (!pw[k]) break; }
     fprintf(stderr, "[seed] account name/password written into profile %08x\n", prof); }
-static void lua_check(Cpu *cpu, uint32_t pc) { for (int i = 0; i < nlua; i++) if (lua_b[i].a == pc) { lua_b[i].n++; if (lua_b[i].n == 1) lua_b[i].first = (long)g_frames_pub; if (!strcmp(lua_b[i].name, "ReadOnlineAccountDetails") && !(getenv("BLUR_SEEDACCT") && getenv("BLUR_SEEDACCT")[0] == '0')) seed_account(); static uint64_t t0; uint64_t t = real_us(); if (!t0) t0 = t;
+static void lua_check(Cpu *cpu, uint32_t pc) { for (int i = 0; i < nlua; i++) if (lua_b[i].a == pc) { lua_b[i].n++; if (lua_b[i].n == 1) { lua_b[i].first = (long)g_frames_pub; lua_b[i].first_t = (double)real_us() / 1e6; } if (!strcmp(lua_b[i].name, "ReadOnlineAccountDetails") && !(getenv("BLUR_SEEDACCT") && getenv("BLUR_SEEDACCT")[0] == '0')) seed_account(); static uint64_t t0; uint64_t t = real_us(); if (!t0) t0 = t;
     if (!lua_quiet && (lua_b[i].n <= 40 || (lua_b[i].n & (lua_b[i].n - 1)) == 0)) fprintf(stderr, "[lua] %s #%u frame=%llu t=%llums thread=%d L=%08x\n", lua_b[i].name, lua_b[i].n, (unsigned long long)g_frames_pub, (unsigned long long)((t - t0) / 1000), C->cur, M32(cpu->esp + 4)); return; } }
 static struct { uint32_t pc, ret, a[4]; int t; } hook_ring[128]; static unsigned hook_n;    // BLUR_HOOK_TAIL=1: keep the last 128 entries, dumped when the run dies on a missing target
 static void hook_dump(void) { for (unsigned i = hook_n > 128 ? hook_n - 128 : 0; i < hook_n; i++) { typeof(hook_ring[0]) *e = &hook_ring[i & 127]; fprintf(stderr, "[hooktail] %08x t%d ret=%08x args %08x %08x %08x %08x\n", e->pc, e->t, e->ret, e->a[0], e->a[1], e->a[2], e->a[3]); } }
@@ -388,7 +402,11 @@ void rt_dispatch(Cpu *cpu) {
         if (pc - STUB_BASE < STUB_SLOTS * 16u) { cpu->pc = rt_api(cpu, pc); continue; }
         if (pc == RET_MAGIC) return;                         // the thread's start routine returned
         GuestFn f = lookup(pc);
-        if (!f) rt_missing(cpu, pc);
+        if (!f) {
+            if (cold_mode < 0) cold_mode = getenv("BLUR_COLD") ? atoi(getenv("BLUR_COLD")) : 1;
+            if (cold_mode && rt_cold(cpu)) continue;          // interpreter fallback
+            rt_missing(cpu, pc);
+        }
         MUSTTAIL return f(cpu);
     }
 }
@@ -416,9 +434,24 @@ static void thread_body(int idx) {
 }
 static void *thread_main(void *arg) { int idx = (int)(intptr_t)arg; wait_turn(C, idx); thread_body(idx); return NULL; }
 
+// Spin diagnosis: a guest loop that stays inside one lifted function never reaches a scheduler check, so the stale Cpu snapshot below says nothing about it. The watchdog
+// therefore signals the host thread running the guest (SIGUSR2) and the handler prints the host PC with its symbol (f_<guest address> = the lifted function that spins).
+#include <pthread.h>
+static pthread_t g_main_thr; static volatile int g_spin_dumped;
+static void spin_sig(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si; ucontext_t *uc = uc_; uintptr_t pc = 0, sp = 0;
+#if defined(__aarch64__)
+    pc = (uintptr_t)uc->uc_mcontext->__ss.__pc; sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
+#elif defined(__x86_64__)
+    pc = (uintptr_t)uc->uc_mcontext->__ss.__rip; sp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+#endif
+    Dl_info di; const char *nm = "?"; uintptr_t off = 0; if (pc && dladdr((void *)pc, &di) && di.dli_sname) { nm = di.dli_sname; off = pc - (uintptr_t)di.dli_saddr; }
+    fprintf(stderr, "[spin] host pc=%p sp=%p in %s+0x%lx (guest function f_<addr> = the lifted function the guest thread is spinning in)\n", (void *)pc, (void *)sp, nm, (unsigned long)off); g_spin_dumped = 1;
+}
 static void *watchdog(void *arg) {
     Ctx *c = arg; uint64_t last = 0; int still = 0;
     for (;;) { sleep(2); uint64_t now = g_switches + c->api_progress; if (now == last) { if (++still >= 2) { fprintf(stderr, "[watchdog] no scheduling progress; cur=%d nthreads=%d\n", c->cur, c->nthreads);
+            if (!g_spin_dumped) { pthread_kill(g_main_thr, SIGUSR2); for (int w = 0; w < 50 && !g_spin_dumped; w++) usleep(20000); g_spin_dumped = 0; }
             { Thread *ct = &c->threads[c->cur]; Cpu *cp = ct->cpu; if (cp) { fprintf(stderr, "[watchdog] thread %d last Cpu snapshot: pc=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x last_api=%s\n", c->cur, cp->pc, cp->eax, cp->ecx, cp->edx, cp->ebx, cp->esp, cp->ebp, cp->esi, cp->edi, ct->last_api ? ct->last_api : "-");
                 fprintf(stderr, "[watchdog] stack:"); for (int k = 0; k < 24; k++) fprintf(stderr, " %08x", M32(cp->esp + 4 * k)); fprintf(stderr, "\n"); if (cp->esi > 0x10000) { for (int k = 0; k < c->nthreads; k++) { Thread *t = &c->threads[k]; if (t->used) fprintf(stderr, "[watchdog] thread %2d %s%s%s apis=%u last=%s(%08x,%08x) ret=%08x\n", k, t->done ? "done " : "", t->suspended ? "susp " : "", t->blocked ? "blocked " : "", t->n_api, t->last_api ? t->last_api : "-", t->last_a0, t->last_a1, t->last_ret); }
                 fprintf(stderr, "[watchdog] [esi]:"); for (int k = 0; k < 40; k++) fprintf(stderr, " %08x", M32(cp->esi + 4 * k)); fprintf(stderr, "\n"); uint32_t n = M32(cp->esi + 0x44); fprintf(stderr, "[watchdog] list from [esi+0x44]:"); for (int k = 0; k < 12; k++) { fprintf(stderr, " %08x", n); if (n < 0x1000) break; n = M32(n + 4); } fprintf(stderr, "\n"); } } } for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; fprintf(stderr, "  #%d used=%d done=%d susp=%d blocked=%d started=%d\n", i, t->used, t->done, t->suspended, t->blocked, t->rt_started); } still = 0; if (getenv("BLUR_HANGEXIT")) { hle_sync_report(c); fprintf(stderr, "[watchdog] BLUR_HANGEXIT: exiting\n"); fflush(stderr); _exit(8); } } } else still = 0; last = now; }
@@ -439,6 +472,7 @@ void rt_main(Ctx *c) {
     if (getenv("BLUR_SECONDS")) t_end = real_us() + (uint64_t)atof(getenv("BLUR_SECONDS")) * 1000000ull;
     c->api_slice = getenv("BLUR_API_SLICE") ? (uint32_t)atoi(getenv("BLUR_API_SLICE")) : 300;   // was 50: every forced yield is a scheduler pass (pick_next over all threads)
     for (int i = 0; i < MAX_THREADS; i++) pthread_cond_init(&bcv[i], NULL);
+    { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = spin_sig; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGUSR2, &sa, NULL); g_main_thr = pthread_self(); }
     { pthread_t wd; pthread_create(&wd, NULL, watchdog, c); pthread_detach(wd); }
     if (!getenv("BLUR_WATCHW_AFTER_FRAME1")) ww_arm();
     fprintf(stderr, "[rt] %u recompiled functions; entering the game at %08x on the recompiled path\n", rt_table_n, g_oep_addr);
