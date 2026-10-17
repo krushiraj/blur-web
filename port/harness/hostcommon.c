@@ -45,7 +45,7 @@ static FreeList *freelist_for(uint32_t cap, int create) {
 // (heapchk_scan from Present) and at exit/crash. A corrupted block is reported once with the API call that allocated it.
 #define HC_PAD 32
 typedef struct { uint32_t p, size, ret; const char *api; } HcEnt;
-static HcEnt *hc_ents; static size_t hc_n, hc_cap; static int hc_on = -1;
+static HcEnt *hc_ents; static size_t hc_n, hc_cap; static int hc_on = -1; static Ctx *hc_ctx;
 extern const char *g_cur_api; extern uint32_t g_api_ret;
 static int hc_enabled(void) { if (hc_on < 0) hc_on = getenv("BLUR_HEAPCHK") != NULL; return hc_on; }
 static int hc_check(Ctx *c, HcEnt *e, const char *when) {
@@ -75,18 +75,56 @@ void heapdbg_describe(Ctx *c, uint32_t v, const char *tag) {
     (void)c; for (size_t i = fd_n; i-- > 0; ) if (v >= fd[i].p && v < fd[i].p + fd[i].cap) { FreeEnt *f = &fd[i];
         fprintf(stderr, "[heapdbg] %s=%08x lies in FREED block %08x (+%x) size=%u: freed by %s ret=%08x thread %d; allocated by %s ret=%08x\n", tag, v, f->p, v - f->p, f->size, f->free_api ? f->free_api : "?", f->free_ret, f->thr, f->alloc_api ? f->alloc_api : "?(use BLUR_HEAPCHK=1)", f->alloc_ret); return; }
 }
+// BLUR heap diagnostics: bump allocations per size class and per allocating API; reported when the heap is exhausted
+static struct { uint32_t cap; uint32_t n; } hs_cls[HEAP_CLASSES]; static int hs_ncls;
+static struct { const char *api; uint64_t bytes; uint32_t n; } hs_api[512]; static int hs_napi;
+static void heap_note_bump(uint32_t cap) {
+    int i = 0; for (; i < hs_ncls; i++) if (hs_cls[i].cap == cap) break;
+    if (i == hs_ncls && hs_ncls < HEAP_CLASSES) hs_cls[hs_ncls++].cap = cap;
+    if (i < HEAP_CLASSES) hs_cls[i].n++;
+    const char *a = g_cur_api ? g_cur_api : "?"; int j = 0; for (; j < hs_napi; j++) if (hs_api[j].api == a) break;
+    if (j == hs_napi && hs_napi < 512) hs_api[hs_napi++].api = a;
+    if (j < 512) { hs_api[j].bytes += cap; hs_api[j].n++; }
+}
+// BLUR_HEAPSITES=1 (needs BLUR_HEAPCHK=1 so every live block is tracked): live guest-heap bytes grouped by allocating API + guest return address, top 14
+void heap_sites_report(const char *why) {
+    if (!hc_enabled()) return;
+    static struct { const char *api; uint32_t ret; uint64_t bytes; uint32_t n; } g[4096]; static int ng; ng = 0; uint64_t tot = 0; uint32_t live = 0;
+    for (size_t i = 0; i < hc_n; i++) { HcEnt *e = &hc_ents[i]; if (!e->p || !hc_ctx || !rd32(hc_ctx, e->p - 12) || rd32(hc_ctx, e->p - 16) != e->size) continue; tot += e->size; live++;
+        int k = 0; for (; k < ng; k++) if (g[k].api == e->api && g[k].ret == e->ret) break;
+        if (k == ng) { if (ng >= 4096) continue; g[ng].api = e->api; g[ng].ret = e->ret; g[ng].bytes = 0; g[ng].n = 0; ng++; } g[k].bytes += e->size; g[k].n++; }
+    extern uint32_t hle_virt_used(void); fprintf(stderr, "[heapsites] %s: heap cursor %u MB, VirtualAlloc window used %u MB, %u live tracked blocks, %llu MB requested; top sites:", why, hc_ctx ? (hc_ctx->heap_next - HEAP_BASE) >> 20 : 0, hle_virt_used() >> 20, live, (unsigned long long)(tot >> 20));
+    for (int r = 0; r < 14; r++) { int b = -1; uint64_t bv = 0; for (int k = 0; k < ng; k++) if (g[k].bytes > bv) { bv = g[k].bytes; b = k; } if (b < 0) break;
+        fprintf(stderr, " | %s ret=%08x: %u blocks %.1f MB", g[b].api ? g[b].api : "?", g[b].ret, g[b].n, g[b].bytes / 1048576.0); g[b].bytes = 0; }
+    fprintf(stderr, "\n");
+}
+static void heap_report(uint32_t want) {
+    uint64_t freeb = 0; for (int i = 0; i < nfree_lists; i++) freeb += (uint64_t)free_lists[i].cap * free_lists[i].n;
+    fprintf(stderr, "[heap] failed request %u bytes; %llu MB sit on free lists (unusable for this request class)\n", want, (unsigned long long)(freeb >> 20));
+    for (int k = 0; k < 12; k++) { int b = -1; uint64_t bv = 0; for (int i = 0; i < hs_ncls; i++) { uint64_t v = (uint64_t)hs_cls[i].cap * hs_cls[i].n; if (v > bv) { bv = v; b = i; } }
+        if (b < 0) break; FreeList *fl = freelist_for(hs_cls[b].cap, 0);
+        fprintf(stderr, "[heap]  class %9u B: %7u bumped (%5llu MB), %u on free list\n", hs_cls[b].cap, hs_cls[b].n, (unsigned long long)(bv >> 20), fl ? fl->n : 0); hs_cls[b].n = 0; }
+    for (int k = 0; k < 8; k++) { int b = -1; uint64_t bv = 0; for (int i = 0; i < hs_napi; i++) if (hs_api[i].bytes > bv) { bv = hs_api[i].bytes; b = i; }
+        if (b < 0) break; fprintf(stderr, "[heap]  api %-24s %7u allocs, %5llu MB bumped\n", hs_api[b].api, hs_api[b].n, (unsigned long long)(bv >> 20)); hs_api[b].bytes = 0; }
+}
 uint32_t guest_alloc(Ctx *c, uint32_t size) {
     if (size > 0x7f000000u) { strict_log("guest_alloc", "request > 2 GB (rounding would wrap)", size, 0); return 0; }
     uint32_t rsize = hc_enabled() ? size + HC_PAD : size;
     uint32_t cap = heap_class_size(rsize ? rsize : 1), p; FreeList *fl = freelist_for(cap, 0);
     if (fl && fl->n) p = fl->v[--fl->n];
     else {
-        if (cap > HEAP_SIZE || c->heap_next + cap + 16 > HEAP_BASE + HEAP_SIZE) { fprintf(stderr, "guest heap exhausted (%u MB used)\n", (c->heap_next - HEAP_BASE) >> 20); return 0; }
-        p = c->heap_next + 16; c->heap_next += cap + 16; c->heap_next = (c->heap_next + 15) & ~15u;
+        if (cap > HEAP_SIZE || c->heap_next + cap + 16 > HEAP_BASE + HEAP_SIZE) {
+            // The bump region is full. Memory freed in other size classes is unusable by exact-class lookup (a game session frees tens of MB of textures in classes
+            // later requests never ask for): reuse the smallest free block that is big enough (the block keeps its own capacity, so it returns to its real class on free).
+            FreeList *best = NULL; for (int i = 0; i < nfree_lists; i++) if (free_lists[i].n && free_lists[i].cap >= cap && (!best || free_lists[i].cap < best->cap)) best = &free_lists[i];
+            if (best) { p = best->v[--best->n]; cap = best->cap; goto have_block; }
+            fprintf(stderr, "guest heap exhausted (%u MB used)\n", (c->heap_next - HEAP_BASE) >> 20); heap_sites_report("EXHAUSTED"); heap_report(size); return 0; }
+        heap_note_bump(cap); p = c->heap_next + 16; c->heap_next += cap + 16; c->heap_next = (c->heap_next + 15) & ~15u;
     }
+have_block: ;
     static uint8_t z[1 << 16]; for (uint32_t o = 0; o < cap; o += sizeof z) uc_mem_write(c->uc, p + o, z, cap - o < sizeof z ? cap - o : sizeof z);   // always zero-filled
     wr32(c, p - 16, size); wr32(c, p - 12, cap);
-    if (hc_enabled()) {
+    if (hc_enabled()) { hc_ctx = c;
         uint8_t pad[HC_PAD]; memset(pad, 0xAB, sizeof pad); wrbuf(c, p + size, pad, HC_PAD);
         if (hc_n == hc_cap) { hc_cap = hc_cap ? hc_cap * 2 : 1 << 16; hc_ents = realloc(hc_ents, hc_cap * sizeof *hc_ents); }
         hc_ents[hc_n++] = (HcEnt){ p, size, g_api_ret, g_cur_api };

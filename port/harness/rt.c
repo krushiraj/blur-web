@@ -1,5 +1,8 @@
 // Runtime for the statically recompiled game code: API dispatch into the Win32/D3D9 handlers, guest threads on host threads
 // (one runs at a time, hand-off at blocking calls, like the cooperative scheduler it replaces), CPUID/RDTSC.
+#include <dispatch/dispatch.h>
+#include <stdatomic.h>
+#include <sched.h>
 #include "emu.h"
 #include "../recomp/rt.h"
 #include <unistd.h>
@@ -158,17 +161,25 @@ static uint64_t last_prog; static int idle_n; static uint64_t idle_since;
 // handlers' "block and retry" protocol are unchanged.  A blocked thread parks on its own condition variable (releases the lock) and is woken by par_wake() after any
 // API that can make a wait satisfiable, or by a timeout (sleep deadlines, 2 ms safety).  Guest atomics are real __atomic ops (lift.py), so lock-free code keeps working.
 int par_mode;
-static pthread_mutex_t par_lock = PTHREAD_MUTEX_INITIALIZER; static __thread int t_idx = -1;
+// The API lock is a spin-then-yield lock: critical sections are a few hundred ns, and a pthread mutex under contention cost ~26% of the render thread's time in kernel
+// wait/wake (psynch_mutexwait/mutexdrop).  Blocked threads park on a per-thread semaphore (a post that arrives before the wait is not lost).
+static _Atomic int par_l; static dispatch_semaphore_t par_sem[MAX_THREADS]; static __thread int t_idx = -1;
+static inline void par_lock_acq(void) { for (int spins = 0;; spins++) { int exp = 0; if (atomic_compare_exchange_weak_explicit(&par_l, &exp, 1, memory_order_acquire, memory_order_relaxed)) return; if (spins < 3000) __asm__ volatile("yield"); else { sched_yield(); spins = 2000; } } }
+static inline void par_lock_rel(void) { atomic_store_explicit(&par_l, 0, memory_order_release); }
 static uint8_t par_flag[STUB_SLOTS];            // 0 unknown, 1 plain, 2 may unblock waiters, 4 may start threads (|)
 static __thread int t_depth;
 static uint64_t par_lockwait_ns[MAX_THREADS], par_parked_ns[MAX_THREADS], par_held_ns[MAX_THREADS], par_acq_t[MAX_THREADS]; static int par_stat = -1;
 static void par_enter(Ctx *c) {
     if (t_depth++ == 0) { if (par_stat < 0) par_stat = getenv("BLUR_PARSTAT") != NULL ? 1 : 0;
-        if (par_stat) { uint64_t t0 = real_us(); pthread_mutex_lock(&par_lock); uint64_t t1 = real_us(); par_lockwait_ns[t_idx] += t1 - t0; par_acq_t[t_idx] = t1; } else pthread_mutex_lock(&par_lock); }
+        if (par_stat) { uint64_t t0 = real_us(); par_lock_acq(); uint64_t t1 = real_us(); par_lockwait_ns[t_idx] += t1 - t0; par_acq_t[t_idx] = t1; } else par_lock_acq(); }
     c->cur = t_idx; }
-static void par_leave(void) { if (--t_depth == 0) { if (par_stat > 0) par_held_ns[t_idx] += real_us() - par_acq_t[t_idx]; pthread_mutex_unlock(&par_lock); } }
+static void par_leave(void) { if (--t_depth == 0) { if (par_stat > 0) par_held_ns[t_idx] += real_us() - par_acq_t[t_idx]; par_lock_rel(); } }
+extern uint64_t g_sched_now;
 static void par_wake(Ctx *c) {
-    for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (i != t_idx && t->used && !t->done && t->par_waiting && ((!t->wk && t->wake_at) ? now_us() >= t->wake_at : thread_can_run(c, t))) pthread_cond_signal(&bcv[i]); }
+    g_sched_now = 0; { int any = 0; for (int i = 0; i < c->nthreads; i++) if (i != t_idx && c->threads[i].par_waiting) { any = 1; break; } if (!any) return; }
+    uint64_t now = now_us(); g_sched_now = now;       // one clock read for the whole scan
+    for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (i != t_idx && t->used && !t->done && t->par_waiting && ((!t->wk && t->wake_at) ? now >= t->wake_at : thread_can_run(c, t))) { t->par_waiting = 0; dispatch_semaphore_signal(par_sem[i]); } }
+    g_sched_now = 0;
 }
 static void *par_thread_main(void *arg);
 static void par_start_pending(Ctx *c) {
@@ -178,12 +189,11 @@ static void par_start_pending(Ctx *c) {
 }
 static void par_wait(Ctx *c) {             // called with par_lock held, from inside an API handler that wants to block: park until woken / deadline, then retry
     int self = t_idx; Thread *t = &c->threads[self];
-    if (t->done) { par_wake(c); t_depth = 0; pthread_mutex_unlock(&par_lock); pthread_exit(NULL); }
+    if (t->done) { par_wake(c); t_depth = 0; par_lock_rel(); pthread_exit(NULL); }
     uint64_t wait_us = 2000;
     if (t->wake_at) { uint64_t n = now_us(); if (t->wake_at <= n) return; if (t->wake_at - n < wait_us) wait_us = t->wake_at - n; }
-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += (long)(wait_us * 1000); if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     uint64_t pw0 = par_stat > 0 ? real_us() : 0; if (par_stat > 0) par_held_ns[self] += pw0 - par_acq_t[self];
-    t->par_waiting = 1; int rc = pthread_cond_timedwait(&bcv[self], &par_lock, &ts); t->par_waiting = 0; c->cur = self; if (par_stat > 0) { uint64_t n = real_us(); par_parked_ns[self] += n - pw0; par_acq_t[self] = n; }
+    t->par_waiting = 1; par_lock_rel(); int rc = dispatch_semaphore_wait(par_sem[self], dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_us * 1000)); par_lock_acq(); t->par_waiting = 0; c->cur = self; if (par_stat > 0) { uint64_t n = real_us(); par_parked_ns[self] += n - pw0; par_acq_t[self] = n; }
     { static int on = -1; if (on < 0) on = getenv("BLUR_PARSTAT") != NULL;
       if (on) { static struct { int t; const char *api; uint8_t wk; uint64_t sig, to, us; } h[96]; static int nh; static uint64_t last; int k = 0; uint64_t dur = real_us() - pw0;
         for (; k < nh; k++) if (h[k].t == self && h[k].api == t->last_api && h[k].wk == t->wk) break;
@@ -196,7 +206,7 @@ static void par_wait(Ctx *c) {             // called with par_lock held, from in
 static void par_flags_for(const Stub *s, int idx) {
     // Any API may complete a wait (events set from IO/audio handlers, handle state changes...), so waiters are re-checked after every API except those known to be irrelevant
     // (graphics/input/clock/TLS calls: ~60% of all calls).  par_wake costs one thread_can_run() per parked thread.
-    static const char *quiet[] = { "IDirect3D", "IDirectInput", "D3DX", "XInput", "QueryPerformanceCounter", "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue", "GetCurrentThreadId", "GetTickCount", "timeGetTime", "FlsGetValue", "FlsSetValue", "HeapAlloc", "HeapFree", "HeapSize", "GetProcessHeap", "EnterCriticalSection", "TryEnterCriticalSection", NULL };
+    static const char *quiet[] = { "IDirect3D", "IDirectInput", "D3DX", "XInput", "QueryPerformanceCounter", "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue", "GetCurrentThreadId", "GetTickCount", "timeGetTime", "FlsGetValue", "FlsSetValue", "HeapAlloc", "HeapFree", "HeapSize", "GetProcessHeap", "EnterCriticalSection", "TryEnterCriticalSection", "Interlocked", "Sleep", "WaitForSingleObject", "WaitForMultipleObjects", "IDirectSoundBuffer8", "GetCurrentProcess", "GetCurrentThread", "GetModuleHandle", "GetProcAddress", "QueryPerformanceFrequency", "GetSystemTimeAsFileTime", "MultiByteToWideChar", "WideCharToMultiByte", "lstrlen", "EncodePointer", "DecodePointer", NULL };    // none of these can make another thread's wait satisfiable (acquiring/ sleeping/ polling only)
     uint8_t f = 1 | 2; for (int i = 0; quiet[i]; i++) if (!strncmp(s->name, quiet[i], strlen(quiet[i]))) f = 1;
     if (!strcmp(s->name, "CreateThread") || !strcmp(s->name, "ResumeThread")) f |= 4; par_flag[idx] = f;
 }
@@ -314,13 +324,15 @@ static void framestat(void) {
     if (last && now - last > 30000) { fprintf(stderr, "[hitch] frame %.1f ms: API %.1f ms in %llu calls, guest/other %.1f ms; slowest calls:", (now - last) / 1e3, fs_api_us / 1e3, (unsigned long long)fs_ncalls, ((now - last) - fs_api_us) / 1e3);
         for (int i = 0; i < 6; i++) if (fs_top[i].us > 300) fprintf(stderr, " %s=%.1fms", fs_top[i].api, fs_top[i].us / 1e3); fprintf(stderr, "\n"); }
     memset(fs_top, 0, sizeof fs_top); fs_api_us = fs_ncalls = 0; last = now; if (!t10) t10 = now;
+    { static int hs = -1; if (hs < 0) hs = getenv("BLUR_HEAPSITES") != NULL; static uint64_t hl; if (hs && now - hl > 30000000ull) { hl = now; extern void heap_sites_report(const char *); heap_sites_report("periodic"); } }
     if (now - t10 >= 10000000ull && n > 20) {
         qsort(dts, (size_t)n, 4, fs_cmp); int o20 = 0, o33 = 0; for (int i = 0; i < n; i++) { if (dts[i] > 20000) o20++; if (dts[i] > 33400) o33++; }
         fprintf(stderr, "[framestat] %d frames: p50 %.1f p95 %.1f p99 %.1f max %.1f ms; >20ms: %d, >33ms: %d\n", n, dts[n / 2] / 1e3, dts[n * 95 / 100] / 1e3, dts[n * 99 / 100] / 1e3, dts[n - 1] / 1e3, o20, o33); n = 0; t10 = now; }
 }
 static void pace_present(Ctx *c) {
     framestat();
-    static uint32_t sent;
+    static uint32_t sent; static uint32_t pace_epoch = ~0u;
+    if (pace_epoch != g_net_epoch) { pace_epoch = g_net_epoch; sent = 0; g_net_ack = 0; }      // a new viewer counts its acks from 0: restart the lead counter or the host would wait 100 ms per frame for acks that never catch up
     // viewer back-pressure: the page acks every presented frame; do not run more than BLUR_MAXLAG (4) frames ahead of it (it would only queue them in browser memory = latency). Gives up after 100 ms (hidden tab, old page).
     if (g_net_ack_seen && net_client_connected()) { static int maxlag = -1; if (maxlag < 0) maxlag = getenv("BLUR_MAXLAG") ? atoi(getenv("BLUR_MAXLAG")) : 4; sent++;
         if (g_det_on && (int32_t)(sent - g_net_ack) > maxlag) { uint64_t until = real_us() + 100000; while ((int32_t)(sent - g_net_ack) > maxlag && real_us() < until) usleep(200); }   // BLUR_DET: wait in REAL time without yielding/ticking the virtual clock, otherwise the number of virtual ticks (= guest progress) would depend on when the viewer's acks arrive
@@ -530,6 +542,8 @@ static void *par_thread_main(void *arg) { t_idx = (int)(intptr_t)arg; thread_bod
 // Spin diagnosis: a guest loop that stays inside one lifted function never reaches a scheduler check, so the stale Cpu snapshot below says nothing about it. The watchdog
 // therefore signals the host thread running the guest (SIGUSR2) and the handler prints the host PC with its symbol (f_<guest address> = the lifted function that spins).
 #include <pthread.h>
+#include <dispatch/dispatch.h>
+#include <stdatomic.h>
 static pthread_t g_main_thr; static volatile int g_spin_dumped;
 static void spin_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_; uintptr_t pc = 0, sp = 0;
@@ -566,6 +580,7 @@ void rt_main(Ctx *c) {
     if (getenv("BLUR_SECONDS")) t_end = real_us() + (uint64_t)atof(getenv("BLUR_SECONDS")) * 1000000ull;
     c->api_slice = getenv("BLUR_API_SLICE") ? (uint32_t)atoi(getenv("BLUR_API_SLICE")) : 300;   // was 50: every forced yield is a scheduler pass (pick_next over all threads)
     for (int i = 0; i < MAX_THREADS; i++) pthread_cond_init(&bcv[i], NULL);
+    for (int i = 0; i < MAX_THREADS; i++) par_sem[i] = dispatch_semaphore_create(0);
     { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = spin_sig; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGUSR2, &sa, NULL); g_main_thr = pthread_self(); }
     { pthread_t wd; pthread_create(&wd, NULL, watchdog, c); pthread_detach(wd); }
     if (!getenv("BLUR_WATCHW_AFTER_FRAME1")) ww_arm();
