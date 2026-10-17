@@ -38,7 +38,7 @@ class D3D9Renderer {
     // Redundant-call filter: the draw path issues >100 GL calls per draw and Chrome's GPU process (ANGLE) pays for every one even when the state is
     // unchanged. All call sites go through these wrappers, so the shadow state is always exact. BLUR 'glcache=0' in the URL hash disables it.
     if (!/glcache=0/.test(location.hash)) {
-      const o = {}; for (const k of ['activeTexture', 'bindTexture', 'bindSampler', 'useProgram', 'bindBuffer', 'bindBufferRange', 'samplerParameteri', 'samplerParameterf', 'uniform1i', 'uniform1f', 'uniform2f',
+      gl.__glc = true; const o = {}; for (const k of ['activeTexture', 'bindTexture', 'bindSampler', 'useProgram', 'bindBuffer', 'bindBufferRange', 'samplerParameteri', 'samplerParameterf', 'uniform1i', 'uniform1f', 'uniform2f',
         'deleteTexture', 'deleteBuffer', 'deleteSampler', 'deleteProgram']) o[k] = gl[k].bind(gl);
       let unit = 0; const tex = new Map(), smp = new Array(32).fill(null); let prog = null, arr = null, ubo = null; const uboR = new Array(16).fill(null);   // tex: (unit<<16|target) -> texture
       gl.activeTexture = (u) => { const n = u - gl.TEXTURE0; if (n !== unit) { unit = n; o.activeTexture(u); } };
@@ -56,6 +56,32 @@ class D3D9Renderer {
       gl.deleteBuffer = (b) => { if (arr === b) arr = null; if (ubo === b) ubo = null; for (let i = 0; i < 16; i++) if (uboR[i] && uboR[i].b === b) uboR[i] = null; o.deleteBuffer(b); };
       gl.deleteSampler = (x) => { for (let i = 0; i < smp.length; i++) if (smp[i] === x) smp[i] = null; o.deleteSampler(x); };
       gl.deleteProgram = (x) => { if (prog === x) prog = null; o.deleteProgram(x); };
+      // fixed-function state: exact shadows of what is set on the context (every call site goes through these wrappers)
+      const q = {}; for (const k of ['enable', 'disable', 'viewport', 'scissor', 'depthRange', 'depthFunc', 'depthMask', 'colorMask', 'cullFace', 'frontFace', 'blendFunc', 'blendFuncSeparate', 'blendEquation', 'blendEquationSeparate', 'blendColor',
+        'stencilFuncSeparate', 'stencilOpSeparate', 'stencilMaskSeparate', 'stencilMask', 'bindFramebuffer', 'deleteFramebuffer', 'drawBuffers']) q[k] = gl[k].bind(gl);
+      const caps = new Map(); gl.enable = (c) => { if (caps.get(c) !== true) { caps.set(c, true); q.enable(c); } }; gl.disable = (c) => { if (caps.get(c) !== false) { caps.set(c, false); q.disable(c); } };
+      let vx = NaN, vy, vw, vh; gl.viewport = (x, y, w, h) => { if (vx !== x || vy !== y || vw !== w || vh !== h) { vx = x; vy = y; vw = w; vh = h; q.viewport(x, y, w, h); } };
+      let sx = NaN, sy, sw, sh; gl.scissor = (x, y, w, h) => { if (sx !== x || sy !== y || sw !== w || sh !== h) { sx = x; sy = y; sw = w; sh = h; q.scissor(x, y, w, h); } };
+      let dn = NaN, df; gl.depthRange = (n, f) => { if (dn !== n || df !== f) { dn = n; df = f; q.depthRange(n, f); } };
+      let dfn = -1; gl.depthFunc = (f) => { if (dfn !== f) { dfn = f; q.depthFunc(f); } };
+      let dm = -1; gl.depthMask = (m) => { const v = m ? 1 : 0; if (dm !== v) { dm = v; q.depthMask(m); } };
+      let cr = -1, cg, cb, ca; gl.colorMask = (r, g, b, a) => { const R = r ? 1 : 0, G = g ? 1 : 0, B = b ? 1 : 0, A = a ? 1 : 0; if (cr !== R || cg !== G || cb !== B || ca !== A) { cr = R; cg = G; cb = B; ca = A; q.colorMask(r, g, b, a); } };
+      let cf = -1; gl.cullFace = (m) => { if (cf !== m) { cf = m; q.cullFace(m); } };
+      let ff = -1; gl.frontFace = (m) => { if (ff !== m) { ff = m; q.frontFace(m); } };
+      let bs = -1, bd, bsa, bda; gl.blendFuncSeparate = (a, b, c, d) => { if (bs !== a || bd !== b || bsa !== c || bda !== d) { bs = a; bd = b; bsa = c; bda = d; q.blendFuncSeparate(a, b, c, d); } };
+      gl.blendFunc = (a, b) => gl.blendFuncSeparate(a, b, a, b);
+      let be = -1, bea; gl.blendEquationSeparate = (a, b) => { if (be !== a || bea !== b) { be = a; bea = b; q.blendEquationSeparate(a, b); } };
+      gl.blendEquation = (e) => gl.blendEquationSeparate(e, e);
+      let bcr = NaN, bcg, bcb, bca; gl.blendColor = (r, g, b, a) => { if (bcr !== r || bcg !== g || bcb !== b || bca !== a) { bcr = r; bcg = g; bcb = b; bca = a; q.blendColor(r, g, b, a); } };
+      const sf = { [gl.FRONT]: [-1, 0, 0], [gl.BACK]: [-1, 0, 0] }, so = { [gl.FRONT]: [-1, 0, 0], [gl.BACK]: [-1, 0, 0] }, sm = { [gl.FRONT]: [-1], [gl.BACK]: [-1] };
+      gl.stencilFuncSeparate = (face, fn, ref, mask) => { const faces = face === gl.FRONT_AND_BACK ? [gl.FRONT, gl.BACK] : [face]; for (const f of faces) { const t = sf[f]; if (t[0] === fn && t[1] === ref && t[2] === mask) continue; t[0] = fn; t[1] = ref; t[2] = mask; q.stencilFuncSeparate(f, fn, ref, mask); } };
+      gl.stencilOpSeparate = (face, a, b, c) => { const faces = face === gl.FRONT_AND_BACK ? [gl.FRONT, gl.BACK] : [face]; for (const f of faces) { const t = so[f]; if (t[0] === a && t[1] === b && t[2] === c) continue; t[0] = a; t[1] = b; t[2] = c; q.stencilOpSeparate(f, a, b, c); } };
+      gl.stencilMaskSeparate = (face, m) => { const faces = face === gl.FRONT_AND_BACK ? [gl.FRONT, gl.BACK] : [face]; for (const f of faces) { const t = sm[f]; if (t[0] === m) continue; t[0] = m; q.stencilMaskSeparate(f, m); } };
+      gl.stencilMask = (m) => gl.stencilMaskSeparate(gl.FRONT_AND_BACK, m);
+      let drawFb = null, readFb = null;
+      gl.bindFramebuffer = (t, f) => { if (t === gl.FRAMEBUFFER) { if (drawFb === f && readFb === f) return; drawFb = readFb = f; } else if (t === gl.DRAW_FRAMEBUFFER) { if (drawFb === f) return; drawFb = f; } else if (t === gl.READ_FRAMEBUFFER) { if (readFb === f) return; readFb = f; } q.bindFramebuffer(t, f); };
+      gl.deleteFramebuffer = (f) => { if (drawFb === f) drawFb = null; if (readFb === f) readFb = null; q.deleteFramebuffer(f); };
+      gl.drawBuffers = (bufs) => { const fb = drawFb; if (fb) { const key = bufs.join(); if (fb.__db === key) return; fb.__db = key; } q.drawBuffers(bufs); };
     }
     this.ext = {
       cbf: gl.getExtension('EXT_color_buffer_float'), cbh: gl.getExtension('EXT_color_buffer_half_float'),
@@ -73,7 +99,7 @@ class D3D9Renderer {
     this.rt = [{ kind: 3 }, { kind: 3 }, { kind: 3 }, { kind: 3 }]; this.ds = { kind: 3 };
     this.stats = { draws: 0, frameDraws: 0, clears: 0, progs: 0, shaders: 0, skipped: 0, tex: 0, deferred: 0, refs: 0, warmed: 0, held: 0 };
     this.fbWarn = true; this.initDefaults(); this.initGL(); if (this.q.hud) this.initHud();
-    window.addEventListener('keydown', (e) => { if (e.code === 'F2') { this.initHud(); this.hud.c.style.display = this.hud.c.style.display === 'none' ? '' : 'none'; } });
+    window.addEventListener('keydown', (e) => { if (e.code === 'F2') { const first = !this.hud; this.initHud(); if (!first) this.hud.c.style.display = this.hud.c.style.display === 'none' ? '' : 'none'; } });
   }
   initDefaults() {
     const r = this.rs; r[7] = 1; r[14] = 1; r[23] = 4; r[22] = 3; r[19] = 2; r[20] = 1; r[168] = r[190] = r[191] = r[192] = 15; r[171] = 1; r[209] = 1; r[207] = 2; r[208] = 1;
@@ -139,11 +165,12 @@ class D3D9Renderer {
     g.fillStyle = '#fff'; g.fillText(`${(1000 / avg).toFixed(1)} fps  avg ${avg.toFixed(1)} ms  p99 ${p99.toFixed(1)}  max ${mx.toFixed(1)}`, 4, 12);
     g.fillText(`scale ${this.q.scale}x  msaa ${this.q.msaa || 'off'}  aniso ${this.q.aniso}x  bias ${this.q.bias}  draws ${this.stats.frameDraws}  gpu ${this.gpuMs ? this.gpuMs.toFixed(1) + ' ms' : 'n/a'}`, 4, 26);
   }
-  statLine() { const s = this.stats; return `draws/frame ${s.frameDraws}  progs ${s.progs}  shaders ${s.shaders}  tex ${this.textures.size}  skipped ${s.skipped}  deferred ${s.deferred}  held ${s.held}`; }
+  statLine() { const s = this.stats, fr = this.jsFrames || 0, js = fr ? (this.jsBusy / fr).toFixed(1) : '-', mp = fr ? Math.round(this.jsMsgs / fr) : '-'; this.jsBusy = this.jsFrames = this.jsMsgs = 0;
+    return `[b4 glcache ${this.gl.__glc ? 'on' : 'off'}] JS ${js} ms/frame  msgs/frame ${mp}  draws/frame ${s.frameDraws}  progs ${s.progs}  shaders ${s.shaders}  tex ${this.textures.size}  skipped ${s.skipped}  deferred ${s.deferred}  held ${s.held}`; }
 
   // ---- message pump ---------------------------------------------------------------------------------------------------------------------------
   feed(ab) {
-    const t0 = performance.now(); try { return this.feed0(ab); } finally { if (this.hud) this.hud.busy += performance.now() - t0; }
+    const t0 = performance.now(); let r; try { r = this.feed0(ab); return r; } finally { const d = performance.now() - t0; if (this.hud) this.hud.busy += d; this.jsBusy = (this.jsBusy || 0) + d; if (r) { this.jsFrames = (this.jsFrames || 0) + r.presents; this.jsMsgs = (this.jsMsgs || 0) + r.messages; } }
   }
   feed0(ab) {
     const dv = new DataView(ab); let off = 0, messages = 0, presents = 0;
@@ -156,9 +183,9 @@ class D3D9Renderer {
   handle(type, ab, dv, p, len) {
     const u = (i) => dv.getUint32(p + 4 * i, true), f = (i) => dv.getFloat32(p + 4 * i, true);
     switch (type) {
-      case G.TEX_CREATE: this.texCreate(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7)); break;
+      case G.TEX_CREATE: this.rtDirty = true; this.texCreate(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7)); break;
       case G.TEX_UPLOAD: this.texUpload(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), new Uint8Array(ab, p + 32, len - 32)); break;       // consumed synchronously by texSubImage: no copy
-      case G.SURF_CREATE: this.surfCreate(u(0), u(1), u(2), u(3), u(4), u(5)); break;
+      case G.SURF_CREATE: this.rtDirty = true; this.surfCreate(u(0), u(1), u(2), u(3), u(4), u(5)); break;
       case G.BUF_CREATE: this.bufCreate(u(0), u(1), u(2), u(3), u(4)); break;
       case G.BUF_UPLOAD: { const b = this.buffers.get(u(0)); if (b) { const gl = this.gl, tg = b.kind === 1 ? gl.ELEMENT_ARRAY_BUFFER : gl.ARRAY_BUFFER; gl.bindBuffer(tg, b.buf); gl.bufferSubData(tg, u(1), new Uint8Array(ab, p + 8, len - 8)); } break; }
       case G.SHADER: this.shaderCreate(ab, p, len, u); break;
@@ -175,8 +202,8 @@ class D3D9Renderer {
       case G.SET_PSC: { const n = u(1); this.psc.set(((p + 8) & 3) ? new Float32Array(ab.slice(p + 8, p + 8 + 16 * n)) : new Float32Array(ab, p + 8, 4 * n), u(0) * 4); this.pscDirty = true; break; }
       case G.SET_VIEWPORT: this.vp = { x: u(0), y: u(1), w: u(2), h: u(3), minz: f(4), maxz: f(5) }; break;
       case G.SET_SCISSOR: this.scissor = { l: u(0), t: u(1), r: u(2), b: u(3) }; break;
-      case G.SET_RT: this.rt[u(0)] = { kind: u(1), id: u(2), level: u(3), face: u(4) }; break;
-      case G.SET_DS: this.ds = { kind: u(0), id: u(1), level: u(2), face: u(3) }; break;
+      case G.SET_RT: this.rtDirty = true; this.rt[u(0)] = { kind: u(1), id: u(2), level: u(3), face: u(4) }; break;
+      case G.SET_DS: this.rtDirty = true; this.ds = { kind: u(0), id: u(1), level: u(2), face: u(3) }; break;
       case G.DRAW: this.draw(u(0), u(1), u(2), u(3), u(4), u(5), u(6)); break;
       case G.DRAW_UP: this.drawUP(u(0), u(1), u(2), u(3), u(4), u(5), u(6), new Uint8Array(ab, p + 28, len - 28)); break;
       case G.CLEAR: this.clear(u(0), u(1), f(2), u(3), u(4), new Int32Array(ab.slice(p + 20, p + 20 + 16 * u(4)))); break;
@@ -186,7 +213,7 @@ class D3D9Renderer {
       case 86: this.auditRun(u(0)); break;
       case G.PRESENT: this.present(); return true;
       case G.STRETCH: this.stretch(Array.from({ length: 19 }, (_, i) => u(i))); break;
-      case 95: this.destroyRes(u(0), u(1)); break;     // host freed the D3D object: release the GL texture / buffer (kind 0 texture, 1 vertex/index buffer)
+      case 95: this.rtDirty = true; this.destroyRes(u(0), u(1)); break;     // host freed the D3D object: release the GL texture / buffer (kind 0 texture, 1 vertex/index buffer)
       case 90: if (this.onAudio) this.onAudio(u(0), u(1), u(2), ab.slice(p + 12, p + len)); break;      // host-mixed PCM: rate, channels, frames, int16 data
       default: this.warn('type' + type, 'unknown message type ' + type);
     }
@@ -430,6 +457,12 @@ class D3D9Renderer {
     out.push(src.slice(i)); return out.join('');
   }
   getProgram() {
+    const vsId = this._vsEff ?? this.vs, pc = this._pc || (this._pc = new Map()); let m1 = pc.get(vsId), m2 = m1 && m1.get(this.ps); const hit = m2 && m2.get(this.vdecl | 0); if (hit) return hit;       // (vs, ps, vdecl) -> ready program: no per-draw key strings
+    const P = this.getProgramSlow(vsId);
+    if (P && P.ready) { if (!m1) pc.set(vsId, m1 = new Map()); if (!m2) m1.set(this.ps, m2 = new Map()); m2.set(this.vdecl | 0, P); }
+    return P;
+  }
+  getProgramSlow() {
     const vs = this.shaders.get(this._vsEff ?? this.vs), ps = this.shaders.get(this.ps); if (!vs || !ps) return null;      // _vsEff = -1: built-in POSITIONT vertex shader (Bink quads)
     const d = this.vdecl ? this.vdecls.get(this.vdecl) : null;
     return this.programFor(vs, ps, d ? this.colorKey(d, vs) : '', true);
@@ -484,6 +517,7 @@ class D3D9Renderer {
     const w = o.msW, h = o.msH; gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.COLOR_BUFFER_BIT, gl.NEAREST); this.stats.resolves = (this.stats.resolves || 0) + 1;
   }
   bindTargets() {
+    if (!this.rtDirty && this._bt) { const gl = this.gl, b = this._bt; gl.bindFramebuffer(gl.FRAMEBUFFER, b.fbo.fbo); gl.drawBuffers(b.fbo.bufs); if (b.ms) for (const o of b.fbo.owners) o.msDirty = true; return b.res; }       // render targets unchanged since the last draw
     const gl = this.gl, c0 = this.surfaceTarget(this.rt[0]); let ds = this.surfaceTarget(this.ds);
     // D3D9 allows a depth surface larger than the colour target; GL needs identical attachment sizes -> use a private depth renderbuffer of the colour size (cached per size/format)
     if (ds && c0 && (ds.w !== c0.w || ds.h !== c0.h)) {
@@ -511,14 +545,15 @@ class D3D9Renderer {
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.fbo); gl.drawBuffers(fbo.bufs);
     if (ms) for (const o of fbo.owners) o.msDirty = true;
-    return { w: c0 ? c0.w : 1, h: c0 ? c0.h : 1, sc: c0 ? c0.sc : 1 };
+    const res = { w: c0 ? c0.w : 1, h: c0 ? c0.h : 1, sc: c0 ? c0.sc : 1 }; this._bt = { fbo, ms, res }; this.rtDirty = false;
+    return res;
   }
 
   // ---- state application ----------------------------------------------------------------------------------------------------------------------------
-  cmp(f) { const gl = this.gl; return [gl.NEVER, gl.NEVER, gl.LESS, gl.EQUAL, gl.LEQUAL, gl.GREATER, gl.NOTEQUAL, gl.GEQUAL, gl.ALWAYS][f] || gl.ALWAYS; }
-  blendFactor(b) { const gl = this.gl; const c = this.rs[193]; return [gl.ZERO, gl.ZERO, gl.ONE, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.DST_ALPHA, gl.ONE_MINUS_DST_ALPHA, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA_SATURATE, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.CONSTANT_COLOR, gl.ONE_MINUS_CONSTANT_COLOR][b] ?? gl.ONE; }
-  blendOp(o) { const gl = this.gl; return [gl.FUNC_ADD, gl.FUNC_ADD, gl.FUNC_SUBTRACT, gl.FUNC_REVERSE_SUBTRACT, gl.MIN, gl.MAX][o] ?? gl.FUNC_ADD; }
-  stencilOp(o) { const gl = this.gl; return [gl.KEEP, gl.KEEP, gl.ZERO, gl.REPLACE, gl.INCR, gl.DECR, gl.INVERT, gl.INCR_WRAP, gl.DECR_WRAP][o] ?? gl.KEEP; }
+  cmp(f) { const gl = this.gl; return (this._cmpT || (this._cmpT = [gl.NEVER, gl.NEVER, gl.LESS, gl.EQUAL, gl.LEQUAL, gl.GREATER, gl.NOTEQUAL, gl.GEQUAL, gl.ALWAYS]))[f] || gl.ALWAYS; }
+  blendFactor(b) { const gl = this.gl; return (this._bfT || (this._bfT = [gl.ZERO, gl.ZERO, gl.ONE, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.DST_ALPHA, gl.ONE_MINUS_DST_ALPHA, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA_SATURATE, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.CONSTANT_COLOR, gl.ONE_MINUS_CONSTANT_COLOR]))[b] ?? gl.ONE; }
+  blendOp(o) { const gl = this.gl; return (this._boT || (this._boT = [gl.FUNC_ADD, gl.FUNC_ADD, gl.FUNC_SUBTRACT, gl.FUNC_REVERSE_SUBTRACT, gl.MIN, gl.MAX]))[o] ?? gl.FUNC_ADD; }
+  stencilOp(o) { const gl = this.gl; return (this._soT || (this._soT = [gl.KEEP, gl.KEEP, gl.ZERO, gl.REPLACE, gl.INCR, gl.DECR, gl.INVERT, gl.INCR_WRAP, gl.DECR_WRAP]))[o] ?? gl.KEEP; }
   applyState(rtw, rth, rtsc) {
     const gl = this.gl, r = this.rs, vp = this.vp;
     const sc = this.curSc = rtsc || 1; gl.viewport(this.scaled(vp.x, sc), this.scaled(vp.y, sc), this.scaled(vp.w, sc), this.scaled(vp.h, sc)); gl.depthRange(vp.minz, vp.maxz);
@@ -727,16 +762,30 @@ class D3D9Renderer {
   }
   // D3D9 gamma ramp (SetGammaRamp): applied in the present pass through a 256x1 RGBA8 LUT; identity ramps keep the plain blit
   readbackTexel(kind, id, level, face, dstId) {                  // GetRenderTargetData answer: texel (0,0) of the source as a D3D-order 32-bit value (R32F: raw float bits)
+    // Asynchronous: readPixels into a pixel-pack buffer + fence, answered a few frames later (pollReadbacks). The host never waits for the answer
+    // (it just stores the value into the destination surface), and a synchronous readPixels + checkFramebufferStatus stalled the whole GPU pipeline
+    // every frame (the game reads a 1x1 luminance target each frame): ~30% of the page's time in the race profile.
     const gl = this.gl, tg = this.surfaceTarget({ kind, id, level, face }); if (!tg || !this.sendInput) return;
-    let bits = 0, o = tg.owner; if (o && o.msDirty) this.resolveMS(o);
+    const o = tg.owner; if (o && o.msDirty) this.resolveMS(o);
     const fb = this.rbFbo || (this.rbFbo = gl.createFramebuffer()); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fb);
     if (tg.rb) gl.framebufferRenderbuffer(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, tg.rb); else gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tg.target, tg.tex, tg.level);
-    const t = tg.tex && this.textures.get(id), flt = t && t.info && t.info.float;
-    if (gl.checkFramebufferStatus(gl.READ_FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
-      if (flt) { const f = new Float32Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, f); const fmt = t.fmt; bits = fmt === 114 ? new Uint32Array(f.buffer)[0] : 0; if (fmt !== 114) { this.warn('rb' + fmt, 'GetRenderTargetData of float format ' + fmt + ' only supports R32F'); } }
-      else { const b = new Uint8Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b); bits = ((b[3] << 24) | (b[0] << 16) | (b[1] << 8) | b[2]) | 0; }
+    const t = tg.tex && this.textures.get(id), flt = !!(t && t.info && t.info.float);
+    if (flt && t.fmt !== 114) this.warn('rb' + t.fmt, 'GetRenderTargetData of float format ' + t.fmt + ' only supports R32F');
+    const pool = this.rbPool || (this.rbPool = []); let pbo = pool.pop();
+    if (!pbo) { pbo = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo); gl.bufferData(gl.PIXEL_PACK_BUFFER, 16, gl.STREAM_READ); } else gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+    if (flt) gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, 0); else gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    (this.rbPending || (this.rbPending = [])).push({ pbo, fence: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), flt, raw: flt && t.fmt === 114, dstId });
+  }
+  pollReadbacks() {
+    const q = this.rbPending; if (!q || !q.length) return; const gl = this.gl;
+    while (q.length) {
+      const r = q[0], st = gl.clientWaitSync(r.fence, 0, 0); if (st === gl.TIMEOUT_EXPIRED) break; q.shift(); gl.deleteSync(r.fence);
+      let bits = 0; gl.bindBuffer(gl.PIXEL_PACK_BUFFER, r.pbo);
+      if (st !== gl.WAIT_FAILED) { if (r.flt) { const f = new Float32Array(4); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, f); bits = r.raw ? new Uint32Array(f.buffer)[0] : 0; }
+        else { const b = new Uint8Array(4); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, b); bits = ((b[3] << 24) | (b[0] << 16) | (b[1] << 8) | b[2]) | 0; } }
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); this.rbPool.push(r.pbo); this.sendInput(10, r.dstId, 0, 0, bits | 0);
     }
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null); this.sendInput(10, dstId, 0, 0, bits | 0);
   }
   setGamma(r) {
     const gl = this.gl; let id = true; for (let i = 0; i < 768; i++) if (Math.abs(r[i] - (i & 255) * 257) > 128) { id = false; break; }
@@ -752,6 +801,7 @@ class D3D9Renderer {
   }
   present() { this.auditPresent = (this.auditPresent || 0) + 1;
     const gl = this.gl;
+    this.pollReadbacks();
     this.dn = 0;
     { const fd = this.stats.frameDraws; if (this.cap) { window.__cap = this.cap; this.cap = null; window.__capNext = false; console.log('renderer: capture done'); }
       else if (!window.__cap && (window.__capNext || (window.__capAuto && fd >= 300))) this.cap = []; this.capTexMap = null; } if (this.dbg && (this.dbgF = (this.dbgF || 0) + 1) % 600 === 0) { for (const id of (window.DBG_RT || [2795, 2798])) this.dbgReadRT(id); } this.stats.frameDraws = this.stats.draws - (this.lastDraws || 0); this.lastDraws = this.stats.draws;
