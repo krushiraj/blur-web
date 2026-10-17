@@ -18,7 +18,7 @@ typedef struct {
     uint8_t own;                                                  // o->data was allocated for this object (freed with it)
     uint8_t *shadow, *known; uint32_t sh_epoch, nup, nodiff, st_cnt, st_in, st_out, lock_flags; uint64_t up_bytes, up_saved;   // buffer upload dedupe: what the renderer holds (see send_buf)
 } Obj;
-#define MAXOBJ 262144          // object ids are never reused (the renderer keys resources by id); freed objects only give back their guest memory
+#define MAXOBJ 1048576         // object ids are never reused (the renderer keys resources by id); freed objects only give back their guest memory. 262144 ('d3d9 object table full') was reached in an hour-long session; only touched entries are resident (BSS)
 static Obj objs[MAXOBJ]; static int nobjs = 1;
 
 // device state
@@ -154,8 +154,9 @@ static struct { const char *name; uint64_t n; } ostat[32]; static int nostat;
 static void objstat(const char *iface) { static int on = -1; if (on < 0) on = getenv("BLUR_OBJSTAT") != NULL; if (!on) return; for (int i = 0; i < nostat; i++) if (!strcmp(ostat[i].name, iface)) { ostat[i].n++; return; } if (nostat < 32) { ostat[nostat].name = iface; ostat[nostat++].n = 1; } }
 static void objstat_report(void) { for (int i = 0; i < nostat; i++) fprintf(stderr, "[objstat] %-32s %llu created\n", ostat[i].name, (unsigned long long)ostat[i].n); }
 // ---- object creation ---------------------------------------------------------------------------------------------------------------
+static Ctx *d3d_ctx;
 static uint32_t make_obj(Ctx *c, const char *iface, const ComMethod *m, int n, Kind k, Obj **out) {
-    com_zero_hook = d3d_zero; objstat(iface);
+    d3d_ctx = c; com_zero_hook = d3d_zero; objstat(iface);
     uint32_t g = com_make(c, iface, m, n, 8); int i = nobjs++; if (i >= MAXOBJ) { fprintf(stderr, "d3d9 object table full\n"); exit(1); }
     memset(&objs[i], 0, sizeof objs[i]); objs[i].kind = k; objs[i].guest = g; wr32(c, g + 8, (uint32_t)i); if (out) *out = &objs[i]; return g;
 }
@@ -743,6 +744,55 @@ static void d3d_reap(Ctx *c) {
         wr32(c, g + 8, 0); d3d_free(c, g); memset(o, 0, sizeof *o); n_destroyed++;
     }
 }
+// A viewer attached (first load or a reload): it holds no resources. Re-emit the creation message of every live object (creation order = id order), then re-upload texture and
+// buffer contents from guest memory (render targets are redrawn every frame). State (render states, bindings) is re-sent lazily by sent_sync().
+void d3d9_replay_resources(void) {
+    Ctx *c = d3d_ctx; if (!c) return; uint64_t t0 = real_us(); int nt = 0, nb = 0, ns = 0;
+    for (int i = 1; i < nobjs; i++) { Obj *o = &objs[i]; uint32_t id = (uint32_t)i;
+        switch (o->kind) {
+        case K_TEXTURE: GFXW(G_TEX_CREATE, id, 0, o->w, o->h, 1, o->nlev, o->fmt, o->usage); nt++; break;
+        case K_VOLUME: GFXW(G_TEX_CREATE, id, 2, o->w, o->h, o->d, o->nlev, o->fmt, o->usage); nt++; break;
+        case K_CUBE: GFXW(G_TEX_CREATE, id, 1, o->w, o->h, 1, o->nlev, o->fmt, o->usage); nt++; break;
+        case K_VB: GFXW(G_BUF_CREATE, id, 0, o->len, 0, o->usage); nb++; break;
+        case K_IB: GFXW(G_BUF_CREATE, id, 1, o->len, o->fmt, o->usage); nb++; break;
+        case K_SURFACE: if (!o->parent) { if (o->guest == st.backbuf) GFXW(G_SURF_CREATE, id, o->w, o->h, o->fmt, 0, 0); else if (o->usage == 1 || o->usage == 2) GFXW(G_SURF_CREATE, id, o->w, o->h, o->fmt, o->usage, o->ms); } break;
+        case K_VDECL: send_vdecl(c, o); break;
+        case K_VSHADER: send_shader(c, o, 0); ns++; break;
+        case K_PSHADER: send_shader(c, o, 1); ns++; break;
+        default: break; } }
+    for (int i = 1; i < nobjs; i++) { Obj *o = &objs[i];
+        if ((o->kind == K_TEXTURE || o->kind == K_CUBE || o->kind == K_VOLUME) && !(o->usage & 3) && o->data && o->nlev) { uint32_t faces = o->kind == K_CUBE ? 6 : 1; for (uint32_t f = 0; f < faces; f++) for (uint32_t l = 0; l < o->nlev; l++) send_level(c, o, f, l); }
+        else if ((o->kind == K_VB || o->kind == K_IB) && o->data && o->len) send_buf_raw(o, 0, o->len); }
+    fprintf(stderr, "[net] viewer attached: replayed %d textures, %d buffers, %d shaders in %.0f ms\n", nt, nb, ns, (real_us() - t0) / 1e3);
+}
+// BLUR_HEAPSITES: why are texture objects still alive? histogram of live K_TEXTURE objects by COM refcount, whether currently bound, and zombie-queue membership
+void d3d9_leak_report(void) {
+    Ctx *c = d3d_ctx; if (!c) return; static uint8_t *inz; static size_t inz_cap;
+    if (inz_cap < (size_t)nobjs) { inz = realloc(inz, nobjs + 4096); inz_cap = nobjs + 4096; } memset(inz, 0, inz_cap);
+    for (size_t k = zq_head; k < zq_n; k++) { uint32_t i = rd32(c, zq[k].g + 8); if (i && i < (uint32_t)nobjs) inz[i] = 1; }
+    int rc_hist[6] = {0}, bound = 0, inzq = 0, tot = 0; uint64_t bytes_rc0 = 0, bytes_rc1 = 0, bytes_rcn = 0;
+    for (int i = 1; i < nobjs; i++) { Obj *o = &objs[i]; if (o->kind != K_TEXTURE || !o->guest) continue; uint32_t rc = rd32(c, o->guest + 4); tot++; rc_hist[rc > 4 ? 5 : rc]++; if (is_bound(o->guest)) bound++; if (inz[i]) inzq++;
+        if (rc == 0) bytes_rc0 += o->len; else if (rc == 1) bytes_rc1 += o->len; else bytes_rcn += o->len; }
+    { static struct { uint32_t pool, usage, fmt; int n; double mb; int rc1; } g[64]; int ng = 0;
+      for (int i = 1; i < nobjs; i++) { Obj *o = &objs[i]; if (o->kind != K_TEXTURE || !o->guest) continue; uint32_t rc = rd32(c, o->guest + 4); int k = 0; for (; k < ng; k++) if (g[k].pool == o->pool && g[k].usage == o->usage && g[k].fmt == o->fmt) break;
+        if (k == ng) { if (ng >= 64) continue; g[ng].pool = o->pool; g[ng].usage = o->usage; g[ng].fmt = o->fmt; g[ng].n = 0; g[ng].mb = 0; g[ng].rc1 = 0; ng++; } g[k].n++; g[k].mb += o->len / 1048576.0; if (rc == 1) g[k].rc1++; }
+      fprintf(stderr, "[leak] live textures by pool/usage/format (n, MB, rc==1):");
+      for (int r = 0; r < 8; r++) { int b = -1; double bm = 0; for (int k = 0; k < ng; k++) if (g[k].mb > bm) { bm = g[k].mb; b = k; } if (b < 0) break; fprintf(stderr, " | pool%u usage%x fmt%u: %d, %.0f MB, rc1 %d", g[b].pool, g[b].usage, g[b].fmt, g[b].n, g[b].mb, g[b].rc1); g[b].mb = 0; }
+      fprintf(stderr, "\n"); }
+    { int all = 0, withg = 0, ownd = 0, idbad = 0, noguest_data = 0; uint64_t dbytes = 0;
+      for (int i = 1; i < nobjs; i++) { Obj *o = &objs[i]; if (o->kind != K_TEXTURE) continue; all++; if (o->guest) { withg++; if (rd32(c, o->guest + 8) != (uint32_t)i) idbad++; } else if (o->data) noguest_data++; if (o->own && o->data) { ownd++; dbytes += o->len; } }
+      fprintf(stderr, "[leak] K_TEXTURE entries: %d total, %d with COM block, %d own data (%.0f MB), %d COM blocks whose id slot mismatches, %d without COM block but with data\n", all, withg, ownd, dbytes / 1048576.0, idbad, noguest_data); }
+    fprintf(stderr, "[leak] live textures %d: refcount 0:%d 1:%d 2:%d 3:%d 4:%d >4:%d | bound now %d, in zombie queue %d | guest bytes rc0 %.0f MB, rc1 %.0f MB, rc>1 %.0f MB | zombie queue pending %zu, destroyed so far %llu\n",
+            tot, rc_hist[0], rc_hist[1], rc_hist[2], rc_hist[3], rc_hist[4], rc_hist[5], bound, inzq, bytes_rc0 / 1048576.0, bytes_rc1 / 1048576.0, bytes_rcn / 1048576.0, zq_n - zq_head, (unsigned long long)n_destroyed);
+}
+// BLUR_HEAPSITES: is this live guest-heap block referenced by any D3D object the host still tracks (COM object, data, shader code, cached level surfaces)?
+static uint32_t *own_tab; static uint8_t *own_tag; static size_t own_n, own_cap;
+static void own_add(uint32_t p, uint8_t tag) { if (!p) return; size_t h = (p * 2654435761u) & (own_cap - 1); while (own_tab[h]) { if (own_tab[h] == p) return; h = (h + 1) & (own_cap - 1); } own_tab[h] = p; own_tag[h] = tag; own_n++; }
+void d3d9_owner_snapshot(void) {
+    size_t need = 16; while (need < (size_t)nobjs * 8) need <<= 1; if (need != own_cap) { free(own_tab); free(own_tag); own_cap = need; own_tab = calloc(own_cap, 4); own_tag = calloc(own_cap, 1); } else memset(own_tab, 0, own_cap * 4); own_n = 0;
+    for (int i = 1; i < nobjs; i++) { Obj *o = &objs[i]; if (!o->kind) continue; own_add(o->guest, (uint8_t)(o->kind << 2 | 0)); if (o->own) own_add(o->data, (uint8_t)(o->kind << 2 | 1)); own_add(o->code, (uint8_t)(o->kind << 2 | 2)); if (o->sc) for (int k = 0; k < 96; k++) own_add(o->sc[k], (uint8_t)(o->kind << 2 | 3)); }
+}
+int d3d9_owns_block(uint32_t p) { if (!own_tab) return 1; size_t h = (p * 2654435761u) & (own_cap - 1); while (own_tab[h]) { if (own_tab[h] == p) return 1 + own_tag[h]; h = (h + 1) & (own_cap - 1); } return 0; }
 void d3d9_report(Ctx *c) {
     objstat_report(); fprintf(stderr, "[d3d9] %llu objects destroyed (%llu KB of data freed), %zu zombies pending\n", (unsigned long long)n_destroyed, (unsigned long long)(bytes_freed >> 10), zq_n - zq_head); (void)c; fprintf(stderr, "[d3d9] frames=%llu draws=%llu clears=%llu scenes=%llu objects=%d\n", (unsigned long long)st.frames, (unsigned long long)st.draws, (unsigned long long)st.clears, (unsigned long long)st.scenes, nobjs - 1); }
 
@@ -765,7 +815,7 @@ int d3d9_snap_busy(void) { return nobjs - 1 + (int)st.frames + (int)st.draws; }
 
 // post-mortem helper (rt.c rt_missing): describe the d3d9 object behind a guest COM pointer
 void d3d9_dbg_obj(Ctx *c, uint32_t p, const char *tag) {
-    if (p < 0x20000000u || p >= 0x58000000u) return;
+    if (p < 0x20000000u || p >= VIRT_BASE) return;
     uint32_t i = rd32(c, p + 8); if (!i || i >= (uint32_t)nobjs) { fprintf(stderr, "[obj %s %08x] no object (idx=%u)\n", tag, p, i); return; }
     Obj *o = &objs[i];
     fprintf(stderr, "[obj %s %08x] #%u kind=%d %ux%u lv=%u nlev=%u fmt=%08x usage=%x pool=%u len=%u data=%08x parent=%u level=%u lev_off=", tag, p, i, o->kind, o->w, o->h, o->levels, o->nlev, o->fmt, o->usage, o->pool, o->len, o->data, o->parent, o->level);

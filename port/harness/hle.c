@@ -14,6 +14,8 @@ static uint32_t cached_str(Ctx *c, uint32_t *slot, const void *data, int n) {
     return *slot;
 }
 static int vlog(Ctx *c) { return c->verbose; }
+extern uint32_t g_api_ret;
+static void set_err(Ctx *c, uint32_t v);
 
 // ---- module handles ---------------------------------------------------------------------
 static struct { char name[64]; uint32_t base; } fake_mods[32]; static int nfake;
@@ -84,8 +86,8 @@ H(GetSystemInfo) {
 H(GetProcessHeap) { UNUSED; return 0x1111; }
 H(HeapCreate) { UNUSED; return 0x1111; }
 H(HeapDestroy) { UNUSED; return 1; }
-H(HeapAlloc) { return guest_alloc(c, a[2]); }
-H(HeapFree) { guest_free(c, a[2]); return 1; }
+H(HeapAlloc) { if (a[2] >= 0x7f000000u) { strict_log("HeapAlloc", "huge size (real: NULL / STATUS_NO_MEMORY)", a[2], 0); return 0; } return guest_alloc(c, a[2]); }
+H(HeapFree) { if (a[2] && (a[2] < 0x20000010u || a[2] >= VIRT_BASE || !guest_blockcap(c, a[2]))) strict_log("HeapFree", "pointer is not a live heap block (double free / foreign pointer; real heap would fault)", a[2], 0); guest_free(c, a[2]); return 1; }
 H(HeapSize) { return guest_blocksize(c, a[2]); }
 H(HeapValidate) { UNUSED; return 1; }
 H(HeapSetInformation) { UNUSED; return 1; }
@@ -105,23 +107,38 @@ H(GlobalAlloc) { return guest_alloc(c, a[1]); }
 H(GlobalFree) { guest_free(c, a[0]); return 0; }
 
 // ---- virtual memory -----------------------------------------------------------------------------
-static uint32_t virt_next = 0x58000000u;
+static uint32_t virt_next = VIRT_BASE;
+uint32_t hle_virt_used(void) { return virt_next - VIRT_BASE; }
 static struct { uint32_t base, size; } vallocs[4096]; static int nvallocs;
+static struct { uint32_t base, size; } vfree[512]; static int nvfree;     // released VirtualAlloc spans, reused by the next allocation of the same size
 static void zero_range(Ctx *c, uint32_t addr, uint32_t size) {            // Windows returns zero pages after decommit/release
-    static uint8_t z[1 << 16]; for (uint32_t o = 0; o < size; o += sizeof z) { uint32_t n = size - o < sizeof z ? size - o : (uint32_t)sizeof z; uc_mem_write(c->uc, addr + o, z, n); }
+    memset(G + addr, 0, size);
 }
 H(VirtualAlloc) {                                                          // lpAddress, size, type, protect
     uint32_t addr = a[0], size = (a[1] + 0xfff) & ~0xfffu, type = a[2];
-    if (!addr) { addr = virt_next; uint32_t span = (size + 0xffff) & ~0xffffu; virt_next += span; if (nvallocs < 4096) { vallocs[nvallocs].base = addr; vallocs[nvallocs++].size = span; } }
+    if (!size || !(type & 0x83000)) { strict_log("VirtualAlloc", "size 0 or neither MEM_COMMIT nor MEM_RESERVE (real: NULL, ERROR_INVALID_PARAMETER)", a[1], type); set_err(c, 87); return 0; }
+    if (!addr) {
+        uint32_t span = (size + 0xffff) & ~0xffffu; int reused = 0;
+        for (int i = 0; i < nvfree; i++) if (vfree[i].size == span) { addr = vfree[i].base; vfree[i] = vfree[--nvfree]; reused = 1; break; }   // reuse released spans of the same size
+        if (!reused) {
+            if (size > 0x20000000u || virt_next + span > 0x7a000000u) { strict_log("VirtualAlloc", "address space window 0x58000000..0x7a000000 exhausted / huge request", a[1], virt_next); set_err(c, 8); return 0; }
+            addr = virt_next; virt_next += span;
+        }
+        if (nvallocs < 4096) { int k; for (k = 0; k < nvallocs; k++) if (vallocs[k].base == addr) break; if (k == nvallocs) vallocs[nvallocs++].base = addr; vallocs[k].size = span; }
+        else strict_log("VirtualAlloc", "allocation table full (4096): MEM_RELEASE of later blocks will not zero/reuse", 0, 0);
+    }
     uint32_t pg = addr & ~0xfffu, end = (addr + size + 0xfff) & ~0xfffu;
+    if (!(g_recomp && c->oep_hit))                                         // after the boot phase Unicorn is gone: the flat mapping already covers every page
     for (uint32_t p = pg; p < end; p += 0x1000) uc_mem_map(c->uc, p, 0x1000, UC_PROT_ALL);   // already-mapped pages keep their contents
     if (vlog(c)) fprintf(stderr, "[VirtualAlloc] %08x size=%x type=%x -> %08x\n", a[0], a[1], type, addr);
+    if (getenv("BLUR_VMLOG")) fprintf(stderr, "[vm] VirtualAlloc(%08x, %x, %x, prot %x) -> %08x thread %d ret=%08x\n", a[0], a[1], type, a[3], addr, c->cur, g_api_ret);
     return addr;
 }
 H(VirtualFree) {                                                           // lpAddress, size, freeType
     uint32_t addr = a[0], size = a[1], type = a[2];
+    if (getenv("BLUR_VMLOG")) fprintf(stderr, "[vm] VirtualFree(%08x, %x, %x) thread %d ret=%08x\n", addr, size, type, c->cur, g_api_ret);
     if (type & 0x8000) {                                                   // MEM_RELEASE: whole allocation
-        for (int i = 0; i < nvallocs; i++) if (vallocs[i].base == addr) { zero_range(c, addr, vallocs[i].size); return 1; }
+        for (int i = 0; i < nvallocs; i++) if (vallocs[i].base == addr) { zero_range(c, addr, vallocs[i].size); if (!getenv("BLUR_NOVREUSE") && nvfree < 512) { vfree[nvfree].base = addr; vfree[nvfree++].size = vallocs[i].size; } else strict_log("VirtualFree", "reuse list full", 0, 0); return 1; }
         if (size) zero_range(c, addr, (size + 0xfff) & ~0xfffu);
     } else if (type & 0x4000) zero_range(c, addr & ~0xfffu, (size + 0xfff + (addr & 0xfff)) & ~0xfffu);   // MEM_DECOMMIT
     return 1;
@@ -168,7 +185,11 @@ H(DecodePointer) { UNUSED; return a[0]; }
 H(GetTickCount) { UNUSED; return (uint32_t)(now_us() / 1000); }
 H(QueryPerformanceCounter) { uint64_t t = now_us() * 10; wr32(c, a[0], (uint32_t)t); wr32(c, a[0] + 4, (uint32_t)(t >> 32)); return 1; }   // 10 MHz, on the guest clock
 H(QueryPerformanceFrequency) { wr32(c, a[0], 10000000); wr32(c, a[0] + 4, 0); return 1; }
-H(GetSystemTimeAsFileTime) { uint64_t t = (11644473600ull * 1000000ull + now_us()) * 10; wr32(c, a[0], (uint32_t)t); wr32(c, a[0] + 4, (uint32_t)(t >> 32)); return 0; }
+static uint64_t wall_us(void) {       // real wall-clock (microseconds since 1970) at first use + guest elapsed time, so dates look right and stay consistent with QPC/GetTickCount
+    static uint64_t base_wall, base_guest; if (!base_wall) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); base_wall = (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000; { extern int g_det_on; if (g_det_on) base_wall = 1760000000ull * 1000000ull; } base_guest = now_us(); }   // BLUR_DET: fixed date so native and wasm runs match
+    return base_wall + (now_us() - base_guest);
+}
+H(GetSystemTimeAsFileTime) { uint64_t t = (11644473600ull * 1000000ull + wall_us()) * 10; wr32(c, a[0], (uint32_t)t); wr32(c, a[0] + 4, (uint32_t)(t >> 32)); return 0; }
 
 // ---- startup info / environment / code pages -------------------------------------------------------------
 static uint32_t s_cmdA, s_cmdW, s_envW, s_envA;
@@ -184,7 +205,8 @@ H(GetEnvironmentVariableA) { UNUSED; return 0; }
 H(GetEnvironmentVariableW) { UNUSED; return 0; }
 H(GetStdHandle) { UNUSED; return 0x10 + a[0]; }
 H(SetHandleCount) { UNUSED; return a[0]; }
-H(GetFileType) { UNUSED; return 2; }
+static Handle *hp(Ctx *c, uint32_t h);
+H(GetFileType) { Handle *o = hp(c, a[0]); return o && o->type == H_FILE ? 1u : 2u; }       // FILE_TYPE_DISK for files, CHAR for console/std handles
 H(GetACP) { UNUSED; return 1252; }
 H(GetOEMCP) { UNUSED; return 437; }
 H(IsValidCodePage) { UNUSED; return 1; }
@@ -273,15 +295,31 @@ H(CreateSemaphoreA) { uint32_t h = named_lookup(c, H_SEMAPHORE, a[3], 0); if (h)
     set_err(c, 0); h = new_handle(c, H_SEMAPHORE); hp(c, h)->count = (int)a[1]; hp(c, h)->max = (int)a[2]; named_register(c, H_SEMAPHORE, a[3], 0, h); return h; }
 H(CreateSemaphoreW) { uint32_t h = named_lookup(c, H_SEMAPHORE, a[3], 1); if (h) { set_err(c, 183); return h; }
     set_err(c, 0); h = new_handle(c, H_SEMAPHORE); hp(c, h)->count = (int)a[1]; hp(c, h)->max = (int)a[2]; named_register(c, H_SEMAPHORE, a[3], 1, h); return h; }
-H(ReleaseSemaphore) { Handle *o = hp(c, a[0]); if (!o) return 0; if (a[2]) wr32(c, a[2], (uint32_t)o->count); o->count += (int)a[1]; c->yield_req = 1; return 1; }
+H(ReleaseSemaphore) {        // (h, releaseCount, *previousCount): fails with ERROR_TOO_MANY_POSTS (298) if count + n would exceed the maximum; previous count is written only on success
+    Handle *o = hp(c, a[0]); if (!o || o->type != H_SEMAPHORE) { set_err(c, 6); return 0; }
+    if ((int)a[1] <= 0 || (o->max > 0 && (int64_t)o->count + (int)a[1] > o->max)) { set_err(c, (int)a[1] <= 0 ? 87 : 298); return 0; }
+    if (a[2]) wr32(c, a[2], (uint32_t)o->count); o->count += (int)a[1]; o->nset++; c->yield_req = 1; return 1; }
 H(OpenEventA) { uint32_t h = named_lookup(c, H_EVENT, a[2], 0); if (!h) set_err(c, 2); return h; }
 H(OpenMutexA) { uint32_t h = named_lookup(c, H_MUTEX, a[2], 0); if (!h) set_err(c, 2); return h; }
 H(CloseHandle) { Handle *o = hp(c, a[0]); if (o && o->type == H_FILE && o->fp) { fclose(o->fp); o->fp = NULL; } return 1; }
-H(SetEvent) { Handle *o = hp(c, a[0]); if (!o) return 0; o->signaled = 1; c->yield_req = 1; return 1; }
+extern uint32_t g_api_ret, g_api_esp;
+static void settrace(Ctx *c, uint32_t h) {          // BLUR_SETTRACE=<hex handle>[,..]: print the call chain (code addresses found on the guest stack) of distinct SetEvent sites
+    static const char *e = (const char *)1; static uint32_t hs[8]; static int nh; if (e == (const char *)1) { e = getenv("BLUR_SETTRACE"); const char *p = e; while (p && *p && nh < 8) { hs[nh++] = (uint32_t)strtoul(p, (char **)&p, 16); if (*p == ',') p++; } }
+    int m = 0; for (int i = 0; i < nh; i++) if (hs[i] == h) m = 1; if (!m) return;
+    static uint32_t seen[64]; static int ns; uint32_t chain[10]; int n = 0, hsh = 0; for (int k = 0; k < 120 && n < 10; k++) { uint32_t w = rd32(c, g_api_esp + 4 * k); if (w >= 0x401000 && w < 0xe40000) { chain[n++] = w; hsh = hsh * 31 + (int)w; } }
+    for (int i = 0; i < ns; i++) if (seen[i] == (uint32_t)hsh) return; if (ns < 64) seen[ns++] = (uint32_t)hsh;
+    fprintf(stderr, "[settrace] t%d SetEvent(%x) chain:", c->cur, h); for (int i = 0; i < n; i++) fprintf(stderr, " %08x", chain[i]); fprintf(stderr, "\n");
+}
+H(SetEvent) { settrace(c, a[0]); Handle *o = hp(c, a[0]); if (!o || o->type != H_EVENT) { set_err(c, 6); return 0; } o->signaled = 1; o->nset++; c->yield_req = 1;
+    { int k; for (k = 0; k < 4; k++) if (o->setter[k] == g_api_ret || !o->setter[k]) break; if (k < 4) { o->setter[k] = g_api_ret; o->setter_n[k]++; } }   // distinct SetEvent call sites (BLUR_SYNCSTAT)
+    return 1; }
 void hle_signal_event(Ctx *c, uint32_t h) { Handle *o = hp(c, h); if (o && o->type == H_EVENT) o->signaled = 1; }
-H(ResetEvent) { Handle *o = hp(c, a[0]); if (!o) return 0; o->signaled = 0; return 1; }
+H(ResetEvent) { Handle *o = hp(c, a[0]); if (!o || o->type != H_EVENT) { set_err(c, 6); return 0; } o->signaled = 0; return 1; }
 H(PulseEvent) { UNUSED; return 1; }
-H(ReleaseMutex) { Handle *o = hp(c, a[0]); if (!o) return 0; if (o->count > 0 && --o->count == 0) { o->owner = 0; c->yield_req = 1; } return 1; }     // hand off to a waiting thread
+H(ReleaseMutex) {            // only the owner may release (ERROR_NOT_OWNER = 288); recursive acquisitions need one release each
+    Handle *o = hp(c, a[0]); if (!o || o->type != H_MUTEX) { set_err(c, 6); return 0; }
+    if (o->count <= 0 || o->owner != cur_thread(c)->tid) { set_err(c, 288); return 0; }
+    if (--o->count == 0) { o->owner = 0; c->yield_req = 1; } return 1; }
 H(CreateFileMappingA) { log_name(c, "CreateFileMapping", a[5], 0); set_err(c, 0); return new_handle(c, H_EVENT); }
 H(MapViewOfFile) { UNUSED; uint32_t sz = a[4] ? a[4] : 0x10000; uint32_t args[4] = {0, sz, 0x3000, 4}; return h_VirtualAlloc(c, args); }
 H(UnmapViewOfFile) { UNUSED; return 1; }
@@ -290,9 +328,9 @@ H(UnmapViewOfFile) { UNUSED; return 1; }
 static int try_acquire(Ctx *c, Handle *o) {
     uint32_t me = cur_thread(c)->tid;
     switch (o->type) {
-    case H_EVENT: if (!o->signaled) return 0; if (!o->manual) o->signaled = 0; return 1;
-    case H_MUTEX: if (o->count == 0 || o->owner == me) { o->owner = me; o->count++; return 1; } return 0;
-    case H_SEMAPHORE: if (o->count > 0) { o->count--; return 1; } return 0;
+    case H_EVENT: if (!o->signaled) return 0; if (!o->manual) o->signaled = 0; o->nacq++; return 1;
+    case H_MUTEX: if (o->count == 0 || o->owner == me) { o->owner = me; o->count++; o->nacq++; return 1; } return 0;
+    case H_SEMAPHORE: if (o->count > 0) { o->count--; o->nacq++; return 1; } return 0;
     case H_THREAD: return o->signaled;
     }
     return 1;
@@ -307,8 +345,9 @@ static int timed_out(Ctx *c, uint32_t ms) {
 }
 H(WaitForSingleObject) {
     Handle *o = hp(c, a[0]); if (!o) { if (vlog(c)) fprintf(stderr, "[wait] WaitForSingleObject on invalid handle %08x (t%d)\n", a[0], c->cur); set_err(c, 6); return WAIT_FAILED_; }
-    if (try_acquire(c, o)) { cur_thread(c)->wake_at = 0; return 0; }
+    if (try_acquire(c, o)) { cur_thread(c)->wake_at = 0; if (o->type == H_MUTEX && o->abandoned) { o->abandoned = 0; return 0x80; } return 0; }       // WAIT_ABANDONED_0 once
     if (timed_out(c, a[1])) return WAIT_TIMEOUT_;
+    { Thread *t = cur_thread(c); t->wk = 1; t->nwh = 1; t->wall = 0; t->wh[0] = a[0]; }
     c->block = 1; return 0;
 }
 H(SignalObjectAndWait) {        // (hSignal, hWait, ms, alertable): signal once, then wait like WaitForSingleObject (the call is re-run until it completes)
@@ -320,16 +359,19 @@ H(SignalObjectAndWait) {        // (hSignal, hWait, ms, alertable): signal once,
     }
     if (try_acquire(c, w)) { t->sig_done = 0; t->wake_at = 0; return 0; }
     if (timed_out(c, a[2])) { t->sig_done = 0; return WAIT_TIMEOUT_; }
+    t->wk = 1; t->nwh = 1; t->wall = 0; t->wh[0] = a[1];
     c->block = 1; return 0;
 }
 H(WaitForMultipleObjects) {
     uint32_t n = a[0], all = a[2], hs[64]; if (n > 64) return WAIT_FAILED_;
-    for (uint32_t i = 0; i < n; i++) { hs[i] = rd32(c, a[1] + 4 * i); if (!hp(c, hs[i])) return WAIT_FAILED_; }
+    if (n == 0) { set_err(c, 87); return WAIT_FAILED_; }
+    for (uint32_t i = 0; i < n; i++) { hs[i] = rd32(c, a[1] + 4 * i); if (!hp(c, hs[i])) { set_err(c, 6); return WAIT_FAILED_; } }
     if (all) {
         int ready = 1; for (uint32_t i = 0; i < n; i++) { Handle *o = hp(c, hs[i]); if (!(o->type == H_MUTEX ? (o->count == 0 || o->owner == cur_thread(c)->tid) : o->type == H_SEMAPHORE ? o->count > 0 : o->signaled)) ready = 0; }
         if (ready) { for (uint32_t i = 0; i < n; i++) try_acquire(c, hp(c, hs[i])); cur_thread(c)->wake_at = 0; return 0; }
-    } else for (uint32_t i = 0; i < n; i++) if (try_acquire(c, hp(c, hs[i]))) { cur_thread(c)->wake_at = 0; return i; }
+    } else for (uint32_t i = 0; i < n; i++) if (try_acquire(c, hp(c, hs[i]))) { Handle *ho = hp(c, hs[i]); cur_thread(c)->wake_at = 0; if (ho->type == H_MUTEX && ho->abandoned) { ho->abandoned = 0; return 0x80 + i; } return i; }
     if (timed_out(c, a[3])) return WAIT_TIMEOUT_;
+    if (n <= 8) { Thread *t = cur_thread(c); t->wk = 1; t->nwh = (uint8_t)n; t->wall = (uint8_t)(all != 0); for (uint32_t i = 0; i < n; i++) t->wh[i] = hs[i]; }
     c->block = 1; return 0;
 }
 extern uint32_t g_api_ret;
@@ -341,27 +383,44 @@ static void sleep_hist(Ctx *c, uint32_t ms, uint32_t a1) {
     uint64_t n = real_us(); if (n - last > 5000000) { last = n; for (int k = 0; k < nh; k++) fprintf(stderr, "[sleep] thread %d Sleep(%u) ret=%08x x%llu\n", h[k].tid, h[k].ms, h[k].ret, (unsigned long long)h[k].n); fprintf(stderr, "[sleep] ----\n"); }
 }
 H(Sleep) { static int nolimit = -1; if (nolimit < 0) nolimit = getenv("BLUR_NOLIMIT") != NULL; if (nolimit && a[1] == 0x6cb983) return 0;   // experiment: drop the game's frame-limiter sleep
-    if (!cur_thread(c)->wake_at) sleep_hist(c, a[0], a[1]); if (timed_out(c, a[0])) return 0; c->block = 1; return 0; }
+    if (a[0] == 0 && !cur_thread(c)->wake_at) { cur_thread(c)->wake_at = 1; c->block = 1; return 0; }          // Sleep(0): give up the rest of the slice to another ready thread once
+    if (!cur_thread(c)->wake_at) sleep_hist(c, a[0], a[1]); if (timed_out(c, a[0])) return 0; cur_thread(c)->wk = 2; c->block = 1; return 0; }
 H(SleepEx) { return h_Sleep(c, a); }
 H(SwitchToThread) { Thread *t = cur_thread(c); if (t->wake_at) { t->wake_at = 0; return 1; } t->wake_at = 1; c->block = 1; return 0; }
+static Thread *thr_of(Ctx *c, uint32_t h) {        // thread handle -> Thread; the pseudo handle (HANDLE)-2 is the calling thread
+    if (h == 0xfffffffeu) return cur_thread(c); Handle *o = hp(c, h); return o && o->type == H_THREAD ? &c->threads[o->thread] : NULL; }
 H(CreateThread) {
     uint32_t h = spawn_thread(c, a[2], a[3], (a[4] & 4) != 0, a[1]);
     if (h && a[5]) wr32(c, a[5], c->threads[hp(c, h)->thread].tid);
     return h;
 }
-H(ResumeThread) { Handle *o = hp(c, a[0]); if (!o) return WAIT_FAILED_; Thread *t = &c->threads[o->thread]; uint32_t was = t->suspended; t->suspended = 0; return was; }
-H(SuspendThread) { Handle *o = hp(c, a[0]); if (!o) return WAIT_FAILED_; Thread *t = &c->threads[o->thread]; uint32_t was = t->suspended; t->suspended = 1; return was; }
+H(ResumeThread) { Thread *t = thr_of(c, a[0]); if (!t) return WAIT_FAILED_; uint32_t was = (uint32_t)t->suspended; if (t->suspended > 0) t->suspended--; if (was > 1 || !t->suspended) c->yield_req = was == 1; return was; }   // suspend COUNT
+H(SuspendThread) { Thread *t = thr_of(c, a[0]); if (!t) return WAIT_FAILED_; uint32_t was = (uint32_t)t->suspended; t->suspended++; return was; }
 H(ExitThread) {
-    Thread *t = cur_thread(c); t->done = 1; t->exit_code = a[0]; if (t->handle) hp(c, t->handle)->signaled = 1;
+    Thread *t = cur_thread(c); t->done = 1; t->exit_code = a[0]; hle_thread_exit(c, t); if (t->handle) hp(c, t->handle)->signaled = 1;
     if (c->cur == 0) { c->exited = 1; c->exit_code = a[0]; } else c->block = 1;
     return 0;
 }
-H(GetExitCodeThread) { Handle *o = hp(c, a[0]); if (!o) return 0; Thread *t = &c->threads[o->thread]; wr32(c, a[1], t->done ? t->exit_code : 259); return 1; }
-H(TerminateThread) { Handle *o = hp(c, a[0]); if (!o) return 0; Thread *t = &c->threads[o->thread]; t->done = 1; t->exit_code = a[1]; o->signaled = 1; return 1; }
+H(GetExitCodeThread) { Thread *t = thr_of(c, a[0]); if (!t) return 0; wr32(c, a[1], t->done ? t->exit_code : 259); return 1; }
+H(TerminateThread) { Handle *o = hp(c, a[0]); if (!o || o->type != H_THREAD) return 0; Thread *t = &c->threads[o->thread]; t->done = 1; t->exit_code = a[1]; hle_thread_exit(c, t); o->signaled = 1; return 1; }
 H(SetThreadPriority) { UNUSED; return 1; }
 H(GetThreadPriority) { UNUSED; return 0; }
 H(SetThreadAffinityMask) { UNUSED; return 0xff; }
 H(SetThreadIdealProcessor) { UNUSED; return 0; }
+H(GetUserDefaultLCID) { UNUSED; return 0x409; }                                                             // en-US
+H(GetUserDefaultLangID) { UNUSED; return 0x409; }
+H(RaiseException) { static int n; if (n++ < 8 && vlog(c)) fprintf(stderr, "[RaiseException] code=%08x flags=%x nargs=%u caller=%08x\n", a[0], a[1], a[2], g_api_ret); return 0; }     // 0x406D1388 = SetThreadName; anything else would unwind on Windows
+H(FlushFileBuffers) { Handle *o = hp(c, a[0]); if (!o || o->type != H_FILE) { set_err(c, 6); return 0; } if (o->fp) fflush(o->fp); return 1; }
+H(GetDriveTypeA) { UNUSED; return 3; }      // DRIVE_FIXED
+H(GetProcessAffinityMask) { if (a[1]) wr32(c, a[1], 0xff); if (a[2]) wr32(c, a[2], 0xff); return 1; }       // 8 logical processors, all usable (matches GetSystemInfo)
+H(GetExitCodeProcess) { if (a[1]) wr32(c, a[1], 259); return 1; }                                          // STILL_ACTIVE
+H(DuplicateHandle) {            // (srcProc, srcHandle, dstProc, *dstHandle, access, inherit, options): handles are never freed, so the duplicate is the same value
+    uint32_t src = a[1];
+    if (src == 0xfffffffeu) {   // pseudo handle of the calling thread -> a real handle that stays bound to THIS thread (the usual "register my thread" idiom)
+        uint32_t nh = new_handle(c, H_THREAD); c->handles[(nh - 0x100) / 4].thread = c->cur; if (cur_thread(c)->done) c->handles[(nh - 0x100) / 4].signaled = 1;
+        c->handles[(nh - 0x100) / 4].nm[0] = 'D'; if (a[3]) wr32(c, a[3], nh); return 1; }
+    if (src == 0xffffffffu) { if (a[3]) wr32(c, a[3], src); return 1; }
+    if (!hp(c, src)) { set_err(c, 6); return 0; } if (a[3]) wr32(c, a[3], src); return 1; }
 H(GetCurrentThreadId2) { return cur_thread(c)->tid; }
 
 // critical sections: owner/recursion tracked in the guest struct (+8 recursion, +12 owner)
@@ -371,11 +430,30 @@ H(InitializeCriticalSectionEx) { h_InitializeCriticalSection(c, a); return 1; }
 static int cs_take(Ctx *c, uint32_t cs) {
     uint32_t me = cur_thread(c)->tid, owner = rd32(c, cs + 12);
     if (owner && owner != me) return 0;
-    wr32(c, cs + 12, me); wr32(c, cs + 8, rd32(c, cs + 8) + 1); return 1;
+    wr32(c, cs + 12, me); wr32(c, cs + 8, rd32(c, cs + 8) + 1); wr32(c, cs + 4, rd32(c, cs + 8) - 1); return 1;
 }
-H(EnterCriticalSection) { if (cs_take(c, a[0])) return 0; c->block = 1; return 0; }
+H(EnterCriticalSection) { if (cs_take(c, a[0])) return 0; { Thread *t = cur_thread(c); t->wk = 3; t->wcs = a[0]; } c->block = 1; return 0; }
+// scheduler query: could this (blocked) thread make progress now?  Conservative: unknown waits count as runnable.
+uint64_t g_sched_now;      // one clock read per scheduling pass (set by pick_next), instead of one per sleeping thread
+int thread_can_run(Ctx *c, Thread *t) {
+    if (!t->blocked || !t->wk) return 1;
+    uint64_t nw = g_sched_now ? g_sched_now : (t->wake_at ? now_us() : 0);
+    switch (t->wk) {
+    case 2: return !t->wake_at || nw >= t->wake_at;
+    case 3: { uint32_t o = rd32(c, t->wcs + 12); return !o || o == t->tid; }
+    case 1: {
+        if (t->wake_at && nw >= t->wake_at) return 1;
+        int any = 0, all = 1;
+        for (int i = 0; i < t->nwh; i++) { Handle *o = hp(c, t->wh[i]); int r;
+            if (!o) return 1;
+            switch (o->type) { case H_EVENT: case H_THREAD: r = o->signaled; break; case H_MUTEX: r = o->count == 0 || o->owner == t->tid; break; case H_SEMAPHORE: r = o->count > 0; break; default: return 1; }
+            any |= r; all &= r; }
+        return t->wall ? all : any; }
+    }
+    return 1;
+}
 H(TryEnterCriticalSection) { return cs_take(c, a[0]); }
-H(LeaveCriticalSection) { uint32_t r = rd32(c, a[0] + 8); if (r) { r--; wr32(c, a[0] + 8, r); if (!r) wr32(c, a[0] + 12, 0); } return 0; }
+H(LeaveCriticalSection) { uint32_t r = rd32(c, a[0] + 8); if (r && rd32(c, a[0] + 12) == cur_thread(c)->tid) { r--; wr32(c, a[0] + 8, r); wr32(c, a[0] + 4, r - 1); if (!r) wr32(c, a[0] + 12, 0); } return 0; }
 H(DeleteCriticalSection) { UNUSED; return 0; }
 
 // ---- table ---------------------------------------------------------------------------------------------------
@@ -386,7 +464,7 @@ static const HleDef table[] = {
     E(GetCurrentProcess,0), E(GetCurrentThread,0), E(GetCurrentProcessId,0), E(GetCurrentThreadId,0),
     E(GetVersion,0), E(GetVersionExA,1), E(GetVersionExW,1), E(IsDebuggerPresent,0), E(ExitProcess,1), 
     E(GetLastError,0), E(SetLastError,1), E(SetUnhandledExceptionFilter,1), E(UnhandledExceptionFilter,1),
-    E(IsProcessorFeaturePresent,1), E(OutputDebugStringA,1), E(GetSystemInfo,1),
+    E(IsProcessorFeaturePresent,1), E(OutputDebugStringA,1), E(GetSystemInfo,1), E(FlushFileBuffers,1), E(GetDriveTypeA,1), E(GetUserDefaultLCID,0), E(GetUserDefaultLangID,0), E(RaiseException,4), E(GetProcessAffinityMask,3), E(GetExitCodeProcess,2), E(DuplicateHandle,7),
     E(GetProcessHeap,0), E(HeapCreate,3), E(HeapDestroy,1), E(HeapAlloc,3), E(HeapFree,3), E(HeapSize,3), E(HeapValidate,3),
     E(HeapSetInformation,4), E(HeapReAlloc,4), E(HeapLock,1), E(HeapUnlock,1), E(HeapCompact,2),
     E(LocalAlloc,2), E(LocalFree,1), E(GlobalAlloc,2), E(GlobalFree,1),
@@ -421,4 +499,25 @@ void hle_snap(void (*cb)(void *, void *, size_t), void *u) {
     cb(u, &virt_next, sizeof virt_next); cb(u, &nvallocs, sizeof nvallocs); cb(u, vallocs, sizeof vallocs);
     cb(u, &nfake, sizeof nfake); cb(u, fake_mods, sizeof fake_mods); cb(u, &nnamed, sizeof nnamed); cb(u, named, sizeof named);
     cb(u, &s_cmdA, 4); cb(u, &s_cmdW, 4); cb(u, &s_envW, 4); cb(u, &s_envA, 4);
+}
+
+// release mutexes owned by a finished thread (they become abandoned: the next waiter gets WAIT_ABANDONED_0)
+void hle_thread_exit(Ctx *c, Thread *t) {
+    for (int i = 1; i < c->nhandles; i++) { Handle *o = &c->handles[i]; if (o->type == H_MUTEX && o->count > 0 && o->owner == t->tid) { o->count = 0; o->owner = 0; o->abandoned = 1; } }
+}
+// BLUR_SYNCSTAT=1: at exit list every event/semaphore/mutex: who created it, how often it was signalled / acquired, and which threads are blocked on it
+void hle_sync_report(Ctx *c) {
+    static const char *tn[] = {"none", "event", "mutex", "semaphore", "thread", "file", "find"};
+    fprintf(stderr, "[sync] handle  type       manual signaled count  created-by  sets      acquires   blocked-threads\n");
+    for (int i = 1; i < c->nhandles; i++) { Handle *o = &c->handles[i]; if (o->type != H_EVENT && o->type != H_SEMAPHORE && o->type != H_MUTEX) continue;
+        uint32_t h = 0x100 + 4 * (uint32_t)i; char w[200] = ""; int k = 0;
+        for (int t = 0; t < c->nthreads; t++) { Thread *th = &c->threads[t]; if (th->used && !th->done && th->blocked && th->last_a0 == h && th->last_api && (!strncmp(th->last_api, "WaitFor", 7) || !strncmp(th->last_api, "SignalObjectAndWait", 19))) k += snprintf(w + k, sizeof w - (size_t)k, " t%d", t); }
+        fprintf(stderr, "[sync] %05x  %-9s  %d      %d        %-5d  %08x    %-9llu %-9llu %s", h, tn[o->type], o->manual, o->signaled, o->count, o->cret, (unsigned long long)o->nset, (unsigned long long)o->nacq, w);
+        for (int k = 0; k < 4; k++) if (o->setter[k]) fprintf(stderr, "  set@%08x x%u", o->setter[k], o->setter_n[k]); fprintf(stderr, "\n"); }
+}
+// earliest timer deadline among blocked threads (0 = none): lets the scheduler sleep instead of polling when every thread waits
+uint64_t thread_next_deadline(Ctx *c) {
+    uint64_t best = 0;
+    for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (!t->used || t->done || t->suspended || !t->blocked || !t->wake_at || t->wake_at == 1) continue; if (!best || t->wake_at < best) best = t->wake_at; }
+    return best;
 }

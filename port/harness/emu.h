@@ -91,6 +91,7 @@ typedef struct {
     uint8_t wk, nwh, wall; uint32_t wh[8], wcs;   // what a blocked thread waits for (scheduler skips it until satisfiable): 1 handles, 2 sleep, 3 critical section
     uint64_t wake_at;     // Sleep / timed wait deadline in microseconds (0 = none)
     uint32_t handle;
+    int par_waiting;              // BLUR_PAR: host thread is parked in par_wait()
     void *cpu; int rt_started;    // recompiled-code mode: register file and host thread of this guest thread
     pthread_t pth;
     const char *last_api; uint32_t last_ret, last_a0, last_a1, n_api; uint64_t last_api_us;    // diagnostics: what the thread last called (BLUR_THREADS)
