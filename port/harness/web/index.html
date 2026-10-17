@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Blur (emulated)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#0b0b0d;color:#c8c8d0;font:13px/1.4 ui-monospace,Menlo,monospace}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #bar{padding:6px 12px;display:flex;gap:16px;align-items:center;background:#15151a;border-bottom:1px solid #26262e}
+  #bar b{color:#fff} #status.ok{color:#7ddf8a} #status.bad{color:#ff8080}
+  #stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
+  canvas{max-width:100%;max-height:100%;aspect-ratio:16/9;background:#000;image-rendering:auto}
+  #log{max-height:22vh;overflow:auto;padding:6px 12px;background:#101014;border-top:1px solid #26262e;white-space:pre-wrap;color:#9a9aa8}
+</style></head><body>
+<div id="wrap">
+  <div id="bar"><b>Blur on WebGL2</b><span id="status" class="bad">connecting…</span><span id="fps"></span><span id="stats"></span></div>
+  <div id="stage"><canvas id="c" width="1280" height="720" tabindex="0"></canvas></div>
+  <div id="log"></div>
+</div>
+<script src="renderer.js"></script>
+<script>
+  const canvas = document.getElementById('c'), statusEl = document.getElementById('status'), logEl = document.getElementById('log');
+  const log = (m) => { logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+  const r = new D3D9Renderer(canvas, log); window.__r = r; r.sendInput = (t, a, b, c, d) => send(t, a, b, c, d);
+  let ws, frames = 0, last = performance.now(), msgs = 0, bytes = 0, presented = 0;
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer'; window.__ws = ws;
+    ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.className = 'ok'; };
+    ws.onclose = (e) => { audioFadeOut(); au.faded = true; const busy = e.code === 1013; statusEl.textContent = busy ? 'another viewer is connected - retrying every 3 s' : 'disconnected - retrying'; statusEl.className = 'bad'; setTimeout(connect, busy ? 3000 : 1000); };
+    ws.onmessage = (e) => {
+      bytes += e.data.byteLength; const n = r.feed(e.data); msgs += n.messages; frames += n.presents;
+      if (n.presents) { presented += n.presents; send(9, presented); }       // flow control: the harness runs at most BLUR_MAXLAG (4) frames ahead of this counter; no ack = no throttling
+    };
+  }
+  // ---- audio: host-mixed 48 kHz stereo PCM (message type 90) -> AudioWorklet. Browsers need a user gesture before audio can start.
+  const au = { ctx: null, node: null, master: null, stat: null, pending: [], rx: 0, faded: false, lastRx: 0 };
+  const audioStat = () => au.stat ? `audio ${au.ctx && au.ctx.state} buf=${(au.stat.buffered / 48).toFixed(0)}ms under=${au.stat.underruns} drop=${au.stat.dropped}` : (au.ctx ? 'audio waiting' : 'audio: press a key / click');
+  // The context is never torn down abruptly: every way the sound can end (tab hidden/closed, socket closed, host exit marker, host silent) goes through a short fade
+  // (master GainNode + the worklet's own per-sample ramp) so there is no click.
+  function audioFadeOut(tc = 0.012) {                                        // ~40 ms to silence (time constant 12 ms)
+    if (!au.ctx || !au.node) return;
+    try { au.node.port.postMessage({ stop: 1 }); au.master.gain.cancelScheduledValues(au.ctx.currentTime); au.master.gain.setTargetAtTime(0, au.ctx.currentTime, tc); } catch (e) {}
+  }
+  function audioFadeIn() {
+    if (!au.ctx || !au.node) return;
+    try { au.master.gain.cancelScheduledValues(au.ctx.currentTime); au.master.gain.setTargetAtTime(1, au.ctx.currentTime, 0.02); au.node.port.postMessage({ resume: 1 }); } catch (e) {}
+  }
+  async function audioStart() {
+    if (au.ctx) { if (au.ctx.state === 'suspended') { await au.ctx.resume(); audioFadeIn(); } return; }
+    try {
+      au.ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+      await au.ctx.audioWorklet.addModule('audio-worklet.js');
+      au.node = new AudioWorkletNode(au.ctx, 'blur-pcm', { numberOfInputs: 0, outputChannelCount: [2] });
+      au.master = au.ctx.createGain(); au.master.gain.value = 0;
+      au.node.port.onmessage = (e) => { if (e.data.stats) au.stat = e.data.stats; };
+      au.node.connect(au.master); au.master.connect(au.ctx.destination); await au.ctx.resume();
+      au.master.gain.setTargetAtTime(1, au.ctx.currentTime, 0.015);                      // fade-in (no pop at start)
+      // audio that arrived before the first user gesture is stale: keep only the newest ~150 ms instead of replaying seconds of backlog
+      let keep = 0, i = au.pending.length; while (i > 0 && keep < 7200) { i--; keep += (au.pending[i].pcm.byteLength >> 2); }
+      for (const m of au.pending.splice(i)) au.node.port.postMessage(m, [m.pcm]); au.pending.length = 0;
+    } catch (e) { log('audio init failed: ' + e); au.ctx = null; }
+  }
+  r.onAudio = (rate, ch, frames, buf) => {
+    au.rx += frames; const m = { pcm: buf, rate }; au.lastRx = performance.now();
+    if (au.node) { if (au.faded) { au.faded = false; audioFadeIn(); } au.node.port.postMessage(m, [buf]); } else { au.pending.push(m); if (au.pending.length > 100) au.pending.shift(); }
+  };
+  r.onAudioStop = () => { au.faded = true; audioFadeOut(); };                          // host marker (type 91): the process is exiting / audio ended
+  // earliest teardown signals: fade BEFORE the browser kills the audio thread
+  addEventListener('pagehide', () => audioFadeOut(0.008), { capture: true });
+  addEventListener('beforeunload', () => audioFadeOut(0.008), { capture: true });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { audioFadeOut(); if (au.ctx) setTimeout(() => { if (document.visibilityState === 'hidden' && au.ctx.state === 'running') au.ctx.suspend(); }, 150); }
+    else if (au.ctx) { au.ctx.resume().then(audioFadeIn); }
+  });
+  window.__r = r; window.__audio = au;                                             // test hook (headless checks)
+  for (const ev of ['keydown', 'mousedown', 'pointerdown', 'touchstart']) window.addEventListener(ev, audioStart, { once: false });
+  if (location.search.includes('audio=1')) audioStart();
+  // optional offline shader cache + warm list: when present the harness (BLUR_SHADER_CACHE) sends hashes instead of GLSL
+  const loadCache = (async () => { try { await r.loadShaderCache('shaders.bin'); try { await r.loadWarm('warm.json'); } catch (e) {} } catch (e) { log('[renderer] no shader cache: ' + e.message); } })();
+  loadCache.then(connect);
+  setInterval(() => { const now = performance.now(), dt = (now - last) / 1000; last = now;
+    document.getElementById('fps').textContent = `${(frames / dt).toFixed(1)} fps`; document.getElementById('stats').textContent = `${(bytes / dt / 1048576).toFixed(1)} MB/s  ${r.statLine()}  ${audioStat()}`; frames = 0; bytes = 0; msgs = 0; }, 1000);
+  // input -> harness (NetInput: 5 x int32: type,a,b,c,d). 1=key down(vk) 2=key up(vk) 3=mouse move(x,y) 4=mouse button(btn,down) 5=wheel
+  const send = (t, a = 0, b = 0, c = 0, d = 0) => { if (ws && ws.readyState === 1) ws.send(new Int32Array([t, a, b, c, d]).buffer); };
+  const vk = (e) => ({ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Enter:13,Escape:27,Space:32,Tab:9,Backspace:8,ShiftLeft:160,ShiftRight:161,ControlLeft:162,ControlRight:163,AltLeft:164,AltRight:165}[e.code] || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0));
+  window.addEventListener('keydown', (e) => { send(1, vk(e)); if (e.code !== 'F12') e.preventDefault(); });
+  window.addEventListener('keyup', (e) => { send(2, vk(e)); e.preventDefault(); });
+  canvas.addEventListener('mousemove', (e) => { const b = canvas.getBoundingClientRect(); send(3, Math.round((e.clientX - b.left) * (r.bb ? r.bb.lw : canvas.width) / b.width), Math.round((e.clientY - b.top) * (r.bb ? r.bb.lh : canvas.height) / b.height)); });
+  canvas.addEventListener('mousedown', (e) => { canvas.focus(); send(4, e.button, 1); }); canvas.addEventListener('mouseup', (e) => send(4, e.button, 0));
+</script></body></html>
