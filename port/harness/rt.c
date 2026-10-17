@@ -303,7 +303,23 @@ void audio_tick(Ctx *c);
 // display would hold Present to the refresh rate.  The thread sleeps (other guest threads keep running) until the next refresh tick.  BLUR_NOVSYNC=1 disables, BLUR_REFRESH=<hz> (default 60).
 extern volatile uint32_t g_net_ack; extern volatile int g_net_ack_seen;
 static const Stub *present_stub;
+// BLUR_FRAMESTAT=1: per-frame Present-to-Present time histogram (p50/p95/p99/max, frames > 20 and > 33 ms) every 10 s, and every API call that held the global lock > 2 ms
+static struct { const char *api; uint32_t us; } fs_top[6]; static uint64_t fs_api_us, fs_ncalls;     // main (Present-calling) thread: slowest non-blocked API calls of the current frame
+static void fs_note(const char *api, uint64_t d) { fs_api_us += d; fs_ncalls++; int w = 0; for (int i = 1; i < 6; i++) if (fs_top[i].us < fs_top[w].us) w = i; if (d > fs_top[w].us) { fs_top[w].api = api; fs_top[w].us = (uint32_t)d; } }
+static int fs_cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+static void framestat(void) {
+    static int on = -1; if (on < 0) on = getenv("BLUR_FRAMESTAT") != NULL; if (!on) return;
+    static uint64_t last, t10; static uint32_t dts[4096]; static int n; uint64_t now = real_us();
+    if (last && n < 4096) dts[n++] = (uint32_t)(now - last);
+    if (last && now - last > 30000) { fprintf(stderr, "[hitch] frame %.1f ms: API %.1f ms in %llu calls, guest/other %.1f ms; slowest calls:", (now - last) / 1e3, fs_api_us / 1e3, (unsigned long long)fs_ncalls, ((now - last) - fs_api_us) / 1e3);
+        for (int i = 0; i < 6; i++) if (fs_top[i].us > 300) fprintf(stderr, " %s=%.1fms", fs_top[i].api, fs_top[i].us / 1e3); fprintf(stderr, "\n"); }
+    memset(fs_top, 0, sizeof fs_top); fs_api_us = fs_ncalls = 0; last = now; if (!t10) t10 = now;
+    if (now - t10 >= 10000000ull && n > 20) {
+        qsort(dts, (size_t)n, 4, fs_cmp); int o20 = 0, o33 = 0; for (int i = 0; i < n; i++) { if (dts[i] > 20000) o20++; if (dts[i] > 33400) o33++; }
+        fprintf(stderr, "[framestat] %d frames: p50 %.1f p95 %.1f p99 %.1f max %.1f ms; >20ms: %d, >33ms: %d\n", n, dts[n / 2] / 1e3, dts[n * 95 / 100] / 1e3, dts[n * 99 / 100] / 1e3, dts[n - 1] / 1e3, o20, o33); n = 0; t10 = now; }
+}
 static void pace_present(Ctx *c) {
+    framestat();
     static uint32_t sent;
     // viewer back-pressure: the page acks every presented frame; do not run more than BLUR_MAXLAG (4) frames ahead of it (it would only queue them in browser memory = latency). Gives up after 100 ms (hidden tab, old page).
     if (g_net_ack_seen && net_client_connected()) { static int maxlag = -1; if (maxlag < 0) maxlag = getenv("BLUR_MAXLAG") ? atoi(getenv("BLUR_MAXLAG")) : 4; sent++;
@@ -373,7 +389,10 @@ static uint32_t rt_api_locked(Cpu *cpu, uint32_t addr) {
 static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
     if (!par_mode) return rt_api_locked(cpu, addr);
     Ctx *c = C; int si = (int)((addr - STUB_BASE) / 16); par_enter(c);
+    static int fs_on = -1; if (fs_on < 0) fs_on = getenv("BLUR_FRAMESTAT") != NULL; uint64_t fs0 = fs_on ? real_us() : 0;
     uint32_t r = rt_api_locked(cpu, addr);
+    if (fs_on) { uint64_t d = real_us() - fs0; static int shown; if (t_idx == 0 && strcmp(c->stubs[si].name, "IDirect3DDevice9::Present")) fs_note(c->stubs[si].name, d);
+      if (d > 2000 && shown < 200 && !c->threads[t_idx].blocked) { shown++; fprintf(stderr, "[slowapi] t%d %s took %.1f ms (lock held; includes any wait inside the handler)\n", t_idx, c->stubs[si].name, d / 1e3); } }
     uint8_t f = par_flag[si]; if (!f) { par_flags_for(&c->stubs[si], si); f = par_flag[si]; }
     if (f & 4) par_start_pending(c);
     if (f & 2) par_wake(c);

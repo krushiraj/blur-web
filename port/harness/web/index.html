@@ -8,10 +8,11 @@
   #bar b{color:#fff} #status.ok{color:#7ddf8a} #status.bad{color:#ff8080}
   #stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
   canvas{max-width:100%;max-height:100%;aspect-ratio:16/9;background:#000;image-rendering:auto}
+  :fullscreen #bar,:fullscreen #log{display:none} :fullscreen #stage{width:100vw;height:100vh} :fullscreen canvas{width:100vw;height:100vh;max-width:none;max-height:none;aspect-ratio:auto;object-fit:contain}
   #log{max-height:22vh;overflow:auto;padding:6px 12px;background:#101014;border-top:1px solid #26262e;white-space:pre-wrap;color:#9a9aa8}
 </style></head><body>
 <div id="wrap">
-  <div id="bar"><b>Blur on WebGL2</b><span id="status" class="bad">connecting…</span><span id="fps"></span><span id="stats"></span></div>
+  <div id="bar"><b>Blur on WebGL2</b><span id="status" class="bad">connecting…</span><span id="inputmode" title="what the game sees as its input device">input: keyboard</span><span id="fps"></span><span id="stats"></span></div>
   <div id="stage"><canvas id="c" width="1280" height="720" tabindex="0"></canvas></div>
   <div id="log"></div>
 </div>
@@ -85,6 +86,28 @@
   // (e.g. S = reverse gear for good). Release everything when the page loses focus or is hidden.
   const held = new Map(), heldBtn = new Set();                          // physical key (e.code) -> vk that was sent on key-down (the key-up must release exactly that, even if e.key changed: Shift, layouts, caps lock)
   const releaseAll = () => { for (const k of held.values()) send(2, k); held.clear(); for (const b of heldBtn) send(4, b, 0); heldBtn.clear(); };
+  // Gamepad: a pad is reported to the game ONLY while a real controller is connected (browser Gamepad API; press any button on it once so the browser exposes it).
+  // Otherwise the game sees no XInput device and uses its own keyboard bindings. The header shows which one is in control.
+  const inputEl = document.getElementById('inputmode'); let padKey = '', padSentAt = 0, padWasActive = false;
+  const setMode = (txt, cls) => { inputEl.textContent = txt; inputEl.style.color = cls === 'pad' ? '#7ddf8a' : ''; };
+  const readPad = () => { const gps = navigator.getGamepads ? navigator.getGamepads() : []; for (const g of gps) if (g && g.connected) return g; return null; };
+  const sendPad = () => {
+    const g = readPad(); const now = performance.now();
+    if (!g) { if (padWasActive) { padWasActive = false; padKey = ''; send(6, 0, 0, 0, 0); setMode('input: keyboard', 'kb'); } return; }
+    const B = g.buttons, ax = (i) => Math.max(-32767, Math.min(32767, Math.round((g.axes[i] || 0) * 32767)));
+    let btn = 0; const m = [[0, 0x1000], [1, 0x2000], [2, 0x4000], [3, 0x8000], [4, 0x100], [5, 0x200], [8, 0x20], [9, 0x10], [10, 0x40], [11, 0x80], [12, 0x1], [13, 0x2], [14, 0x4], [15, 0x8]];
+    for (const [i, bit] of m) if (B[i] && B[i].pressed) btn |= bit;
+    const lt = Math.round(((B[6] && B[6].value) || 0) * 255), rt = Math.round(((B[7] && B[7].value) || 0) * 255);
+    const lx = ax(0), ly = -ax(1), rx = ax(2), ry = -ax(3);                       // XInput Y axes point up
+    const key = [btn, lt, rt, lx, ly, rx, ry].join(',');
+    if (key !== padKey || now - padSentAt > 250 || !padWasActive) { padKey = key; padSentAt = now; padWasActive = true; send(6, btn | (lt << 16) | (rt << 24), (lx & 0xffff) | (ly << 16), (rx & 0xffff) | (ry << 16), 1); setMode('input: controller (' + (g.id || 'gamepad').slice(0, 40) + ')', 'pad'); }
+  };
+  setInterval(sendPad, 8);
+  window.addEventListener('gamepaddisconnected', () => sendPad());
+  // Fullscreen: F11 or double-click the picture. Escape is locked (Keyboard Lock API, Chrome) so the game's Esc menu works; leave fullscreen with F11 again.
+  const toggleFs = async () => { try { if (document.fullscreenElement) { await document.exitFullscreen(); } else { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); if (navigator.keyboard && navigator.keyboard.lock) { try { await navigator.keyboard.lock(['Escape']); } catch (e) {} } canvas.focus(); } } catch (e) { log('fullscreen: ' + e.message); } };
+  canvas.addEventListener('dblclick', toggleFs);
+  window.addEventListener('keydown', (e) => { if (e.code === 'F11') { e.preventDefault(); toggleFs(); } }, true);
   window.addEventListener('keydown', (e) => { const k = vk(e); if (!e.repeat || !held.has(e.code)) { held.set(e.code, k); send(1, k); } if (e.code !== 'F12') e.preventDefault(); });
   window.addEventListener('keyup', (e) => { const k = held.has(e.code) ? held.get(e.code) : vk(e); held.delete(e.code); send(2, k); e.preventDefault(); });
   window.addEventListener('blur', releaseAll); window.addEventListener('focus', releaseAll); window.addEventListener('pagehide', releaseAll);
