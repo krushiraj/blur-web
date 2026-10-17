@@ -490,7 +490,16 @@ static uint32_t d_setvsi(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 16) { rdbuf(c
 static uint32_t d_setpsi(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 16) { rdbuf(c, a[2], st.psi[a[1]], 16 * a[3]); uint32_t w[2] = {a[1], a[3]}; gfx_msg(G_SET_PSCI, w, 2, st.psi[a[1]], 16 * a[3]); } return 0; }
 static uint32_t d_setvsb(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 16) { rdbuf(c, a[2], &st.vsb[a[1]], 4 * a[3]); uint32_t w[2] = {a[1], a[3]}; gfx_msg(G_SET_VSCB, w, 2, &st.vsb[a[1]], 4 * a[3]); } return 0; }
 static uint32_t d_setpsb(Ctx *c, uint32_t *a) { if (a[1] + a[3] <= 16) { rdbuf(c, a[2], &st.psb[a[1]], 4 * a[3]); uint32_t w[2] = {a[1], a[3]}; gfx_msg(G_SET_PSCB, w, 2, &st.psb[a[1]], 4 * a[3]); } return 0; }
-static uint32_t d_setrt(Ctx *c, uint32_t *a) { if (a[1] == 0) devset(c, &st.rt, a[2]); uint32_t d[4]; surf_desc_words(c, a[2], d); if (a[1] >= 8 || chg(sent.rt[a[1]], d, 16)) GFXW(G_SET_RT, a[1], d[0], d[1], d[2], d[3]); return 0; }
+static uint32_t d_setrt(Ctx *c, uint32_t *a) {
+    if (a[1] == 0) devset(c, &st.rt, a[2]); uint32_t d[4]; surf_desc_words(c, a[2], d); if (a[1] >= 8 || chg(sent.rt[a[1]], d, 16)) GFXW(G_SET_RT, a[1], d[0], d[1], d[2], d[3]);
+    // D3D9: SetRenderTarget(0, ...) resets the viewport to cover the whole new target (depth range 0..1) and the scissor rect to the target size. The game relies on it
+    // (the rear-view mirror pass never calls SetViewport before its Clear): with the previous pass's 320x192 viewport left in place, the depth clear only covered the
+    // left 320 columns of the 576x96 mirror target and the rest of the mirror was depth-rejected (half a mirror).
+    if (a[1] == 0 && a[2]) { Obj *s = O(c, a[2]); if (s && s->w && s->h) {
+        const float zmin = 0.0f, zmax = 1.0f; uint32_t vp[6] = { 0, 0, s->w, s->h, 0, 0 }; memcpy(&vp[4], &zmin, 4); memcpy(&vp[5], &zmax, 4); memcpy(st.vp, vp, 24);
+        if (chg(sent.vp, st.vp, 24)) GFXW(G_SET_VIEWPORT, st.vp[0], st.vp[1], st.vp[2], st.vp[3], st.vp[4], st.vp[5]);
+        st.scissor[0] = 0; st.scissor[1] = 0; st.scissor[2] = s->w; st.scissor[3] = s->h; if (chg(sent.sc, st.scissor, 16)) GFXW(G_SET_SCISSOR, st.scissor[0], st.scissor[1], st.scissor[2], st.scissor[3]); } }
+    return 0; }
 static void addref_g(Ctx *c, uint32_t g) { if (g) wr32(c, g + 4, rd32(c, g + 4) + 1); }
 static uint32_t d_getrt(Ctx *c, uint32_t *a) { uint32_t g = a[1] == 0 ? (st.rt ? st.rt : st.backbuf) : 0; addref_g(c, g); wr32(c, a[2], g); return 0; }
 static uint32_t d_setds(Ctx *c, uint32_t *a) { devset(c, &st.ds, a[1]); uint32_t d[4]; surf_desc_words(c, a[1], d); if (chg(sent.ds, d, 16)) GFXW(G_SET_DS, d[0], d[1], d[2], d[3]); return 0; }
