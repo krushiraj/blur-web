@@ -19,15 +19,40 @@
 //   wasm    : __EMSCRIPTEN__ -> JS imports on `Module.blurLan`, a client/virtual-lan.js instance in raw mode (enableRaw, rawSendFrame, rawRecvFrame)
 // Everything guest-visible (socket table, errors, broadcast loop-back, GetAdaptersInfo) is identical in both builds.
 #include "emu.h"
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
+#include <string.h>
 #include <pthread.h>
-#include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <ipifcons.h>
+#ifndef IF_TYPE_ETHERNET_CSMA_CD
+#define IF_TYPE_ETHERNET_CSMA_CD 6
+#define IF_TYPE_IEEE80211 71
+#define IF_TYPE_SOFTWARE_LOOPBACK 24
+#define IF_TYPE_TUNNEL 131
+#define IF_TYPE_PPP 23
+#endif
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#define close(fd) closesocket((SOCKET)(fd))
+static void set_nonblock(int fd) { u_long on = 1; ioctlsocket((SOCKET)fd, FIONBIO, &on); }
+#define host_errstr() "winsock error"
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+static void set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); }
+#define host_errstr() strerror(errno)
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -75,13 +100,119 @@ static struct {
     uint16_t next_eph;
     uint32_t hostent, ntoa_buf; int started;
     uint64_t tx_dg, rx_dg, drop_dg;
+    int mesh, mport, mslot; struct { uint32_t vip; struct sockaddr_in a; uint64_t seen; } peer[64]; struct sockaddr_in bc[8]; int nbc;   // BLUR_NET_MESH: serverless LAN mode (see mesh_*)
     char hello[300]; int joined;               // BLUR_NET_ROOM: payload of the HELLO frames (room=CODE;name=..;pw=..) once joined via the lobby server's UDP gateway
 } W = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
+#ifndef __EMSCRIPTEN__
+// ---- mesh mode: no relay. Every machine binds UDP MESH_PORT, announces itself with HELLO frames to the LAN broadcast addresses, and learns
+// peers (virtual ip -> real ip:port) from the frames it receives. DATA frames then go straight to the owning peer (unicast) or to every
+// known peer (broadcast). The virtual ip is 10.77.0.<last octet of the machine's LAN address>, so nothing needs configuring.
+#define PORT_MESH 47801
+#define PEER_STALE_US 6000000ull
+static uint64_t mono_us(void);
+static int bcast_addr(uint32_t ip_n);
+#ifdef _WIN32
+// Windows: pick the best LAN adapter (ethernet/wifi with a default gateway, private range; virtual switches penalised) and collect the directed broadcast of every usable adapter into W.bc.
+static int mesh_enum(uint32_t *bestp) {
+    ULONG sz = 16384, fl = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER; IP_ADAPTER_ADDRESSES *aa = malloc(sz);
+    ULONG r = GetAdaptersAddresses(AF_INET, fl, NULL, aa, &sz); if (r == ERROR_BUFFER_OVERFLOW) { aa = realloc(aa, sz); r = GetAdaptersAddresses(AF_INET, fl, NULL, aa, &sz); }
+    if (r != NO_ERROR) { free(aa); return -1; }
+    uint32_t best = 0; int bestscore = -1;
+    for (IP_ADAPTER_ADDRESSES *a = aa; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->IfType == IF_TYPE_TUNNEL || a->IfType == IF_TYPE_PPP) continue;
+        int virt = a->FriendlyName && (wcsstr(a->FriendlyName, L"vEthernet") || wcsstr(a->FriendlyName, L"VirtualBox") || wcsstr(a->FriendlyName, L"VMware") || wcsstr(a->FriendlyName, L"WSL") || wcsstr(a->FriendlyName, L"Hyper-V") || wcsstr(a->FriendlyName, L"Docker"));
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            uint32_t ip = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr; uint8_t *b = (uint8_t *)&ip;
+            if (b[0] == 169 && b[1] == 254) continue;                                        // link-local: no DHCP lease
+            int score = (b[0] == 192 && b[1] == 168) ? 3 : (b[0] == 10) ? 2 : (b[0] == 172 && b[1] >= 16 && b[1] < 32) ? 2 : 1;
+            if (a->IfType == IF_TYPE_ETHERNET_CSMA_CD || a->IfType == IF_TYPE_IEEE80211) score += 4;
+            if (a->FirstGatewayAddress) score += 2;
+            if (virt) score -= 5;
+            if (score > bestscore) { bestscore = score; best = ip; }
+            unsigned pl = u->OnLinkPrefixLength; if (pl >= 1 && pl < 32 && W.nbc < 8) {
+                uint32_t mask = htonl(~0u << (32 - pl)); W.bc[W.nbc].sin_family = AF_INET; W.bc[W.nbc].sin_addr.s_addr = ip | ~mask; W.bc[W.nbc].sin_port = htons(PORT_MESH); W.nbc++; }
+        }
+    }
+    free(aa); *bestp = best; return best ? 0 : -1;
+}
+#endif
+static int mesh_setup(void) {
+#ifdef _WIN32
+    uint32_t best = 0; if (mesh_enum(&best) != 0) return -1;
+#else
+    struct ifaddrs *ifs = NULL; if (getifaddrs(&ifs) != 0) return -1;
+    uint32_t best = 0; int bestscore = -1;
+    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT)) || !(i->ifa_flags & IFF_BROADCAST)) continue;
+        uint32_t ip = ((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr; uint8_t *b = (uint8_t *)&ip;
+        if (b[0] == 169 && b[1] == 254) continue;                                            // link-local: no DHCP lease
+        int score = (b[0] == 192 && b[1] == 168) ? 3 : (b[0] == 10) ? 2 : (b[0] == 172 && b[1] >= 16 && b[1] < 32) ? 2 : 1;
+        if (!strncmp(i->ifa_name, "en", 2) || !strncmp(i->ifa_name, "eth", 3) || !strncmp(i->ifa_name, "wl", 2)) score += 4;
+        if (score > bestscore) { bestscore = score; best = ip; }
+    }
+    if (!best) { freeifaddrs(ifs); return -1; }
+#endif
+    uint8_t last = ((uint8_t *)&best)[3]; if (last == 0 || last == 255) last = 1;
+    const char *sl = getenv("BLUR_NET_MESH_SLOT"); W.mslot = sl ? atoi(sl) : 0;                // test aid: several instances on ONE machine (slot 1..8): own udp port + own virtual ip, discovery over loopback
+    if (W.mslot > 0) last = (uint8_t)(200 + W.mslot);
+    W.mport = PORT_MESH + W.mslot;
+    W.vip = htonl((10u << 24) | (77u << 16) | (0u << 8) | last);
+#ifndef _WIN32
+    for (struct ifaddrs *i = ifs; i && W.nbc < 8; i = i->ifa_next) {                          // directed broadcast of every usable interface
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK) || !(i->ifa_flags & IFF_BROADCAST) || !i->ifa_dstaddr) continue;
+        struct sockaddr_in *d = (struct sockaddr_in *)i->ifa_dstaddr; W.bc[W.nbc] = *d; W.bc[W.nbc].sin_port = htons(PORT_MESH); W.nbc++;
+    }
+    freeifaddrs(ifs);
+#endif
+    W.rfd = socket(AF_INET, SOCK_DGRAM, 0); if (W.rfd < 0) return -1;
+    int one = 1; setsockopt(W.rfd, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
+#ifdef _WIN32
+    { DWORD z = 0, rb = 0; BOOL no = FALSE; (void)z; WSAIoctl((SOCKET)W.rfd, SIO_UDP_CONNRESET, &no, sizeof no, NULL, 0, &rb, NULL, NULL); }      // ICMP port-unreachable must not turn into WSAECONNRESET on recvfrom
+#else
+    setsockopt(W.rfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#endif
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(W.mport) }; me.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(W.rfd, (struct sockaddr *)&me, sizeof me) != 0) { fprintf(stderr, "[wsock] mesh: cannot bind UDP %d (%s) - is another game already running?\n", W.mport, host_errstr()); close(W.rfd); W.rfd = -1; return -1; }
+    set_nonblock(W.rfd);
+    W.mesh = 1; W.relay_ok = 1;
+    uint8_t *b = (uint8_t *)&best; fprintf(stderr, "[wsock] LAN mesh: this machine %u.%u.%u.%u -> virtual ip %u.%u.%u.%u, %d broadcast address(es), udp %d\n", b[0], b[1], b[2], b[3], W.vip & 255, (W.vip >> 8) & 255, (W.vip >> 16) & 255, W.vip >> 24, W.nbc, W.mport);
+    return 0;
+}
+static ssize_t mesh_send(const uint8_t *f, size_t n) {
+    if (n < FR_HDR) return -1;
+    if (f[3] == FR_HELLO) {
+        struct sockaddr_in all = { .sin_family = AF_INET, .sin_port = htons(PORT_MESH) }; all.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        sendto(W.rfd, f, n, 0, (struct sockaddr *)&all, sizeof all);
+        for (int i = 0; i < W.nbc; i++) sendto(W.rfd, f, n, 0, (struct sockaddr *)&W.bc[i], sizeof W.bc[i]);
+        if (W.mslot > 0) for (int k = 0; k <= 8; k++) if (PORT_MESH + k != W.mport) { struct sockaddr_in lo = { .sin_family = AF_INET, .sin_port = htons(PORT_MESH + k) }; lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK); sendto(W.rfd, f, n, 0, (struct sockaddr *)&lo, sizeof lo); }
+        return (ssize_t)n;
+    }
+    if (f[3] != FR_DATA) return (ssize_t)n;
+    uint32_t dip; memcpy(&dip, f + 12, 4); uint64_t t = mono_us(); int bc = bcast_addr(dip);
+    for (int i = 0; i < 64; i++) if (W.peer[i].vip && t - W.peer[i].seen < PEER_STALE_US && (bc || W.peer[i].vip == dip)) sendto(W.rfd, f, n, 0, (struct sockaddr *)&W.peer[i].a, sizeof W.peer[i].a);
+    return (ssize_t)n;
+}
+static ssize_t mesh_recv(void *f, size_t cap) {
+    struct sockaddr_in from; socklen_t fl = sizeof from;
+    ssize_t n = recvfrom(W.rfd, f, cap, 0, (struct sockaddr *)&from, &fl);
+    const uint8_t *b = f;
+    if (n < FR_HDR || b[0] != 'B' || b[1] != 'N' || b[2] != 1) return n < 0 ? n : 0;
+    uint32_t sip; memcpy(&sip, b + 4, 4);
+    if (sip == W.vip) return 0;                                                                // our own broadcast (or a machine with the same last octet)
+    uint64_t t = mono_us(); int slot = -1, freeslot = -1;
+    for (int i = 0; i < 64; i++) { if (W.peer[i].vip == sip) { slot = i; break; } if (freeslot < 0 && (!W.peer[i].vip || t - W.peer[i].seen > PEER_STALE_US * 4)) freeslot = i; }
+    if (slot < 0 && freeslot >= 0) { slot = freeslot; const uint8_t *r = (const uint8_t *)&from.sin_addr; fprintf(stderr, "[wsock] LAN mesh: found player at %u.%u.%u.%u\n", r[0], r[1], r[2], r[3]); }
+    if (slot >= 0) { W.peer[slot].vip = sip; W.peer[slot].a = from; W.peer[slot].seen = t; }
+    return n;
+}
+#endif
 static ssize_t host_send(const void *f, size_t n) {
 #ifdef __EMSCRIPTEN__
     return js_lan_send((const uint8_t *)f, (int)n) ? (ssize_t)n : -1;
 #else
+    if (W.mesh) return mesh_send(f, n);
     return sendto(W.rfd, f, n, 0, (struct sockaddr *)&W.raddr, sizeof W.raddr);
 #endif
 }
@@ -89,6 +220,7 @@ static ssize_t host_recv(void *f, size_t cap) {
 #ifdef __EMSCRIPTEN__
     return js_lan_recv((uint8_t *)f, (int)cap);
 #else
+    if (W.mesh) return mesh_recv(f, cap);
     return recv(W.rfd, f, cap, 0);
 #endif
 }
@@ -104,10 +236,20 @@ static void join_room_locked(void);
 static void net_init_locked(void) {
     if (W.init) return;
     W.init = 1; W.rfd = -1; W.next_eph = 49152;
+#ifdef _WIN32
+    { WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd); }
+#endif
 #ifdef __EMSCRIPTEN__
     { srand(js_seed()); unsigned v = js_lan_vip(); W.vip = v ? v : htonl((10u << 24) | (77u << 16) | 1u); W.relay_ok = 1;
       fprintf(stderr, "[wsock] browser host, virtual ip %u.%u.%u.%u\n", W.vip & 255, (W.vip >> 8) & 255, (W.vip >> 16) & 255, W.vip >> 24); return; }
 #endif
+    if (getenv("BLUR_NET_MESH") && !getenv("BLUR_NET_ID") && !getenv("BLUR_NET_RELAY") && !getenv("BLUR_NET_ROOM")) {
+        srand((unsigned)(time(NULL) * 2654435761u) ^ ((unsigned)getpid() << 8));
+#ifndef __EMSCRIPTEN__
+        if (mesh_setup() == 0) return;
+#endif
+        fprintf(stderr, "[wsock] LAN mesh unavailable (no usable network interface); falling back to local-only\n");
+    }
     int id = getenv("BLUR_NET_ID") ? atoi(getenv("BLUR_NET_ID")) : 1;
     if (id < 1 || id > 254) id = 1;
     W.vip = htonl((10u << 24) | (77u << 16) | (0u << 8) | (uint32_t)id);
@@ -118,7 +260,7 @@ static void net_init_locked(void) {
     if (r) { const char *col = strrchr(r, ':'); if (col) { snprintf(host, sizeof host, "%.*s", (int)(col - r), r); port = atoi(col + 1); } else snprintf(host, sizeof host, "%s", r); }
     W.rfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (W.rfd < 0) return;
-    fcntl(W.rfd, F_SETFL, fcntl(W.rfd, F_GETFL) | O_NONBLOCK);
+    set_nonblock(W.rfd);
     memset(&W.raddr, 0, sizeof W.raddr); W.raddr.sin_family = AF_INET; W.raddr.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &W.raddr.sin_addr) != 1) { close(W.rfd); W.rfd = -1; return; }
     W.relay_ok = 1;
@@ -433,7 +575,7 @@ static const HleDef wtab[] = {
     { "GetAdaptersInfo", 2, 0, h_GetAdaptersInfo },
 };
 // Off unless BLUR_NET_ROOM or BLUR_NET_ID is set (integration policy): the default build keeps the old placeholder winsock rows (no sockets, no relay).
-static int wsock_enabled(void) { static int on = -1; if (on < 0) on = (getenv("BLUR_NET_ROOM") && *getenv("BLUR_NET_ROOM")) || getenv("BLUR_NET_ID") || getenv("BLUR_NET_RELAY"); return on; }
+static int wsock_enabled(void) { static int on = -1; if (on < 0) on = getenv("BLUR_NET_MESH") || (getenv("BLUR_NET_ROOM") && *getenv("BLUR_NET_ROOM")) || getenv("BLUR_NET_ID") || getenv("BLUR_NET_RELAY"); return on; }
 const HleDef *wsock_lookup(const char *name) {
     if (!wsock_enabled()) return NULL;
     for (size_t i = 0; i < sizeof wtab / sizeof wtab[0]; i++) if (!strcmp(wtab[i].name, name)) return &wtab[i];
