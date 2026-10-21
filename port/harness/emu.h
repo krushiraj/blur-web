@@ -1,6 +1,15 @@
 // Shared declarations for the Blur HLE harness (x86 emulation + Win32 API implementation).
 #pragma once
 #include <stdint.h>
+#if defined(__x86_64__) || defined(__i386__)
+#define CPU_RELAX() __asm__ volatile("pause")      /* spin-wait hint (was an unconditional arm64 "yield") */
+#else
+#ifdef __wasm__
+#define CPU_RELAX() ((void)0)
+#else
+#define CPU_RELAX() __asm__ volatile("yield")
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +37,12 @@ extern uint8_t *G;
 #define STACK_TOP   0x0f800000u
 #define STACK_SIZE  0x00800000u
 #define HEAP_BASE   0x20000000u
-#define HEAP_SIZE   0x38000000u   // 896 MB virtual (0x20000000..0x58000000); the VirtualAlloc area starts at 0x58000000
+#ifdef __EMSCRIPTEN__
+#define HEAP_SIZE   0x38000000u   // wasm: 896 MB (0x20000000..0x58000000); the VirtualAlloc area starts at 0x58000000 (snapshots rely on this layout)
+#else
+#define HEAP_SIZE   0x50000000u   // native: 1280 MB (0x20000000..0x70000000): VirtualAlloc only ever used ~10 MB of its window, and a long session exhausted the old 896 MB
+#endif
+#define VIRT_BASE   (HEAP_BASE + HEAP_SIZE)
 #define TEB_ADDR    0x7ffdf000u
 #define PEB_ADDR    0x7ffde000u
 #define KUSER_ADDR  0x7ffe0000u
@@ -54,6 +68,7 @@ enum { G_TEX_CREATE = 20, G_TEX_UPLOAD = 21, G_SURF_CREATE = 22, G_BUF_CREATE = 
 int gfx_on(void); void gfx_flush(void);
 void gfx_msg(uint32_t type, const uint32_t *w, int nw, const void *data, uint32_t ndata);
 uint8_t *gfx_msg_alloc(uint32_t type, const uint32_t *w, int nw, uint32_t ndata);
+void hc_viewer_reset(void); void hc_net_msg(const void *p, size_t n);   // content-hash cache (gfx.c): called by the network thread on connect / on page messages 10 and 12
 extern volatile uint32_t g_net_epoch;   // incremented each time a viewer attaches: source-side state filters must forget what they believe the renderer holds
 #define GFXW(type, ...) do { if (gfx_on()) { uint32_t _w[] = {__VA_ARGS__}; gfx_msg(type, _w, (int)(sizeof _w / 4), NULL, 0); } } while (0)
 void md5_digest(const uint8_t *m, size_t n, uint8_t out[16]); void sha1_digest(const uint8_t *m, size_t n, uint8_t out[20]); void sha256_digest(const uint8_t *m, size_t n, uint8_t out[32]);
@@ -80,7 +95,11 @@ typedef struct {
 #define MAX_THREADS 64
 #define MAX_HANDLES 4096
 enum { H_NONE = 0, H_EVENT, H_MUTEX, H_SEMAPHORE, H_THREAD, H_FILE, H_FIND };
-typedef struct { int type, signaled, manual; uint32_t owner; int count, max, thread; void *fp; char pat[260]; int abandoned; uint32_t cret; uint64_t nset, nacq; char nm[48]; uint32_t setter[4], setter_n[4]; } Handle;
+typedef struct { int type, signaled, manual; uint32_t owner; int count, max, thread; void *fp; char pat[260];
+#ifdef _WIN32
+  char dirp[1024];     /* FindFirstFile: host directory (mingw dirent has no d_type) */
+#endif
+  int abandoned; uint32_t cret; uint64_t nset, nacq; char nm[48]; uint32_t setter[4], setter_n[4]; } Handle;
 typedef struct { uint32_t real_ret, value; int use_result; } Cont;
 typedef struct {
     Cont cont[16]; int ncont;

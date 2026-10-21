@@ -2,10 +2,20 @@
 // builds a fake TEB/PEB, and traps every other imported API into hle.c.
 // Usage: blurhle <path/to/BLUR/Blur.exe> [path/to/msvcr90.dll]
 #include "emu.h"
+#ifdef _WIN32
+#include <windows.h>
+#include <mmsystem.h>
+#else
 #include <sys/mman.h>
+#endif
 #include <ctype.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#define MAP_FAILED_W ((void *)-1)
+#else
+#define MAP_FAILED_W MAP_FAILED
+#endif
 void load_sigs(const char *path);
 static int ieq(const char *a, const char *b) { return strcasecmp(a, b) == 0; }
 static uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
@@ -327,15 +337,47 @@ static void setup_process(Ctx *c) {
     uc_hook_add(uc, &h, UC_HOOK_INSN, sysenter_hook, c, 1, 0, UC_X86_INS_SYSENTER);
 }
 
+#ifdef _WIN32
+// Guest memory at the fixed base the lifted code hard-codes. Windows has no MAP_NORESERVE: commit the whole 4 GB window (it only costs commit charge, pages are
+// zero-filled on first touch). If the commit limit is too low, fall back to reserve-only + a vectored handler that commits 256 KB chunks on first access
+// (host-side file reads straight into never-touched guest pages can then fail; the guest-side faults are handled).
+#define GUEST_SPAN ((1ull << 32) + 0x10000)
+static LONG CALLBACK guest_commit_veh(EXCEPTION_POINTERS *ep) {
+    EXCEPTION_RECORD *r = ep->ExceptionRecord; if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t a = (uintptr_t)r->ExceptionInformation[1], base = 0x7000000000ull; if (a < base || a >= base + GUEST_SPAN) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t pg = a & ~(uintptr_t)0x3ffff; return VirtualAlloc((void *)pg, 0x40000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+static void *guest_mem_map(void) {
+    void *p = VirtualAlloc((void *)0x7000000000ull, GUEST_SPAN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); if (p) return p;
+    p = VirtualAlloc((void *)0x7000000000ull, GUEST_SPAN, MEM_RESERVE, PAGE_READWRITE); if (!p) return NULL;
+    fprintf(stderr, "[mem] could not commit 4 GB (low commit limit / pagefile): committing guest memory on demand\n"); AddVectoredExceptionHandler(1, guest_commit_veh); return p;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    timeBeginPeriod(1);                                         // 1 ms timer granularity (usleep/Sleep/waits default to 15.6 ms)
+#endif
     if (argc < 2) { fprintf(stderr, "usage: %s Blur.exe [msvcr90.dll]\n", argv[0]); return 2; }
     static Ctx ctx; Ctx *c = &ctx;
     g_recomp = getenv("BLUR_RECOMP") != NULL;
-    G = mmap(NULL, (1ull << 32) + 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (G == MAP_FAILED) { perror("mmap guest memory"); return 1; }
+#ifdef _WIN32
+    G = guest_mem_map(); if (!G) G = (uint8_t *)MAP_FAILED_W;
+#else
+    G = mmap((void *)0x7000000000ull, (1ull << 32) + 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);      // fixed-address hint: lifted code built with -DBLUR_G_FIXED=0x7000000000ull hard-codes this base
+#endif
+    if (G != (uint8_t *)0x7000000000ull) fprintf(stderr, "[mem] guest memory mapped at %p, not 0x7000000000: code built with BLUR_G_FIXED will crash (build without it)\n", (void *)G);
+#ifdef BLUR_G_CHECK
+    if (G != (uint8_t *)0x7000000000ull) { fprintf(stderr, "[mem] FATAL: guest memory mapped at %p but the lifted code was built with BLUR_G_FIXED=0x7000000000\n", (void *)G); exit(2); }
+#endif
+    if (G == (uint8_t *)MAP_FAILED_W) { perror("mmap guest memory"); return 1; }
     c->verbose = getenv("BLUR_LOG") != NULL;
     c->tls_next = 0;
-    { char *d = strdup(argv[1]); char *sl = strrchr(d, '/'); if (sl) *sl = 0; else strcpy(d, "."); snprintf(g_gamedir, sizeof g_gamedir, "%s", d); free(d); }
+    { char *d = strdup(argv[1]); char *sl = strrchr(d, '/');
+#ifdef _WIN32
+    { char *bs = strrchr(d, '\\'); if (bs && (!sl || bs > sl)) sl = bs; }
+#endif
+    if (sl) *sl = 0; else strcpy(d, "."); snprintf(g_gamedir, sizeof g_gamedir, "%s", d); free(d); }
     snprintf(g_savedir, sizeof g_savedir, "%s", getenv("BLUR_SAVEDIR") ? getenv("BLUR_SAVEDIR") : "./save");
     if (getenv("BLUR_WEB")) {                                   // browser renderer: BLUR_WEB=1 (port 8765) or BLUR_WEB=<port>
         int port = atoi(getenv("BLUR_WEB")); if (port < 2) port = 8765;

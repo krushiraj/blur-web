@@ -5,7 +5,9 @@
 //   manifest.json human/JS-readable summary: memory runs {addr,len,off}, thread-0 registers, stub table, modules, clock, sizes
 #include "snap.h"
 #include "../recomp/rt.h"
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 
 typedef struct { FILE *f; size_t n; } Out;

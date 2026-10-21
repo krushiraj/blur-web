@@ -87,16 +87,34 @@ static void heap_note_bump(uint32_t cap) {
     if (j < 512) { hs_api[j].bytes += cap; hs_api[j].n++; }
 }
 // BLUR_HEAPSITES=1 (needs BLUR_HEAPCHK=1 so every live block is tracked): live guest-heap bytes grouped by allocating API + guest return address, top 14
+static uint32_t *seen_tab; static size_t seen_cap;
+static void hc_seen_reset(void) { size_t need = 1024; while (need < hc_n * 2) need <<= 1; if (need != seen_cap) { free(seen_tab); seen_cap = need; seen_tab = calloc(seen_cap, 4); } else memset(seen_tab, 0, seen_cap * 4); }
+static int hc_seen(uint32_t p) { size_t h = (p * 2654435761u) & (seen_cap - 1); while (seen_tab[h]) { if (seen_tab[h] == p) return 1; h = (h + 1) & (seen_cap - 1); } seen_tab[h] = p; return 0; }
 void heap_sites_report(const char *why) {
     if (!hc_enabled()) return;
     static struct { const char *api; uint32_t ret; uint64_t bytes; uint32_t n; } g[4096]; static int ng; ng = 0; uint64_t tot = 0; uint32_t live = 0;
-    for (size_t i = 0; i < hc_n; i++) { HcEnt *e = &hc_ents[i]; if (!e->p || !hc_ctx || !rd32(hc_ctx, e->p - 12) || rd32(hc_ctx, e->p - 16) != e->size) continue; tot += e->size; live++;
+    hc_seen_reset();
+    for (size_t ii = hc_n; ii-- > 0; ) { size_t i = ii; HcEnt *e = &hc_ents[i]; if (!e->p || !hc_ctx || !rd32(hc_ctx, e->p - 12) || rd32(hc_ctx, e->p - 16) != e->size || hc_seen(e->p)) continue; tot += e->size; live++;
         int k = 0; for (; k < ng; k++) if (g[k].api == e->api && g[k].ret == e->ret) break;
         if (k == ng) { if (ng >= 4096) continue; g[ng].api = e->api; g[ng].ret = e->ret; g[ng].bytes = 0; g[ng].n = 0; ng++; } g[k].bytes += e->size; g[k].n++; }
     extern uint32_t hle_virt_used(void); fprintf(stderr, "[heapsites] %s: heap cursor %u MB, VirtualAlloc window used %u MB, %u live tracked blocks, %llu MB requested; top sites:", why, hc_ctx ? (hc_ctx->heap_next - HEAP_BASE) >> 20 : 0, hle_virt_used() >> 20, live, (unsigned long long)(tot >> 20));
     for (int r = 0; r < 14; r++) { int b = -1; uint64_t bv = 0; for (int k = 0; k < ng; k++) if (g[k].bytes > bv) { bv = g[k].bytes; b = k; } if (b < 0) break;
         fprintf(stderr, " | %s ret=%08x: %u blocks %.1f MB", g[b].api ? g[b].api : "?", g[b].ret, g[b].n, g[b].bytes / 1048576.0); g[b].bytes = 0; }
     fprintf(stderr, "\n");
+    { uint64_t fb = 0; uint32_t fn = 0; for (int i = 0; i < nfree_lists; i++) { fb += (uint64_t)free_lists[i].cap * free_lists[i].n; fn += free_lists[i].n; } fprintf(stderr, "[heapfree] %u free blocks in %d size classes hold %.0f MB (cursor %u MB)\n", fn, nfree_lists, fb / 1048576.0, hc_ctx ? (hc_ctx->heap_next - HEAP_BASE) >> 20 : 0); }
+    { extern void d3d9_leak_report(void); d3d9_leak_report(); }
+    { extern void d3d9_owner_snapshot(void); extern int d3d9_owns_block(uint32_t); d3d9_owner_snapshot();
+      static struct { const char *api; uint32_t ret; uint64_t bytes; uint32_t n; } o[256]; int no = 0; uint64_t ob = 0; uint32_t on = 0;
+      static uint32_t own_cnt[64]; static uint64_t own_bytes[64]; memset(own_cnt, 0, sizeof own_cnt); memset(own_bytes, 0, sizeof own_bytes);
+      hc_seen_reset();
+      for (size_t ii = hc_n; ii-- > 0; ) { size_t i = ii; HcEnt *e = &hc_ents[i]; if (!e->p || !hc_ctx || !rd32(hc_ctx, e->p - 12) || rd32(hc_ctx, e->p - 16) != e->size || hc_seen(e->p)) continue; { int ow = d3d9_owns_block(e->p); if (ow && e->api && !strncmp(e->api, "IDirect3D", 9)) { int t = ow - 1; if (t < 64) { own_cnt[t]++; own_bytes[t] += e->size; } } if (ow) continue; }
+        if (!e->api || strncmp(e->api, "IDirect3D", 9)) continue;      // only D3D allocation sites (HeapAlloc blocks are the game's own)
+        ob += e->size; on++; int k = 0; for (; k < no; k++) if (o[k].api == e->api && o[k].ret == e->ret) break; if (k == no) { if (no >= 256) continue; o[no].api = e->api; o[no].ret = e->ret; o[no].bytes = 0; o[no].n = 0; no++; } o[k].bytes += e->size; o[k].n++; }
+      { static const char *kn[] = {"none","d3d","device","TEXTURE","CUBE","VOLUME","VB","IB","SURFACE","VDECL","VSHADER","PSHADER","QUERY","STATEBLK","SWAPCHAIN"}, *wn[] = {"com-obj","data","code","level-surface"};
+        fprintf(stderr, "[owners] live D3D-site blocks by owner kind/field (blocks, MB):"); for (int t = 0; t < 64; t++) if (own_cnt[t]) { int k = t >> 2; fprintf(stderr, " | %s.%s %u, %.1f", k < 15 ? kn[k] : "?", wn[t & 3], own_cnt[t], own_bytes[t] / 1048576.0); } fprintf(stderr, "\n"); }
+      fprintf(stderr, "[orphans] D3D-allocated live blocks no tracked object references: %u blocks, %.1f MB:", on, ob / 1048576.0);
+      for (int r = 0; r < 6; r++) { int b = -1; uint64_t bv = 0; for (int k = 0; k < no; k++) if (o[k].bytes > bv) { bv = o[k].bytes; b = k; } if (b < 0) break; fprintf(stderr, " | %s ret=%08x: %u blocks %.1f MB", o[b].api, o[b].ret, o[b].n, o[b].bytes / 1048576.0); o[b].bytes = 0; }
+      fprintf(stderr, "\n"); }
 }
 static void heap_report(uint32_t want) {
     uint64_t freeb = 0; for (int i = 0; i < nfree_lists; i++) freeb += (uint64_t)free_lists[i].cap * free_lists[i].n;
@@ -107,11 +125,20 @@ static void heap_report(uint32_t want) {
     for (int k = 0; k < 8; k++) { int b = -1; uint64_t bv = 0; for (int i = 0; i < hs_napi; i++) if (hs_api[i].bytes > bv) { bv = hs_api[i].bytes; b = i; }
         if (b < 0) break; fprintf(stderr, "[heap]  api %-24s %7u allocs, %5llu MB bumped\n", hs_api[b].api, hs_api[b].n, (unsigned long long)(bv >> 20)); hs_api[b].bytes = 0; }
 }
-uint32_t guest_alloc(Ctx *c, uint32_t size) {
+#include <stdatomic.h>
+#include <sched.h>
+static _Atomic int heap_l;      // the guest heap is entered from two API lanes (global lock and the D3D lane): short spin lock
+static inline void heap_lock(void) { for (int sp = 0;; sp++) { int e = 0; if (atomic_compare_exchange_weak_explicit(&heap_l, &e, 1, memory_order_acquire, memory_order_relaxed)) return; if (sp < 3000) CPU_RELAX(); else { sched_yield(); sp = 2000; } } }
+static inline void heap_unlock(void) { atomic_store_explicit(&heap_l, 0, memory_order_release); }
+static uint32_t guest_alloc_nl(Ctx *c, uint32_t size);
+uint32_t guest_alloc(Ctx *c, uint32_t size) { heap_lock(); uint32_t r = guest_alloc_nl(c, size); heap_unlock(); return r; }
+static uint32_t guest_alloc_nl(Ctx *c, uint32_t size) {
     if (size > 0x7f000000u) { strict_log("guest_alloc", "request > 2 GB (rounding would wrap)", size, 0); return 0; }
     uint32_t rsize = hc_enabled() ? size + HC_PAD : size;
     uint32_t cap = heap_class_size(rsize ? rsize : 1), p; FreeList *fl = freelist_for(cap, 0);
     if (fl && fl->n) p = fl->v[--fl->n];
+    else if (({ FreeList *bf = NULL; uint32_t lim = cap + cap / 4; for (int i = 0; i < nfree_lists; i++) if (free_lists[i].n && free_lists[i].cap > cap && free_lists[i].cap <= lim && (!bf || free_lists[i].cap < bf->cap)) bf = &free_lists[i];
+                bf ? (p = bf->v[--bf->n], cap = bf->cap, 1) : 0; })) { /* reused a free block up to 25% larger instead of growing the heap (the block keeps its own capacity) */ }
     else {
         if (cap > HEAP_SIZE || c->heap_next + cap + 16 > HEAP_BASE + HEAP_SIZE) {
             // The bump region is full. Memory freed in other size classes is unusable by exact-class lookup (a game session frees tens of MB of textures in classes
@@ -131,7 +158,9 @@ have_block: ;
     }
     return p;
 }
-void guest_free(Ctx *c, uint32_t p) {
+static void guest_free_nl(Ctx *c, uint32_t p);
+void guest_free(Ctx *c, uint32_t p) { heap_lock(); guest_free_nl(c, p); heap_unlock(); }
+static void guest_free_nl(Ctx *c, uint32_t p) {
     if (!p || p < HEAP_BASE + 16 || p >= HEAP_BASE + HEAP_SIZE) return;
     { static int nf = -1; if (nf < 0) nf = getenv("BLUR_NOFREE") != NULL; if (nf) return; }      // debugging: never reuse memory (finds use-after-free)
     uint32_t cap = rd32(c, p - 12); if (!cap) return;                 // double free / foreign pointer

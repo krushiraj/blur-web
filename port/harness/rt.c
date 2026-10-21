@@ -1,13 +1,15 @@
 // Runtime for the statically recompiled game code: API dispatch into the Win32/D3D9 handlers, guest threads on host threads
 // (one runs at a time, hand-off at blocking calls, like the cooperative scheduler it replaces), CPUID/RDTSC.
-#include <dispatch/dispatch.h>
+#include "plat.h"
 #include <stdatomic.h>
 #include <sched.h>
 #include "emu.h"
 #include "../recomp/rt.h"
 #include <unistd.h>
+#ifndef _WIN32
 #include <execinfo.h>
 #include <sys/mman.h>
+#endif
 #include "apilog.h"
 #include "snap.h"
 void snapshot_write(Ctx *c, const char *dir, uint32_t oep);
@@ -25,7 +27,7 @@ static Ctx *C;
 int rt_trace;
 void rt_enter(Cpu *c, uint32_t addr) {
     if (ring_on) { int t = C->cur; uint32_t i = ring_i[t]++ & (RING_N - 1); ring_a[t][i] = addr; ring_s[t][i] = c->esp; return; }
-    static uint64_t n; if (n++ < (getenv("RT_TRACE_MAX") ? strtoull(getenv("RT_TRACE_MAX"), 0, 0) : 2000)) fprintf(stderr, "[fn] %08x esp=%08x eax=%08x esi=%08x\n", addr, c->esp, c->eax, c->esi);
+    static uint64_t n; if (n++ < (getenv("RT_TRACE_MAX") ? strtoull(getenv("RT_TRACE_MAX"), 0, 0) : 2000)) { static int full = -1; if (full < 0) full = getenv("RT_TRACE_FULL") != NULL; if (full) fprintf(stderr, "[fn] %08x esp=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x ebp=%08x esi=%08x edi=%08x fl=%d%d%d%d%d [esp]=%08x\n", addr, c->esp, c->eax, c->ecx, c->edx, c->ebx, c->ebp, c->esi, c->edi, c->fl.cf, c->fl.pf, c->fl.zf, c->fl.sf, c->fl.of, M32(c->esp)); else fprintf(stderr, "[fn] %08x esp=%08x eax=%08x esi=%08x\n", addr, c->esp, c->eax, c->esi); }
 }
 static GuestFn *htab; static uint32_t *hkey; static uint32_t hmask;
 
@@ -132,7 +134,12 @@ static void coro_switch(void **save, void *to) { (void)save; (void)to; abort(); 
 static void thread_body(int idx);
 static void coro_tramp(void) { thread_body(coro_start_idx); __builtin_trap(); }
 static void coro_prepare(int idx) {
-    size_t sz = 16u << 20; uint8_t *st = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (st == MAP_FAILED) { perror("coro stack"); exit(1); }
+    size_t sz = 16u << 20;
+#ifdef _WIN32
+    uint8_t *st = NULL; { perror("coro stack unsupported on Windows"); exit(1); }
+#else
+    uint8_t *st = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (st == MAP_FAILED) { perror("coro stack"); exit(1); }
+#endif
     uint64_t *sp = (uint64_t *)(st + sz - 176); memset(sp, 0, 176); sp[11] = (uint64_t)(uintptr_t)coro_tramp; coro_sp[idx] = sp;     // x30 slot: the first `ret` enters the trampoline
 }
 static void wait_turn(Ctx *c, int idx) { pthread_mutex_lock(&bm); while (c->cur != idx) pthread_cond_wait(&bcv[idx], &bm); pthread_mutex_unlock(&bm); }
@@ -163,9 +170,14 @@ static uint64_t last_prog; static int idle_n; static uint64_t idle_since;
 int par_mode;
 // The API lock is a spin-then-yield lock: critical sections are a few hundred ns, and a pthread mutex under contention cost ~26% of the render thread's time in kernel
 // wait/wake (psynch_mutexwait/mutexdrop).  Blocked threads park on a per-thread semaphore (a post that arrives before the wait is not lost).
-static _Atomic int par_l; static dispatch_semaphore_t par_sem[MAX_THREADS]; static __thread int t_idx = -1;
-static inline void par_lock_acq(void) { for (int spins = 0;; spins++) { int exp = 0; if (atomic_compare_exchange_weak_explicit(&par_l, &exp, 1, memory_order_acquire, memory_order_relaxed)) return; if (spins < 3000) __asm__ volatile("yield"); else { sched_yield(); spins = 2000; } } }
+static _Atomic int par_l; static plat_sem par_sem[MAX_THREADS]; static __thread int t_idx = -1;
+static inline void par_lock_acq(void) { for (int spins = 0;; spins++) { int exp = 0; if (atomic_compare_exchange_weak_explicit(&par_l, &exp, 1, memory_order_acquire, memory_order_relaxed)) return; if (spins < 3000) CPU_RELAX(); else { sched_yield(); spins = 2000; } } }
 static inline void par_lock_rel(void) { atomic_store_explicit(&par_l, 0, memory_order_release); }
+// D3D lane: graphics calls (IDirect3D*, D3DX*) are ~60k per crowded frame, nearly all from the render thread. They take only this lock (contended solely by other graphics callers
+// such as the texture-creation jobs) and a lean call path, instead of the global API lock; the guest heap has its own lock (hostcommon.c). Present keeps the global lock for its pacing wait.
+static _Atomic int d3d_l;
+static inline void d3d_lock_acq(void) { for (int spins = 0;; spins++) { int exp = 0; if (atomic_compare_exchange_weak_explicit(&d3d_l, &exp, 1, memory_order_acquire, memory_order_relaxed)) return; if (spins < 3000) CPU_RELAX(); else { sched_yield(); spins = 2000; } } }
+static inline void d3d_lock_rel(void) { atomic_store_explicit(&d3d_l, 0, memory_order_release); }
 static uint8_t par_flag[STUB_SLOTS];            // 0 unknown, 1 plain, 2 may unblock waiters, 4 may start threads (|)
 static __thread int t_depth;
 static uint64_t par_lockwait_ns[MAX_THREADS], par_parked_ns[MAX_THREADS], par_held_ns[MAX_THREADS], par_acq_t[MAX_THREADS]; static int par_stat = -1;
@@ -178,7 +190,7 @@ extern uint64_t g_sched_now;
 static void par_wake(Ctx *c) {
     g_sched_now = 0; { int any = 0; for (int i = 0; i < c->nthreads; i++) if (i != t_idx && c->threads[i].par_waiting) { any = 1; break; } if (!any) return; }
     uint64_t now = now_us(); g_sched_now = now;       // one clock read for the whole scan
-    for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (i != t_idx && t->used && !t->done && t->par_waiting && ((!t->wk && t->wake_at) ? now >= t->wake_at : thread_can_run(c, t))) { t->par_waiting = 0; dispatch_semaphore_signal(par_sem[i]); } }
+    for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; if (i != t_idx && t->used && !t->done && t->par_waiting && ((!t->wk && t->wake_at) ? now >= t->wake_at : thread_can_run(c, t))) { t->par_waiting = 0; plat_sem_post(&par_sem[i]); } }
     g_sched_now = 0;
 }
 static void *par_thread_main(void *arg);
@@ -193,7 +205,7 @@ static void par_wait(Ctx *c) {             // called with par_lock held, from in
     uint64_t wait_us = 2000;
     if (t->wake_at) { uint64_t n = now_us(); if (t->wake_at <= n) return; if (t->wake_at - n < wait_us) wait_us = t->wake_at - n; }
     uint64_t pw0 = par_stat > 0 ? real_us() : 0; if (par_stat > 0) par_held_ns[self] += pw0 - par_acq_t[self];
-    t->par_waiting = 1; par_lock_rel(); int rc = dispatch_semaphore_wait(par_sem[self], dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_us * 1000)); par_lock_acq(); t->par_waiting = 0; c->cur = self; if (par_stat > 0) { uint64_t n = real_us(); par_parked_ns[self] += n - pw0; par_acq_t[self] = n; }
+    t->par_waiting = 1; par_lock_rel(); int rc = plat_sem_wait_us(&par_sem[self], (int64_t)wait_us); par_lock_acq(); t->par_waiting = 0; c->cur = self; if (par_stat > 0) { uint64_t n = real_us(); par_parked_ns[self] += n - pw0; par_acq_t[self] = n; }
     { static int on = -1; if (on < 0) on = getenv("BLUR_PARSTAT") != NULL;
       if (on) { static struct { int t; const char *api; uint8_t wk; uint64_t sig, to, us; } h[96]; static int nh; static uint64_t last; int k = 0; uint64_t dur = real_us() - pw0;
         for (; k < nh; k++) if (h[k].t == self && h[k].api == t->last_api && h[k].wk == t->wk) break;
@@ -208,7 +220,9 @@ static void par_flags_for(const Stub *s, int idx) {
     // (graphics/input/clock/TLS calls: ~60% of all calls).  par_wake costs one thread_can_run() per parked thread.
     static const char *quiet[] = { "IDirect3D", "IDirectInput", "D3DX", "XInput", "QueryPerformanceCounter", "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue", "GetCurrentThreadId", "GetTickCount", "timeGetTime", "FlsGetValue", "FlsSetValue", "HeapAlloc", "HeapFree", "HeapSize", "GetProcessHeap", "EnterCriticalSection", "TryEnterCriticalSection", "Interlocked", "Sleep", "WaitForSingleObject", "WaitForMultipleObjects", "IDirectSoundBuffer8", "GetCurrentProcess", "GetCurrentThread", "GetModuleHandle", "GetProcAddress", "QueryPerformanceFrequency", "GetSystemTimeAsFileTime", "MultiByteToWideChar", "WideCharToMultiByte", "lstrlen", "EncodePointer", "DecodePointer", NULL };    // none of these can make another thread's wait satisfiable (acquiring/ sleeping/ polling only)
     uint8_t f = 1 | 2; for (int i = 0; quiet[i]; i++) if (!strncmp(s->name, quiet[i], strlen(quiet[i]))) f = 1;
-    if (!strcmp(s->name, "CreateThread") || !strcmp(s->name, "ResumeThread")) f |= 4; par_flag[idx] = f;
+    if (!strcmp(s->name, "CreateThread") || !strcmp(s->name, "ResumeThread")) f |= 4;
+    if (!strncmp(s->name, "IDirect3D", 9) || !strncmp(s->name, "D3DX", 4) || !strcmp(s->name, "Direct3DCreate9")) { f |= 8; if (!strcmp(s->name, "IDirect3DDevice9::Present")) f |= 16; }      // 8: D3D lane, 16: needs the global lane (pacing wait)
+    par_flag[idx] = f;
 }
 
 static void rt_yield(Ctx *c) {
@@ -263,6 +277,10 @@ void rt_unsupported(Cpu *cpu, uint32_t a, const char *w) { (void)cpu; fprintf(st
 
 // ---- diagnostic write watch: BLUR_WATCHW=<hexaddr>-<hexaddr>  logs which recompiled guest function writes into the range (first 40 hits) ----------------------
 #include <signal.h>
+#ifdef _WIN32
+void ww_rearm(void) {}
+void ww_arm(void) {}      // BLUR_WATCHW / BLUR_WATCHR diagnostics (SIGSEGV + mprotect) are not available on Windows
+#else
 #include <dlfcn.h>
 #include <sys/mman.h>
 static uint32_t ww_lo, ww_hi; static int ww_hits, ww_prot = PROT_READ;
@@ -285,6 +303,7 @@ void ww_arm(void) {
     uint32_t lo = ww_lo & ~0x3fffu, hi = (ww_hi + 0x3fff) & ~0x3fffu; mprotect(G + lo, hi - lo, ww_prot);
     fprintf(stderr, "[watchw] armed %08x-%08x\n", ww_lo, ww_hi);
 }
+#endif
 // ---- API dispatch ------------------------------------------------------------------------------------------------------------
 uint32_t g_api_ret, g_api_esp;
 // BLUR_ARGREC=<frame>: per API stub call counts + the first 6 distinct (caller, args) tuples, dumped to stderr when that frame is presented
@@ -318,6 +337,7 @@ static struct { const char *api; uint32_t us; } fs_top[6]; static uint64_t fs_ap
 static void fs_note(const char *api, uint64_t d) { fs_api_us += d; fs_ncalls++; int w = 0; for (int i = 1; i < 6; i++) if (fs_top[i].us < fs_top[w].us) w = i; if (d > fs_top[w].us) { fs_top[w].api = api; fs_top[w].us = (uint32_t)d; } }
 static int fs_cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
 static void framestat(void) {
+    { static int hs = -1; if (hs < 0) hs = getenv("BLUR_HEAPSITES") != NULL; static uint64_t hl; if (hs) { uint64_t nw = real_us(); if (nw - hl > 30000000ull) { hl = nw; extern void heap_sites_report(const char *); heap_sites_report("periodic"); } } }
     static int on = -1; if (on < 0) on = getenv("BLUR_FRAMESTAT") != NULL; if (!on) return;
     static uint64_t last, t10; static uint32_t dts[4096]; static int n; uint64_t now = real_us();
     if (last && n < 4096) dts[n++] = (uint32_t)(now - last);
@@ -375,7 +395,8 @@ static uint32_t rt_api_locked(Cpu *cpu, uint32_t addr) {
     for (;;) {
         if (c->verbose) fprintf(stderr, "[api t%d] %s!%s(%08x,%08x,%08x,%08x) ret=%08x esp=%08x\n", c->cur, s->dll, s->name, a[0], a[1], a[2], a[3], ret, esp);
         cur_thread(c)->wk = 0;
-        g_api_ret = ret; g_api_esp = esp; g_cur_api = s->name; g_det_ticks++; apilog_call(c->cur, s->name, a); argrec_note(s, ret, a); { Thread *tt = cur_thread(c); tt->last_api = s->name; tt->last_ret = ret; tt->last_a0 = a[0]; tt->last_a1 = a[1]; tt->n_api++; } s->calls++; r = s->fn(c, a);
+        g_api_ret = ret; g_api_esp = esp; g_cur_api = s->name; g_det_ticks++; apilog_call(c->cur, s->name, a); argrec_note(s, ret, a); { Thread *tt = cur_thread(c); tt->last_api = s->name; tt->last_ret = ret; tt->last_a0 = a[0]; tt->last_a1 = a[1]; tt->n_api++; } s->calls++;
+        if (par_mode && (par_flag[s - c->stubs] & 8)) { d3d_lock_acq(); r = s->fn(c, a); d3d_lock_rel(); } else r = s->fn(c, a);
         if (c->exited) finish_process(c);
         if (!c->block) break;
         c->block = 0; cur_thread(c)->blocked = 1; rt_yield(c);
@@ -397,6 +418,14 @@ static uint32_t rt_api_locked(Cpu *cpu, uint32_t addr) {
     if (c->yield_req) { c->yield_req = 0; rt_yield(c); }
     else if (c->api_slice && ++c->api_since_switch >= c->api_slice) { c->api_since_switch = 0; rt_yield(c); }
     return next;
+}
+static uint32_t rt_api_d3d(Cpu *cpu, int si) {          // lean call path for graphics stubs (see the D3D lane note above)
+    Ctx *c = C; Stub *s = &c->stubs[si];
+    uint32_t esp = cpu->esp, ret = M32(esp), a[16]; memcpy(a, G + esp + 4, sizeof a);
+    g_api_ret = ret; g_api_esp = esp; g_cur_api = s->name;
+    d3d_lock_acq(); uint32_t r = s->fn(c, a); d3d_lock_rel();
+    cpu->eax = r; cpu->esp = esp + 4 + (s->cdecl_ ? 0 : 4 * (uint32_t)s->nargs);
+    return ret;
 }
 static uint32_t rt_api(Cpu *cpu, uint32_t addr) {
     if (!par_mode) return rt_api_locked(cpu, addr);
@@ -447,7 +476,11 @@ static void seed_account(void) {       // BLUR_SEEDACCT=1: give the primary prof
     uint32_t prof = 0x1212180u + 0x10 + (uint32_t)idx * 0x2100u; const char *nm = "BlurPlayer", *pw = "blurpass1";
     for (int k = 0; ; k++) { *(uint16_t *)(G + prof + 0xff9 + 2 * k) = (uint8_t)nm[k]; if (!nm[k]) break; } for (int k = 0; ; k++) { *(uint16_t *)(G + prof + 0x1019 + 2 * k) = (uint8_t)pw[k]; if (!pw[k]) break; }
     fprintf(stderr, "[seed] account name/password written into profile %08x\n", prof); }
-static void lua_check(Cpu *cpu, uint32_t pc) { for (int i = 0; i < nlua; i++) if (lua_b[i].a == pc) { lua_b[i].n++; if (lua_b[i].n == 1) { lua_b[i].first = (long)g_frames_pub; lua_b[i].first_t = (double)real_us() / 1e6; } if (!strcmp(lua_b[i].name, "ReadOnlineAccountDetails") && !(getenv("BLUR_SEEDACCT") && getenv("BLUR_SEEDACCT")[0] == '0')) seed_account(); static uint64_t t0; uint64_t t = real_us(); if (!t0) t0 = t;
+static void clear_account(void) {      // BLUR_SEEDACCT=clear: blank the stored online-account name/password (profile+0xff9 / +0x1019) so the Online Account dialog opens empty
+    int32_t idx = *(int32_t *)(G + 0x10e5874); if (idx < 0 || idx >= 7) return;
+    uint32_t prof = 0x1212180u + 0x10 + (uint32_t)idx * 0x2100u; memset(G + prof + 0xff9, 0, 0x20); memset(G + prof + 0x1019, 0, 0x20);
+    static int once; if (!once) { once = 1; fprintf(stderr, "[seed] account name/password cleared in profile %08x\n", prof); } }
+static void lua_check(Cpu *cpu, uint32_t pc) { for (int i = 0; i < nlua; i++) if (lua_b[i].a == pc) { lua_b[i].n++; if (lua_b[i].n == 1) { lua_b[i].first = (long)g_frames_pub; lua_b[i].first_t = (double)real_us() / 1e6; } if (!strcmp(lua_b[i].name, "ReadOnlineAccountDetails") && !(getenv("BLUR_SEEDACCT") && getenv("BLUR_SEEDACCT")[0] == '0')) { if (getenv("BLUR_SEEDACCT") && !strcmp(getenv("BLUR_SEEDACCT"), "clear")) clear_account(); else seed_account(); } static uint64_t t0; uint64_t t = real_us(); if (!t0) t0 = t;
     if (!lua_quiet && (lua_b[i].n <= 40 || (lua_b[i].n & (lua_b[i].n - 1)) == 0)) fprintf(stderr, "[lua] %s #%u frame=%llu t=%llums thread=%d L=%08x\n", lua_b[i].name, lua_b[i].n, (unsigned long long)g_frames_pub, (unsigned long long)((t - t0) / 1000), C->cur, M32(cpu->esp + 4)); return; } }
 static struct { uint32_t pc, ret, a[4]; int t; } hook_ring[128]; static unsigned hook_n;    // BLUR_HOOK_TAIL=1: keep the last 128 entries, dumped when the run dies on a missing target
 static void hook_dump(void) { for (unsigned i = hook_n > 128 ? hook_n - 128 : 0; i < hook_n; i++) { typeof(hook_ring[0]) *e = &hook_ring[i & 127]; fprintf(stderr, "[hooktail] %08x t%d ret=%08x args %08x %08x %08x %08x\n", e->pc, e->t, e->ret, e->a[0], e->a[1], e->a[2], e->a[3]); } }
@@ -490,6 +523,9 @@ void rt_dispatch(Cpu *cpu) {
                 if (__builtin_expect(g_prof != 0, 0)) prof_dispatch++;
                 if (nhook < 0) hook_init();
                 if (hook_user) hook_check(cpu, pc);          // BLUR_HOOK may name stub addresses
+                if (par_mode) { int si = (int)((pc - STUB_BASE) >> 4); uint8_t f = par_flag[si]; if (!f) { par_flags_for(&C->stubs[si], si); f = par_flag[si]; }
+                    static int lane_on = -1; if (lane_on < 0) lane_on = getenv("BLUR_D3DLANE") != NULL && atoi(getenv("BLUR_D3DLANE")) != 0;      // opt-in: no measurable gain in the scripted race (A/B p95 17.4 vs 17.5 ms)
+                    if (lane_on && (f & 8) && !(f & 16) && C->stubs[si].fn && !C->stubs[si].raw) { cpu->pc = rt_api_d3d(cpu, si); continue; } }
                 cpu->pc = rt_api(cpu, pc); continue; }
             FEnt *e = &ftab[(pc * 2654435761u) >> fshift];
             while (e->k && e->k != pc) e++;
@@ -542,23 +578,34 @@ static void *par_thread_main(void *arg) { t_idx = (int)(intptr_t)arg; thread_bod
 // Spin diagnosis: a guest loop that stays inside one lifted function never reaches a scheduler check, so the stale Cpu snapshot below says nothing about it. The watchdog
 // therefore signals the host thread running the guest (SIGUSR2) and the handler prints the host PC with its symbol (f_<guest address> = the lifted function that spins).
 #include <pthread.h>
-#include <dispatch/dispatch.h>
 #include <stdatomic.h>
 static pthread_t g_main_thr; static volatile int g_spin_dumped;
+#ifndef _WIN32
 static void spin_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_; uintptr_t pc = 0, sp = 0;
-#if defined(__aarch64__)
+#if defined(__APPLE__) && defined(__aarch64__)
     pc = (uintptr_t)uc->uc_mcontext->__ss.__pc; sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
-#elif defined(__x86_64__)
+#elif defined(__APPLE__) && defined(__x86_64__)
     pc = (uintptr_t)uc->uc_mcontext->__ss.__rip; sp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+#elif defined(__linux__) && defined(__aarch64__)
+    pc = (uintptr_t)uc->uc_mcontext.pc; sp = (uintptr_t)uc->uc_mcontext.sp;
+#elif defined(__linux__) && defined(__x86_64__)
+    pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]; sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
 #endif
     Dl_info di; const char *nm = "?"; uintptr_t off = 0; if (pc && dladdr((void *)pc, &di) && di.dli_sname) { nm = di.dli_sname; off = pc - (uintptr_t)di.dli_saddr; }
     fprintf(stderr, "[spin] host pc=%p sp=%p in %s+0x%lx (guest function f_<addr> = the lifted function the guest thread is spinning in)\n", (void *)pc, (void *)sp, nm, (unsigned long)off); g_spin_dumped = 1;
 }
+#endif
 static void *watchdog(void *arg) {
     Ctx *c = arg; uint64_t last = 0; int still = 0;
     for (;;) { sleep(2); uint64_t now = g_switches + c->api_progress; if (now == last) { if (++still >= 2) { fprintf(stderr, "[watchdog] no scheduling progress; cur=%d nthreads=%d\n", c->cur, c->nthreads);
-            if (!g_spin_dumped) { pthread_kill(g_main_thr, SIGUSR2); for (int w = 0; w < 50 && !g_spin_dumped; w++) usleep(20000); g_spin_dumped = 0; }
+            if (!g_spin_dumped) { 
+#ifndef _WIN32
+pthread_kill(g_main_thr, SIGUSR2);
+#else
+g_spin_dumped = 1;
+#endif
+for (int w = 0; w < 50 && !g_spin_dumped; w++) usleep(20000); g_spin_dumped = 0; }
             { Thread *ct = &c->threads[c->cur]; Cpu *cp = ct->cpu; if (cp) { fprintf(stderr, "[watchdog] thread %d last Cpu snapshot: pc=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x last_api=%s\n", c->cur, cp->pc, cp->eax, cp->ecx, cp->edx, cp->ebx, cp->esp, cp->ebp, cp->esi, cp->edi, ct->last_api ? ct->last_api : "-");
                 fprintf(stderr, "[watchdog] stack:"); for (int k = 0; k < 24; k++) fprintf(stderr, " %08x", M32(cp->esp + 4 * k)); fprintf(stderr, "\n"); if (cp->esi > 0x10000) { for (int k = 0; k < c->nthreads; k++) { Thread *t = &c->threads[k]; if (t->used) fprintf(stderr, "[watchdog] thread %2d %s%s%s apis=%u last=%s(%08x,%08x) ret=%08x\n", k, t->done ? "done " : "", t->suspended ? "susp " : "", t->blocked ? "blocked " : "", t->n_api, t->last_api ? t->last_api : "-", t->last_a0, t->last_a1, t->last_ret); }
                 fprintf(stderr, "[watchdog] [esi]:"); for (int k = 0; k < 40; k++) fprintf(stderr, " %08x", M32(cp->esi + 4 * k)); fprintf(stderr, "\n"); uint32_t n = M32(cp->esi + 0x44); fprintf(stderr, "[watchdog] list from [esi+0x44]:"); for (int k = 0; k < 12; k++) { fprintf(stderr, " %08x", n); if (n < 0x1000) break; n = M32(n + 4); } fprintf(stderr, "\n"); } } } for (int i = 0; i < c->nthreads; i++) { Thread *t = &c->threads[i]; fprintf(stderr, "  #%d used=%d done=%d susp=%d blocked=%d started=%d\n", i, t->used, t->done, t->suspended, t->blocked, t->rt_started); } still = 0; if (getenv("BLUR_HANGEXIT")) { hle_sync_report(c); fprintf(stderr, "[watchdog] BLUR_HANGEXIT: exiting\n"); fflush(stderr); _exit(8); } } } else still = 0; last = now; }
@@ -567,21 +614,28 @@ static void *watchdog(void *arg) {
 
 void rt_main(Ctx *c) {
     C = c;
+    if (getenv("BLUR_DUMPMEM")) { FILE *df = fopen(getenv("BLUR_DUMPMEM"), "wb"); if (df) { extern uint8_t *G; fwrite(G + 0x400000, 1, 0x1c70000, df); fclose(df); fprintf(stderr, "[dump] guest 0x400000+0x1c70000 -> %s\n", getenv("BLUR_DUMPMEM")); } }
     if (getenv("BLUR_DET")) { g_det_step = atof(getenv("BLUR_DET")); g_time_base = 0; g_det_on = 1; g_det_ticks = 0; audio_clock_us = now_us; fprintf(stderr, "[det] deterministic clock: %g us per API call\n", g_det_step); }
     prof_init(); if (nhook < 0) hook_init(); build_table(); build_fast(); cov_init(); ring_on = getenv("BLUR_RING") != NULL; rt_trace = getenv("RT_TRACE") != NULL || ring_on; cont_addr = cont_stub_addr(c);
     if (getenv("BLUR_SCHED_NOFILTER")) sched_filter = 0;
 #if defined(__aarch64__)
     coro_mode = !getenv("BLUR_NOCORO");
 #endif
-    par_mode = getenv("BLUR_PAR") != NULL && atoi(getenv("BLUR_PAR")) != 0; if (par_mode) { coro_mode = 0; t_idx = 0; fprintf(stderr, "[par] parallel guest threads: one host thread per guest thread, API handlers serialised by a global lock\n"); }
+    par_mode = getenv("BLUR_PAR") != NULL && atoi(getenv("BLUR_PAR")) != 0;
+#ifdef BLUR_NO_BUDGET
+    if (!par_mode) { fprintf(stderr, "[rt] this build's lifted code has no preemption points (built for parallel guest threads): set BLUR_PAR=1, or run ./blurrt_coop for the single-threaded scheduler\n"); exit(2); }
+#endif
+    if (par_mode) { coro_mode = 0; t_idx = 0; fprintf(stderr, "[par] parallel guest threads: one host thread per guest thread, API handlers serialised by a global lock\n"); }
     rt_slow = cov_on > 0 || getenv("BLUR_PROFCNT") || getenv("BLUR_HOOK") || getenv("BLUR_POKE") || getenv("BLUR_PCPROF") || getenv("BLUR_PCCOUNT") || getenv("BLUR_LUATRACE") || getenv("BLUR_SLOWDISP");
     if (getenv("BLUR_DUMP_OEP")) { Module *m = find_module(c, "Blur.exe"); FILE *f = fopen(getenv("BLUR_DUMP_OEP"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] exe image at OEP: base=%08x size=%x\n", m->base, m->size); } exit(0); }
     if (getenv("BLUR_DUMP_MSV")) { Module *m = find_module(c, "msvcr90.dll"); FILE *f = fopen(getenv("BLUR_DUMP_MSV"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] msvcr90 base=%08x size=%x\n", m->base, m->size); } exit(0); }
     if (getenv("BLUR_SECONDS")) t_end = real_us() + (uint64_t)atof(getenv("BLUR_SECONDS")) * 1000000ull;
     c->api_slice = getenv("BLUR_API_SLICE") ? (uint32_t)atoi(getenv("BLUR_API_SLICE")) : 300;   // was 50: every forced yield is a scheduler pass (pick_next over all threads)
     for (int i = 0; i < MAX_THREADS; i++) pthread_cond_init(&bcv[i], NULL);
-    for (int i = 0; i < MAX_THREADS; i++) par_sem[i] = dispatch_semaphore_create(0);
+    for (int i = 0; i < MAX_THREADS; i++) plat_sem_init(&par_sem[i]);
+    #ifndef _WIN32
     { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = spin_sig; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGUSR2, &sa, NULL); g_main_thr = pthread_self(); }
+#endif
     { pthread_t wd; pthread_create(&wd, NULL, watchdog, c); pthread_detach(wd); }
     if (!getenv("BLUR_WATCHW_AFTER_FRAME1")) ww_arm();
     fprintf(stderr, "[rt] %u recompiled functions; entering the game at %08x on the recompiled path\n", rt_table_n, g_oep_addr);
