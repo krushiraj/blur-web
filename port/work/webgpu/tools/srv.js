@@ -1,0 +1,3 @@
+const http=require('http'),fs=require('fs'),path=require('path');
+const roots=process.argv.slice(3);const port=+process.argv[2];
+http.createServer((q,r)=>{const u=decodeURIComponent(q.url.split('?')[0]);for(const root of roots){const p=path.join(root,u==='/'?'/index.html':u);if(p.startsWith(root)&&fs.existsSync(p)&&fs.statSync(p).isFile()){const ext=path.extname(p);r.writeHead(200,{'content-type':{'.html':'text/html','.js':'text/javascript','.json':'application/json'}[ext]||'application/octet-stream'});return fs.createReadStream(p).pipe(r);}}r.writeHead(404);r.end();}).listen(port,'127.0.0.1');

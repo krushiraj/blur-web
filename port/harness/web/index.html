@@ -7,28 +7,64 @@
   #bar{padding:6px 12px;display:flex;gap:16px;align-items:center;background:#15151a;border-bottom:1px solid #26262e}
   #bar b{color:#fff} #status.ok{color:#7ddf8a} #status.bad{color:#ff8080}
   #stage{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
+  canvas:focus,canvas:focus-visible{outline:none}
+  body.idle-cursor,body.idle-cursor canvas{cursor:none}
   canvas{max-width:100%;max-height:100%;aspect-ratio:16/9;background:#000;image-rendering:auto}
-  :fullscreen #bar,:fullscreen #log{display:none} :fullscreen #stage{width:100vw;height:100vh} :fullscreen canvas{width:100vw;height:100vh;max-width:none;max-height:none;aspect-ratio:auto;object-fit:contain}
+  body.hide-bar #bar{display:none} body.hide-log #log{display:none}
+  #ui{position:relative;display:flex;gap:6px;align-items:flex-start;justify-content:flex-end;padding:4px 12px;background:#101014;border-bottom:1px solid #26262e}
+  :fullscreen #ui{position:fixed;top:8px;right:12px;z-index:50;background:none;border:0;padding:0;opacity:.3;transition:opacity .2s} :fullscreen #ui:hover,:fullscreen #ui.open{opacity:1}
+  #ui button{background:#1d1d24cc;color:#e6e6ee;border:1px solid #3a3a46;border-radius:6px;padding:5px 10px;font:12px/1.2 ui-monospace,Menlo,monospace;cursor:pointer} #ui button:hover{background:#2b2b36}
+  #menu{display:none;position:absolute;top:100%;right:12px;z-index:60;min-width:190px;background:#15151ae6;border:1px solid #3a3a46;border-radius:8px;padding:8px 10px;flex-direction:column;gap:6px} #ui.open #menu{display:flex}
+  #menu label{display:flex;gap:8px;align-items:center;cursor:pointer;color:#d8d8e2;white-space:nowrap} #menu .hint{color:#8a8a98;font-size:11px;margin-top:2px}
+  :fullscreen #bar,:fullscreen #log{display:none} :fullscreen #stage{width:100vw;height:100vh} :fullscreen #c{width:100vw;height:100vh;max-width:none;max-height:none;aspect-ratio:auto;object-fit:cover}
+  body.fit-contain:fullscreen #c,:fullscreen body.fit-contain #c{object-fit:contain} body.fit-fill #c{object-fit:fill}
   #log{max-height:22vh;overflow:auto;padding:6px 12px;background:#101014;border-top:1px solid #26262e;white-space:pre-wrap;color:#9a9aa8}
 </style></head><body>
 <div id="wrap">
   <div id="bar"><b>Blur on WebGL2</b><span id="status" class="bad">connecting…</span><span id="inputmode" title="what the game sees as its input device">input: keyboard</span><span id="fps"></span><span id="stats"></span></div>
+  <div id="ui"><button id="fsbtn" title="Fullscreen (F11 or double-click the picture)">⛶ Fullscreen</button><button id="menubtn" title="Show / hide panels">☰ Panels</button>
+    <div id="menu"><label><input type="checkbox" autocomplete="off" id="cb-bar" checked> Status bar</label><label><input type="checkbox" autocomplete="off" id="cb-log"> Log</label><label><input type="checkbox" autocomplete="off" id="cb-hud"> Frame-time HUD (F2)</label><div class="hint">F11 / double-click = fullscreen</div></div></div>
   <div id="stage"><canvas id="c" width="1280" height="720" tabindex="0"></canvas></div>
   <div id="log"></div>
 </div>
 <script src="renderer.js"></script>
-<script>
-  const canvas = document.getElementById('c'), statusEl = document.getElementById('status'), logEl = document.getElementById('log');
+<script src="hcache.js"></script>
+<script>(async () => {
+  let canvas = document.getElementById('c'); const statusEl = document.getElementById('status'), logEl = document.getElementById('log');
   const log = (m) => { logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; };
-  const r = new D3D9Renderer(canvas, log); window.__r = r; r.sendInput = (t, a, b, c, d) => send(t, a, b, c, d);
+  // #gpu=1: WebGPU renderer (renderer_gpu.js + the offline WGSL pack); any failure (no navigator.gpu / adapter / texture-compression-bc, init error, later device loss) falls back to WebGL2
+  const noteEl = document.createElement('span'); noteEl.id = 'gpunote'; noteEl.style.cssText = 'margin-left:8px;color:#e9b44c'; document.getElementById('bar').appendChild(noteEl);
+  const note = (m) => { noteEl.textContent = m; };
+  const loadScript = (src) => new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('cannot load ' + src)); document.head.appendChild(el); });
+  async function makeRenderer() {
+    let why = ''; try { why = sessionStorage.getItem('blur.gpufail') || ''; sessionStorage.removeItem('blur.gpufail'); } catch (e) {}
+    if (why) { console.warn('[gpu] WebGPU lost earlier, running WebGL2: ' + why); note('WebGPU lost (' + why.slice(0, 80) + '): WebGL2'); }
+    if (/gpu=1/.test(location.hash) && !why) {
+      let g = null;
+      try {
+        if (!navigator.gpu) throw new Error('navigator.gpu is missing (WebGPU needs a secure context: https or localhost)');
+        await Promise.all([loadScript('wgslpack.js'), loadScript('renderer_gpu.js')]);
+        g = new D3D9GpuRenderer(canvas, log); await g.init({ packUrl: 'blur.wgslpack.gz', requireBC: true });
+        g.onLost = (info) => { console.warn('[gpu] device lost, reloading with WebGL2: ' + info.message); try { sessionStorage.setItem('blur.gpufail', 'device lost: ' + info.message); } catch (e) {} location.hash = location.hash.replace(/gpu=1/, 'gpu=0'); location.reload(); };
+        g.loadWarm('gpu-warm.json'); document.querySelector('#bar b').textContent = 'Blur on WebGPU'; return g;
+      } catch (e) {
+        console.warn('[gpu] WebGPU renderer unavailable, using WebGL2:', e); note('WebGPU unavailable (' + String(e.message || e).slice(0, 90) + '): using WebGL2');
+        if (g && g.ctx) { const c2 = canvas.cloneNode(false); canvas.replaceWith(c2); canvas = c2; }          // a canvas that already has a webgpu context cannot give out webgl2
+      }
+    }
+    return new D3D9Renderer(canvas, log);
+  }
+  const r = await makeRenderer(); window.__r = r; r.sendInput = (t, a, b, c, d) => send(t, a, b, c, d);
+  const hc = r.hc = new HCache(r); window.__hc = hc; window.__wire = { bytes: 0, msgs: 0 };
   let ws, frames = 0, last = performance.now(), msgs = 0, bytes = 0, presented = 0;
   function connect() {
     ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer'; window.__ws = ws;
-    ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.className = 'ok'; };
+    ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.className = 'ok'; hc.ready.then(() => { if (ws.readyState === 1) hc.announce(ws); }); };
     ws.onclose = (e) => { audioFadeOut(); au.faded = true; const busy = e.code === 1013; statusEl.textContent = busy ? 'another viewer is connected - retrying every 3 s' : 'disconnected - retrying'; statusEl.className = 'bad'; setTimeout(connect, busy ? 3000 : 1000); };
     ws.onmessage = (e) => {
-      bytes += e.data.byteLength; const n = r.feed(e.data); msgs += n.messages; frames += n.presents;
-      if (n.presents) { presented += n.presents; send(9, presented); }       // flow control: the harness runs at most BLUR_MAXLAG (4) frames ahead of this counter; no ack = no throttling
+      bytes += e.data.byteLength; window.__wire.bytes += e.data.byteLength; window.__wire.msgs++;
+      hc.onData(e.data, (n) => { msgs += n.messages; frames += n.presents;
+        if (n.presents) { presented += n.presents; send(9, presented); } });       // flow control: the harness runs at most BLUR_MAXLAG (4) frames ahead of this counter; no ack = no throttling
     };
   }
   // ---- audio: host-mixed 48 kHz stereo PCM (message type 90) -> AudioWorklet. Browsers need a user gesture before audio can start.
@@ -81,7 +117,8 @@
     document.getElementById('fps').textContent = `${(frames / dt).toFixed(1)} fps`; document.getElementById('stats').textContent = `${(bytes / dt / 1048576).toFixed(1)} MB/s  ${r.statLine()}  ${audioStat()}`; frames = 0; bytes = 0; msgs = 0; }, 1000);
   // input -> harness (NetInput: 5 x int32: type,a,b,c,d). 1=key down(vk) 2=key up(vk) 3=mouse move(x,y) 4=mouse button(btn,down) 5=wheel
   const send = (t, a = 0, b = 0, c = 0, d = 0) => { if (ws && ws.readyState === 1) ws.send(new Int32Array([t, a, b, c, d]).buffer); };
-  const vk = (e) => ({ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Enter:13,Escape:27,Space:32,Tab:9,Backspace:8,ShiftLeft:160,ShiftRight:161,ControlLeft:162,ControlRight:163,AltLeft:164,AltRight:165}[e.code] || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0));
+  // Mac keyboards have no Right Ctrl: = / ] / PageUp send Right Ctrl (LAN: Host Game) and - / [ / PageDown send Right Shift (LAN: Refresh)
+  const vk = (e) => ({ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Enter:13,Escape:27,Space:32,Tab:9,Backspace:8,ShiftLeft:160,ShiftRight:161,F1:112,F2:113,F3:114,F4:115,F5:116,F6:117,F7:118,F8:119,F9:120,F10:121,F12:123,ControlLeft:162,ControlRight:163,BracketRight:163,BracketLeft:161,PageUp:163,PageDown:161,Equal:163,Minus:161,AltLeft:164,AltRight:165}[e.code] || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0));
   // keys held right now (vk codes): on tab/window switch the browser never delivers the key-up, so the host would see the key held forever
   // (e.g. S = reverse gear for good). Release everything when the page loses focus or is hidden.
   const held = new Map(), heldBtn = new Set();                          // physical key (e.code) -> vk that was sent on key-down (the key-up must release exactly that, even if e.key changed: Shift, layouts, caps lock)
@@ -104,9 +141,26 @@
   };
   setInterval(sendPad, 8);
   window.addEventListener('gamepaddisconnected', () => sendPad());
+  // Interactive panels: status bar / log / HUD toggles (remembered in localStorage) and a fullscreen button.
+  const store = { get(k, d) { try { const v = localStorage.getItem('blur.' + k); return v === null ? d : v === '1'; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('blur.' + k, v ? '1' : '0'); } catch (e) {} } };
+  const cbBar = document.getElementById('cb-bar'), cbLog = document.getElementById('cb-log'), cbHud = document.getElementById('cb-hud'), uiEl = document.getElementById('ui');
+  const hudOn = () => !!(r.hud && r.hud.c && r.hud.c.style.display !== 'none');
+  const setHud = (on) => { if (on === hudOn() && r.hud) return; window.dispatchEvent(new KeyboardEvent('keydown', { code: 'F2' })); };      // renderer toggles its HUD on F2
+  const applyPanels = () => { document.body.classList.toggle('hide-bar', !cbBar.checked); document.body.classList.toggle('hide-log', !cbLog.checked); store.set('bar', cbBar.checked); store.set('log', cbLog.checked); store.set('hud', cbHud.checked); };
+  cbBar.checked = store.get('bar', true); cbLog.checked = store.get('log', false); cbHud.checked = location.hash.includes('hud=1') || store.get('hud', false);
+  cbBar.onchange = cbLog.onchange = applyPanels; cbHud.onchange = () => { setHud(cbHud.checked); applyPanels(); }; applyPanels();
+  if (cbHud.checked) setTimeout(() => { if (!hudOn()) setHud(true); }, 300);
+  document.getElementById('menubtn').onclick = () => { uiEl.classList.toggle('open'); };
+  document.addEventListener('click', (e) => { if (!uiEl.contains(e.target)) uiEl.classList.remove('open'); });
+  window.addEventListener('keydown', (e) => { if (e.code === 'F2') setTimeout(() => { cbHud.checked = hudOn(); applyPanels(); }, 0); });
+  { const f = new URLSearchParams(location.search).get('fit'); if (f === 'contain' || f === 'fill') document.body.classList.add('fit-' + f); }   // ?fit=contain (letterbox) | fill (stretch); default cover = no bars, crops the edges on 16:10 screens
   // Fullscreen: F11 or double-click the picture. Escape is locked (Keyboard Lock API, Chrome) so the game's Esc menu works; leave fullscreen with F11 again.
   const toggleFs = async () => { try { if (document.fullscreenElement) { await document.exitFullscreen(); } else { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); if (navigator.keyboard && navigator.keyboard.lock) { try { await navigator.keyboard.lock(['Escape']); } catch (e) {} } canvas.focus(); } } catch (e) { log('fullscreen: ' + e.message); } };
   canvas.addEventListener('dblclick', toggleFs);
+  { let idleT = 0; const wake = () => { document.body.classList.remove('idle-cursor'); clearTimeout(idleT); idleT = setTimeout(() => document.body.classList.add('idle-cursor'), 2000); };      // hide the pointer after 2 s without movement
+    document.addEventListener('mousemove', wake); document.addEventListener('mousedown', wake); wake(); }
+  document.getElementById('fsbtn').onclick = () => { toggleFs(); canvas.focus(); };
+  document.addEventListener('fullscreenchange', () => { document.getElementById('fsbtn').textContent = document.fullscreenElement ? '⛶ Exit fullscreen' : '⛶ Fullscreen'; });
   window.addEventListener('keydown', (e) => { if (e.code === 'F11') { e.preventDefault(); toggleFs(); } }, true);
   window.addEventListener('keydown', (e) => { const k = vk(e); if (!e.repeat || !held.has(e.code)) { held.set(e.code, k); send(1, k); } if (e.code !== 'F12') e.preventDefault(); });
   window.addEventListener('keyup', (e) => { const k = held.has(e.code) ? held.get(e.code) : vk(e); held.delete(e.code); send(2, k); e.preventDefault(); });
@@ -114,4 +168,4 @@
   document.addEventListener('visibilitychange', releaseAll);
   canvas.addEventListener('mousemove', (e) => { const b = canvas.getBoundingClientRect(); send(3, Math.round((e.clientX - b.left) * (r.bb ? r.bb.lw : canvas.width) / b.width), Math.round((e.clientY - b.top) * (r.bb ? r.bb.lh : canvas.height) / b.height)); });
   canvas.addEventListener('mousedown', (e) => { canvas.focus(); heldBtn.add(e.button); send(4, e.button, 1); }); canvas.addEventListener('mouseup', (e) => { heldBtn.delete(e.button); send(4, e.button, 0); });
-</script></body></html>
+})();</script></body></html>
