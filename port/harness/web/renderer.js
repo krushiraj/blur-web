@@ -110,6 +110,9 @@ class D3D9Renderer {
     this.rt = [{ kind: 3 }, { kind: 3 }, { kind: 3 }, { kind: 3 }]; this.ds = { kind: 3 };
     this.stats = { draws: 0, frameDraws: 0, clears: 0, progs: 0, shaders: 0, skipped: 0, tex: 0, deferred: 0, refs: 0, warmed: 0, held: 0 };
     this.fbWarn = true; this.initDefaults(); this.initGL(); if (this.q.hud) this.initHud();
+    // Rear-view mirror at half rate when the page cannot keep up: the mirror passes (576x96 target and the heavy 256x256 helper it is composed from) are ~28% of all draws.
+    // #mirror=half always skips them on alternate frames, #mirror=auto does it only while the present-to-present interval stays above ~18 ms, #mirror=full never. Default: auto.
+    this.mirrorMode = (/mirror=(half|auto|full)/.exec(location.hash) || [0, 'auto'])[1]; this.mirrorOn = false; this.mirrorTouched = []; this.mirrorIv = 16.7; this.mirrorLast = 0; this.mirrorFrame = 0;
     this.diag = /diag=1/.test(location.hash); this.diagFrames = []; this.rtCount = {};      // #diag=1: per-frame draw counts by render target (see tools/shot/diag.js)
     window.addEventListener('keydown', (e) => { if (e.code === 'F2') { const first = !this.hud; this.initHud(); if (!first) this.hud.c.style.display = this.hud.c.style.display === 'none' ? '' : 'none'; } });
   }
@@ -195,6 +198,8 @@ class D3D9Renderer {
   handle(type, ab, dv, p, len) {
     const u = (i) => dv.getUint32(p + 4 * i, true), f = (i) => dv.getFloat32(p + 4 * i, true);
     switch (type) {
+      case 98: if (this.hc) this.hc.tagged(this, ab, dv, p, len); break;       // content-hash cache (hcache.js): tagged upload / reference to a cached upload
+      case 96: if (this.hc) this.hc.ref(this, ab, dv, p, len); break;
       case G.TEX_CREATE: this.rtDirty = true; this.texCreate(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7)); break;
       case G.TEX_UPLOAD: this.texUpload(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), new Uint8Array(ab, p + 32, len - 32)); break;       // consumed synchronously by texSubImage: no copy
       case G.SURF_CREATE: this.rtDirty = true; this.surfCreate(u(0), u(1), u(2), u(3), u(4), u(5)); break;
@@ -670,7 +675,14 @@ class D3D9Renderer {
     this.bindTextures(P);
     return { P, vsInfo, decl };
   }
+  skipRT() {        // true while drawing into a mirror-pass target on a skipped frame; also counts draws per target so heavy mirror targets are recognised
+    const r = this.rt[0]; if (r.kind !== 1) return false; const t = this.textures.get(r.id); if (!t) return false;
+    if (this.mirrorMode === 'full') return false;
+    if (t.mdc === undefined) { t.mdc = 0; t.mskip = false; } if (t.mdc++ === 0) this.mirrorTouched.push(t);
+    return this.mirrorOn && t.mskip;
+  }
   draw(type, indexed, base, minIdx, numVerts, start, primCount) {
+    if (this.skipRT()) return;
     const gl = this.gl, ctx = this.prepareDraw(); if (!ctx) return;
     if (this.diag) { const r0 = this.rt[0], k = r0.kind + ':' + (r0.id || 0); this.rtCount[k] = (this.rtCount[k] || 0) + 1; }
     const count = this.primCount(type, primCount), mode = this.glMode(type);
@@ -687,6 +699,7 @@ class D3D9Renderer {
     this.stats.draws++; this.stats.frameDraws++;
   }
   drawUP(type, primCount, stride, nverts, indexed, ifmt, nidx, blob) {
+    if (this.skipRT()) return;
     const gl = this.gl, ctx = this.prepareDraw(); if (!ctx) return;
     const isz = ifmt === 101 ? 2 : 4, ib = indexed ? nidx * isz : 0, mode = this.glMode(type), count = this.primCount(type, primCount);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.upVB); gl.bufferData(gl.ARRAY_BUFFER, blob.subarray(ib), gl.STREAM_DRAW);
@@ -697,6 +710,7 @@ class D3D9Renderer {
     this.stats.draws++; this.stats.frameDraws++;
   }
   clear(flags, color, z, stencil, nrects, rects) {
+    if (this.skipRT()) return;
     const gl = this.gl, t = this.bindTargets(); this.stats.clears++;
     gl.disable(gl.SCISSOR_TEST); gl.colorMask(true, true, true, true); gl.depthMask(true); gl.stencilMask(0xff);
     let bits = 0;
@@ -815,6 +829,12 @@ class D3D9Renderer {
   present() { this.auditPresent = (this.auditPresent || 0) + 1;
     const gl = this.gl;
     this.pollReadbacks();
+    if (this.mirrorMode !== 'full') {
+      const now = performance.now(); if (this.mirrorLast) { const iv = now - this.mirrorLast; this.mirrorIv += (Math.min(iv, 100) - this.mirrorIv) * 0.08; } this.mirrorLast = now;
+      for (const t of this.mirrorTouched) { t.mskip = t.mdc >= 150 && ((t.w === 576 && t.h === 96) || (t.w === 256 && t.h === 256)); t.mdc = 0; } this.mirrorTouched.length = 0;
+      this.mirrorFrame++; const was = !!this.stats.mirrorActive, active = this.mirrorMode === 'half' || (was ? this.mirrorIv > 17.2 : this.mirrorIv > 18.0);      // hysteresis for auto
+      this.mirrorOn = active && (this.mirrorFrame & 1) === 1; this.stats.mirrorActive = active;
+    }
     if (this.diag) { let d = 0; for (const k in this.rtCount) d += this.rtCount[k]; this.diagFrames.push({ d, t: performance.now(), rts: this.rtCount, gl: Object.assign({}, this.glCalls) }); for (const k in this.glCalls) this.glCalls[k] = 0; if (this.diagFrames.length > 4000) this.diagFrames.shift(); this.rtCount = {}; }
     this.dn = 0;
     { const fd = this.stats.frameDraws; if (this.cap) { window.__cap = this.cap; this.cap = null; window.__capNext = false; console.log('renderer: capture done'); }
