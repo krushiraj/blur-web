@@ -169,13 +169,28 @@ static const ComMethod ct_m[] = {
     { "SetVectorArray", 5, ct_setvectorarray }, { "SetMatrix", 4, ct_setmatrix }, { "SetMatrixArray", 5, ct_setmatrixarray }, { "SetMatrixPointerArray", 5, ct_ok },
     { "SetMatrixTranspose", 4, ct_setmatrixT }, { "SetMatrixTransposeArray", 5, ct_setmatrixTarray }, { "SetMatrixTransposePointerArray", 5, ct_ok },
 };
+static uint64_t tab_hash[MAXTABS];
+static uint64_t code_hash(Ctx *c, uint32_t code) {                                 // FNV-1a over the shader token stream (comments included) up to END
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t p = code, n = 0; n < 16384; n++) {
+        uint32_t tok = rd32(c, p); h = (h ^ tok) * 1099511628211ull; if (n && tok == 0x0000ffff) break;
+        if ((tok & 0xffff) == 0xfffe) { uint32_t len = (tok >> 16) & 0x7fff; for (uint32_t i = 1; i <= len; i++) h = (h ^ rd32(c, p + 4 * i)) * 1099511628211ull; p += 4 + len * 4; continue; }
+        p += 4; if (n) p += ((tok >> 24) & 0xf) * 4;
+    }
+    return h;
+}
 static uint32_t x_getctable(Ctx *c, uint32_t *a) {                                  // D3DXGetShaderConstantTable(pFunction, ppConstantTable)
-    if (ntabs >= MAXTABS) { fprintf(stderr, "[d3dx] constant table limit reached\n"); wr32(c, a[1], 0); return 0; }
+    uint64_t h = code_hash(c, a[0]);                                                // the game re-creates the same shaders repeatedly; slots are never freed, so share them
+    for (int i = 1; i < ntabs; i++) if (tab_hash[i] == h) { uint32_t g = com_make(c, "ID3DXConstantTable", ct_m, sizeof ct_m / sizeof ct_m[0], 4); wr32(c, g + 8, (uint32_t)i); wr32(c, a[1], g); return 0; }
+    if (ntabs >= MAXTABS) {                                                         // never hand the game a NULL table: slot 0 is an empty one
+        fprintf(stderr, "[d3dx] constant table limit reached\n");
+        uint32_t g = com_make(c, "ID3DXConstantTable", ct_m, sizeof ct_m / sizeof ct_m[0], 4); wr32(c, g + 8, 0); wr32(c, a[1], g); return 0;
+    }
     CTable *t = &tabs[ntabs]; memset(t, 0, sizeof *t);
     if (c->verbose) { fprintf(stderr, "[d3dx] parse_ctab code=%08x:", a[0]); for (int i = 0; i < 12; i++) fprintf(stderr, " %08x", rd32(c, a[0] + 4 * i)); fprintf(stderr, "\n"); }
     if (!parse_ctab(c, a[0], t)) { wr32(c, a[1], 0); return 0; }                    // shaders without a table: no object (D3D_OK like D3DX)
     uint32_t g = com_make(c, "ID3DXConstantTable", ct_m, sizeof ct_m / sizeof ct_m[0], 4);
-    wr32(c, g + 8, (uint32_t)ntabs++); wr32(c, a[1], g);
+    tab_hash[ntabs] = h; wr32(c, g + 8, (uint32_t)ntabs++); wr32(c, a[1], g);
     if (c->verbose) { fprintf(stderr, "[d3dx] constant table %s%u: %d constants:", t->ps ? "ps" : "vs", t->version & 0xffff, t->n); for (int i = 0; i < t->n; i++) fprintf(stderr, " %s(r%u/%u)", t->k[i].name, t->k[i].reg, t->k[i].count); fprintf(stderr, "\n"); }
     return 0;
 }
