@@ -118,11 +118,11 @@
   // input -> harness (NetInput: 5 x int32: type,a,b,c,d). 1=key down(vk) 2=key up(vk) 3=mouse move(x,y) 4=mouse button(btn,down) 5=wheel
   const send = (t, a = 0, b = 0, c = 0, d = 0) => { if (ws && ws.readyState === 1) ws.send(new Int32Array([t, a, b, c, d]).buffer); };
   // Mac keyboards have no Right Ctrl: = / ] / PageUp send Right Ctrl (LAN: Host Game) and - / [ / PageDown send Right Shift (LAN: Refresh)
-  const vk = (e) => ({ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Enter:13,Escape:27,Space:32,Tab:9,Backspace:8,ShiftLeft:160,ShiftRight:161,F1:112,F2:113,F3:114,F4:115,F5:116,F6:117,F7:118,F8:119,F9:120,F10:121,F12:123,ControlLeft:162,ControlRight:163,BracketRight:163,BracketLeft:161,PageUp:163,PageDown:161,Equal:163,Minus:161,AltLeft:164,AltRight:165}[e.code] || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0));
+  const vk = (e) => ({ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Enter:13,Escape:27,Space:32,Tab:9,Backspace:8,Delete:46,ShiftLeft:160,ShiftRight:161,F1:112,F2:113,F3:114,F4:115,F5:116,F6:117,F7:118,F8:119,F9:120,F10:121,F12:123,ControlLeft:162,ControlRight:163,BracketRight:163,BracketLeft:161,PageUp:163,PageDown:161,Equal:163,Minus:161,AltLeft:164,AltRight:165}[e.code] || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0));
   // keys held right now (vk codes): on tab/window switch the browser never delivers the key-up, so the host would see the key held forever
   // (e.g. S = reverse gear for good). Release everything when the page loses focus or is hidden.
   const held = new Map(), heldBtn = new Set();                          // physical key (e.code) -> vk that was sent on key-down (the key-up must release exactly that, even if e.key changed: Shift, layouts, caps lock)
-  const releaseAll = () => { for (const k of held.values()) send(2, k); held.clear(); for (const b of heldBtn) send(4, b, 0); heldBtn.clear(); };
+  const releaseAll = () => { for (const k of held.values()) send(2, k); if (held.has('Backspace')) send(2, 46); held.clear(); for (const b of heldBtn) send(4, b, 0); heldBtn.clear(); };
   // Gamepad: a pad is reported to the game ONLY while a real controller is connected (browser Gamepad API; press any button on it once so the browser exposes it).
   // Otherwise the game sees no XInput device and uses its own keyboard bindings. The header shows which one is in control.
   const inputEl = document.getElementById('inputmode'); let padKey = '', padSentAt = 0, padWasActive = false;
@@ -162,8 +162,8 @@
   document.getElementById('fsbtn').onclick = () => { toggleFs(); canvas.focus(); };
   document.addEventListener('fullscreenchange', () => { document.getElementById('fsbtn').textContent = document.fullscreenElement ? '⛶ Exit fullscreen' : '⛶ Fullscreen'; });
   window.addEventListener('keydown', (e) => { if (e.code === 'F11') { e.preventDefault(); toggleFs(); } }, true);
-  window.addEventListener('keydown', (e) => { const k = vk(e); if (!e.repeat || !held.has(e.code)) { held.set(e.code, k); send(1, k); } if (e.code !== 'F12') e.preventDefault(); });
-  window.addEventListener('keyup', (e) => { const k = held.has(e.code) ? held.get(e.code) : vk(e); held.delete(e.code); send(2, k); e.preventDefault(); });
+  window.addEventListener('keydown', (e) => { const k = vk(e); if (!e.repeat || !held.has(e.code)) { held.set(e.code, k); send(1, k); if (e.code === 'Backspace') send(1, 46); } if (e.code !== 'F12') e.preventDefault(); });
+  window.addEventListener('keyup', (e) => { const k = held.has(e.code) ? held.get(e.code) : vk(e); held.delete(e.code); send(2, k); if (e.code === 'Backspace') send(2, 46); e.preventDefault(); });
   window.addEventListener('blur', releaseAll); window.addEventListener('focus', releaseAll); window.addEventListener('pagehide', releaseAll);
   document.addEventListener('visibilitychange', releaseAll);
   canvas.addEventListener('mousemove', (e) => { const b = canvas.getBoundingClientRect(); send(3, Math.round((e.clientX - b.left) * (r.bb ? r.bb.lw : canvas.width) / b.width), Math.round((e.clientY - b.top) * (r.bb ? r.bb.lh : canvas.height) / b.height)); });
