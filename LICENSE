@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 Krushi Raj Tula
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------------
+Scope of this licence
+
+The MIT licence above covers only the source code and documentation written
+for this repository. It does NOT cover, and this repository does not contain:
+
+  * Blur (Bizarre Creations / Activision), its executable, its data files, its
+    shaders, textures, audio or video. Blur and everything in it belongs to
+    its owners. You need your own legally obtained copy to use this project.
+  * Microsoft's Visual C++ 2008 runtime (msvcr90.dll), which you must supply.
+  * Any third-party library that this project builds or links against on your
+    machine. See NOTICE for the list and their licences.
+
+Code that setup.sh generates on your machine from your copy of the game
+(lifted C sources, object files, the `blurrt` binary, shader caches) is a
+derivative of that game. Keep it private; do not publish or redistribute it.

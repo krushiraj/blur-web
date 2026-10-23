@@ -1,0 +1,52 @@
+Third-party software and data
+=============================
+
+Nothing below is copied into this repository unless it is listed under
+"Included". Everything else is fetched or installed on your machine by
+setup.sh, or by you.
+
+Included in this repository
+---------------------------
+* Nothing third-party is vendored. The package.json / yarn.lock files in
+  tools/shot and port/mp only name npm packages (puppeteer-core, Apache-2.0;
+  ws, MIT) that `yarn install` downloads.
+* docs/blur-port-log/index.html loads mermaid (MIT) from a CDN at view time.
+* port/work/interp/interp.c is a hand-written x86 interpreter with its own
+  decoder (no third-party code). port/harness/hashes.c contains small MD5 /
+  SHA-1 / SHA-256 routines written for this project.
+
+Fetched or linked at build time (not redistributed here)
+--------------------------------------------------------
+* Unicorn Engine 2.x (GPL-2.0-only): boots the packed executable up to its
+  entry point and serves as the reference CPU for the tests. The harness links
+  against it, so a built `blurrt` is subject to the GPL-2.0 if you ever
+  distribute it. (One more reason to keep the generated binary private.)
+* Capstone 5 (BSD-3-Clause): x86 decoder used by the lifter (pip install).
+* vkd3d 2.1, libvkd3d-shader only (LGPL-2.1-or-later): D3D9 shader bytecode to
+  SPIR-V. Downloaded from https://dl.winehq.org/vkd3d/source/ and built into
+  third_party/ (git-ignored). See third_party/README.md.
+* SPIRV-Cross (Apache-2.0): SPIR-V to GLSL.
+* FFmpeg libavformat / libavcodec / libavutil / libswresample (LGPL-2.1+ or
+  GPL, depending on how your distribution configured it): decodes Bink 1
+  movies.
+* LLVM / Clang: compiler (Apache-2.0 with LLVM exceptions).
+* puppeteer-core (Apache-2.0), ws (MIT): optional test tooling.
+* Only for the optional WebGPU shader pack: naga-cli (MIT / Apache-2.0),
+  SPIRV-Tools (Apache-2.0), brotli.
+
+Not included and not available here
+-----------------------------------
+* Blur.exe and all game data (c) Activision / Bizarre Creations.
+* msvcr90.dll 9.0.21022.8 (c) Microsoft. Supply it yourself (see README).
+* Lifted game code, object files, the runtime binary, shaders.bin,
+  blur.wgslpack, warm lists: all derived from the game. setup.sh recreates the
+  ones it can on your machine.
+
+Address lists
+-------------
+port/recomp/funcs.tsv, blocks.txt, learned*.txt, seed_ranges.txt,
+oracle_funcs*.txt and overrides.txt are lists of code addresses (and sizes) in
+one specific build of Blur.exe, produced by static analysis and by observing
+runs. They contain no instruction bytes and no game assets. They only help the
+lifter find function entries. setup.sh checks the SHA-256 of your Blur.exe
+against the build they were made for.
