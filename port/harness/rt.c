@@ -69,6 +69,7 @@ void audio_shutdown(void);
 static void finish_process(Ctx *c) {
     audio_shutdown();
     cov_write();
+    if (getenv("BLUR_DUMP_EXE")) { Module *m = find_module(c, "Blur.exe"); FILE *f = fopen(getenv("BLUR_DUMP_EXE"), "wb"); if (f && m) { fwrite(G + m->base, 1, m->size, f); fclose(f); fprintf(stderr, "[dump] exe image at exit: base=%08x size=%x\n", m->base, m->size); } }   // the unpacked image a few seconds into the run: includes the code and tables the protector writes at run time (setup.sh feeds it to the lifter)
     if (getenv("BLUR_DUMPMEM")) { FILE *f = fopen(getenv("BLUR_DUMPMEM"), "wb"); if (f) { fwrite(G + 0x20000000u, 1, 0x40000000u, f); fclose(f); fprintf(stderr, "[dumpmem] guest 0x20000000..0x60000000 written\n"); } }
     if (getenv("BLUR_STATS")) {
         fprintf(stderr, "[stats] most called APIs:\n");
