@@ -1,0 +1,1014 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blur Port Build Log</title>
+<meta name="description" content="How a 2010 PC racing game was statically recompiled, made to run natively, and streamed to a WebGL2/WebGPU page: plan, findings, fixes, decisions.">
+<style>
+:root{
+  --bg:#fbfaf7; --panel:#ffffff; --ink:#1d2330; --muted:#5d6678; --line:#e3e0d8; --accent:#1f6feb; --accent-ink:#0b3d91;
+  --ok:#1a7f4b; --warn:#a15c00; --bad:#b42318; --code-bg:#f2f0ea; --find:#eaf2ff; --dec:#eef8f1; --less:#fff6e5; --bug:#fdeeee;
+  --shadow:0 1px 2px rgba(20,24,40,.06),0 6px 20px rgba(20,24,40,.05);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1218; --panel:#171b23; --ink:#e6e9ef; --muted:#9aa4b5; --line:#2a3040; --accent:#6aa5ff; --accent-ink:#9cc2ff;
+    --ok:#4cc38a; --warn:#f0b04a; --bad:#ff7b72; --code-bg:#1d2230; --find:#14223a; --dec:#12271d; --less:#2b2312; --bug:#2f1717;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 20px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1218; --panel:#171b23; --ink:#e6e9ef; --muted:#9aa4b5; --line:#2a3040; --accent:#6aa5ff; --accent-ink:#9cc2ff;
+  --ok:#4cc38a; --warn:#f0b04a; --bad:#ff7b72; --code-bg:#1d2230; --find:#14223a; --dec:#12271d; --less:#2b2312; --bug:#2f1717;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 20px rgba(0,0,0,.3);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--accent)} a:hover{color:var(--accent-ink)}
+code,pre,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em}
+code{background:var(--code-bg);padding:.1em .35em;border-radius:5px}
+pre{background:var(--code-bg);padding:14px 16px;border-radius:10px;overflow:auto;line-height:1.5;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.layout{display:grid;grid-template-columns:260px minmax(0,1fr);gap:0;max-width:1320px;margin:0 auto}
+nav.toc{position:sticky;top:0;align-self:start;height:100vh;overflow:auto;padding:28px 18px 28px 24px;border-right:1px solid var(--line);font-size:14px}
+nav.toc h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+nav.toc a{display:block;color:var(--muted);text-decoration:none;padding:4px 8px;border-radius:6px;margin:1px 0}
+nav.toc a:hover,nav.toc a.on{background:var(--code-bg);color:var(--ink)}
+nav.toc a.sub{padding-left:20px;font-size:13px}
+main{padding:40px clamp(18px,4vw,56px) 120px;min-width:0}
+header.hero{border-bottom:1px solid var(--line);padding-bottom:28px;margin-bottom:12px}
+header.hero .kicker{color:var(--muted);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+header.hero h1{font-size:clamp(30px,4.4vw,46px);line-height:1.12;margin:.2em 0 .3em;letter-spacing:-.02em}
+header.hero p.lede{font-size:19px;color:var(--muted);max-width:62ch;margin:.2em 0 0}
+.meta{display:flex;flex-wrap:wrap;gap:8px 18px;color:var(--muted);font-size:14px;margin-top:16px}
+.meta b{color:var(--ink);font-weight:600}
+h2{font-size:30px;line-height:1.2;margin:2.4em 0 .5em;letter-spacing:-.01em;scroll-margin-top:16px}
+h3{font-size:21px;margin:1.9em 0 .4em;scroll-margin-top:16px}
+h4{font-size:16px;margin:1.4em 0 .2em;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+p{margin:.7em 0} ul,ol{padding-left:1.3em} li{margin:.25em 0}
+.sec-num{color:var(--accent);font-weight:700;margin-right:.35em}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+.card .n{font-size:28px;font-weight:700;letter-spacing:-.02em;line-height:1.1}
+.card .l{color:var(--muted);font-size:13px;margin-top:4px}
+.callout{border-radius:12px;padding:14px 18px;margin:18px 0;border:1px solid var(--line);border-left-width:5px}
+.callout .t{font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;margin-bottom:4px}
+.callout.find{background:var(--find);border-left-color:var(--accent)} .callout.find .t{color:var(--accent)}
+.callout.dec{background:var(--dec);border-left-color:var(--ok)} .callout.dec .t{color:var(--ok)}
+.callout.less{background:var(--less);border-left-color:var(--warn)} .callout.less .t{color:var(--warn)}
+.callout.bug{background:var(--bug);border-left-color:var(--bad)} .callout.bug .t{color:var(--bad)}
+.callout p:first-of-type{margin-top:.2em} .callout p:last-child{margin-bottom:.1em}
+figure{margin:22px 0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;box-shadow:var(--shadow)}
+figure img{display:block;width:100%;height:auto;border-radius:8px;background:#000}
+figcaption{color:var(--muted);font-size:14px;margin:10px 4px 2px}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px} .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media (max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
+.grid2 figure,.grid3 figure{margin:0}
+.diagram{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin:20px 0;overflow:auto;box-shadow:var(--shadow)}
+.diagram .cap{color:var(--muted);font-size:14px;margin-top:8px}
+.mermaid{display:flex;justify-content:center}
+table{border-collapse:collapse;width:100%;margin:16px 0;font-size:14.5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;display:block;overflow-x:auto}
+th,td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+th{background:var(--code-bg);font-size:12.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tag{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;border:1px solid var(--line);background:var(--code-bg);color:var(--muted);white-space:nowrap}
+.tag.ok{color:var(--ok);border-color:var(--ok)} .tag.bad{color:var(--bad);border-color:var(--bad)} .tag.warn{color:var(--warn);border-color:var(--warn)} .tag.info{color:var(--accent);border-color:var(--accent)}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:20px 0;box-shadow:var(--shadow)}
+.chart h5{margin:0 0 10px;font-size:15px}
+.bars{display:grid;grid-template-columns:minmax(120px,230px) 1fr 82px;gap:6px 10px;align-items:center;font-size:13.5px}
+.bars .lab{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.bars .trk{background:var(--code-bg);border-radius:6px;height:16px;overflow:hidden}
+.bars .fil{height:100%;border-radius:6px;background:var(--accent)} .bars .fil.g{background:var(--ok)} .bars .fil.w{background:var(--warn)} .bars .fil.r{background:var(--bad)}
+.bars .val{font-variant-numeric:tabular-nums;text-align:right}
+.chart .note{color:var(--muted);font-size:13px;margin-top:8px}
+details{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:2px 16px;margin:12px 0}
+details summary{cursor:pointer;font-weight:600;padding:10px 0}
+.bugcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:6px 20px 14px;margin:22px 0;box-shadow:var(--shadow)}
+.bugcard h3{margin-top:.9em}
+.bugcard dl{display:grid;grid-template-columns:110px 1fr;gap:6px 14px;margin:8px 0}
+.bugcard dt{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);padding-top:3px;font-weight:700}
+.bugcard dd{margin:0}
+@media (max-width:620px){.bugcard dl{grid-template-columns:1fr}.bugcard dt{padding-top:8px}}
+.themebtn{position:fixed;right:14px;bottom:14px;z-index:5;background:var(--panel);border:1px solid var(--line);color:var(--ink);border-radius:99px;padding:8px 14px;font-size:13px;cursor:pointer;box-shadow:var(--shadow)}
+@media (max-width:1000px){.layout{grid-template-columns:1fr} nav.toc{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)} nav.toc .list{columns:2}}
+@media print{nav.toc,.themebtn{display:none}.layout{display:block} figure,.callout,.bugcard,.diagram{break-inside:avoid}}
+</style>
+</head>
+<body>
+<button class="themebtn" id="themebtn" aria-label="Toggle light and dark theme">Theme</button>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <div class="list">
+  <a href="#tldr">0 · The short version</a>
+  <a href="#premise">1 · Premise and ground rules</a>
+  <a href="#plan">2 · The plan (day zero)</a>
+  <a href="#timeline">3 · How it unfolded</a>
+  <a href="#how">4 · How it works</a>
+  <a href="#method">5 · How we debugged</a>
+  <a href="#bugs">6 · The bug log</a>
+  <a class="sub" href="#bug-ui">Empty UI textures</a>
+  <a class="sub" href="#bug-heap">Zero-size texture smash</a>
+  <a class="sub" href="#bug-exposure">Washed-out scene (twice)</a>
+  <a class="sub" href="#bug-alias">Race stall: UB</a>
+  <a class="sub" href="#bug-collision">Message type collision</a>
+  <a class="sub" href="#bug-sampler">Invalid sampler</a>
+  <a href="#perf">7 · The road to 60 fps</a>
+  <a href="#mp">8 · Multiplayer</a>
+  <a href="#cross">9 · Mac, Windows, Linux</a>
+  <a href="#phase4">10 · Browser-native direction</a>
+  <a class="sub" href="#trackA">Hash cache</a>
+  <a class="sub" href="#trackB">WebGPU renderer</a>
+  <a class="sub" href="#trackC">Full wasm (no-go)</a>
+  <a href="#decisions">11 · Decisions and trade-offs</a>
+  <a href="#team">12 · Working with agents</a>
+  <a href="#lessons">13 · Lessons</a>
+  <a href="#open">14 · Open items</a>
+  <a href="#blog">15 · Blog outline</a>
+  <a href="#appendix">Appendix</a>
+  </div>
+</nav>
+<main>
+
+<header class="hero">
+  <div class="kicker">Personal learning project · build log · October 15–23, 2026</div>
+  <h1>Putting a 2010 PC racer in a browser tab</h1>
+  <p class="lede">Blur's x86 executable was statically recompiled to C, linked against a hand-written Win32/Direct3D 9 host, and its draw commands are streamed to a WebGL2 or WebGPU page. This is the log of what we planned, what broke, how we found out why, and what we decided along the way.</p>
+  <div class="meta">
+    <span><b>Machine</b> Apple M4 Max, 128 GB</span>
+    <span><b>Target</b> solid 60 fps race, fullscreen</span>
+    <span><b>Also builds for</b> Windows x64, Linux x64 and arm64</span>
+    <span><b>Sources</b> <code>PLAN_120FPS.md</code> (F1–F159), agent reports, session history</span>
+  </div>
+</header>
+
+<section id="tldr">
+<h2><span class="sec-num">0</span>The short version</h2>
+<p>The project started as "can Blur run in a browser at up to 120 fps?" It ended up as a native runtime with a browser front end, because the measurements said so at each step. The 120 fps goal was dropped on day two (the game's simulation is baked at 60 Hz) and the target became <b>a rock-solid 60 fps in a race</b>.</p>
+
+<div class="cards">
+  <div class="card"><div class="n">373,530</div><div class="l">x86 functions lifted to C by our recompiler</div></div>
+  <div class="card"><div class="n">17 → 60 fps</div><div class="l">race speed after running guest threads in parallel</div></div>
+  <div class="card"><div class="n">2325</div><div class="l">D3D9 shaders translated offline (0 failures)</div></div>
+  <div class="card"><div class="n">2331/2331</div><div class="l">shaders also reach WGSL for WebGPU</div></div>
+  <div class="card"><div class="n">−57%</div><div class="l">wire bytes on a second visit (hash cache)</div></div>
+  <div class="card"><div class="n">3 + 1</div><div class="l">operating systems / CPU families built (Mac arm64, Win x64, Linux x64 + arm64)</div></div>
+</div>
+
+<div class="callout find"><div class="t">What actually mattered</div>
+<ol>
+<li><b>Static recompilation beat emulation.</b> The Unicorn emulator never got past the loading screen at usable speed. Lifting the code to C gave ~180 command-generation frames per second on its own.</li>
+<li><b>Most "rendering bugs" were host-API bugs.</b> The empty UI, the washed-out scene, and the heap crash were all a stubbed or wrong Windows/D3D9 call, not a renderer or CPU-translation bug.</li>
+<li><b>Race speed was CPU-scheduling bound, not browser bound.</b> The measured fix was one host thread per guest thread. Everything in the renderer helped at the margin; the thread model changed the order of magnitude.</li>
+<li><b>Opt-in browser backends need regression checks of their own.</b> Two of the nastiest bugs in the last days were self-inflicted: a message-type collision in the new cache protocol and an invalid WebGPU sampler that silently threw away whole frames.</li>
+</ol></div>
+
+<figure>
+  <div class="grid2">
+    <div><span class="shot-omitted"><em>[screenshot omitted from the public repository: Title screen washed out to pink]</em></span></div>
+    <div><span class="shot-omitted"><em>[screenshot omitted from the public repository: Title screen with the night city and car]</em></span></div>
+  </div>
+  <figcaption>Left: the first washed-out title screen (exposure readback stubbed, day 2). Right: the same scene after the fix. The same symptom came back a week later from a different cause (see <a href="#bug-exposure">section 6</a>).</figcaption>
+</figure>
+</section>
+
+<section id="premise">
+<h2><span class="sec-num">1</span>Premise and ground rules</h2>
+<p>Blur (Bizarre Creations, Activision, 2010) is a Direct3D 9 game with up to 20-player online and LAN racing. The official servers are gone and the game depends on the defunct Games for Windows Live. The goal was to learn how far static recompilation can take a game this size, and to get it playable on the author's own machines.</p>
+<div class="callout dec"><div class="t">Ground rules we kept</div>
+<ul>
+<li><b>Personal learning only.</b> The game files are the user's own copy and stay on their machines. The zips built for the home setup contain that copy and are not for distribution.</li>
+<li><b>No game bytes in anything public.</b> The original plan said ship the runtime and the translator, never the lifted C or the assets. Nothing was published.</li>
+<li><b>Refused out-of-scope help.</b> When pointed at two browser game sites to learn from, we studied their client architecture only. We did not download or run their unlicensed game copies.</li>
+<li><b>Working habits.</b> Never create accounts or type credentials on websites; no commits or pushes unless asked; yarn, not npm; do not touch the user's own running game instances while testing (we used separate ports and killed only our own processes).</li>
+</ul></div>
+<p>The original research note (<code>BLUR_WEB_PORT_PLAN.md</code>) also records the legal caution that applies to any public release: reverse-engineering for interoperability has precedent in US case law, but contract terms and DRM are separate, so a lawyer should read it before anything is shared.</p>
+</section>
+
+<section id="plan">
+<h2><span class="sec-num">2</span>The plan (day zero)</h2>
+<p>Two documents set the course on October 15–16: a research plan (<code>BLUR_WEB_PORT_PLAN.md</code>) and a performance plan (<code>PLAN_120FPS.md</code>). The first chose the approach; the second set the engineering method.</p>
+
+<h3>Three ways to run an old Windows game in a browser</h3>
+<table>
+<tr><th></th><th>A. Emulate x86 + Win32 in wasm</th><th>B. Static recompile x86 → C/wasm + own Win32/D3D9</th><th>C. Full decompile to readable C++</th></tr>
+<tr><td>Precedent</td><td>wine-assembly, v86, CheerpX</td><td>Theseus, console recompilation projects</td><td>d3d9-webgl GunZ port (had source)</td></tr>
+<tr><td>Time to first pixel</td><td>fastest</td><td>medium</td><td>slowest (years for an engine this size)</td></tr>
+<tr><td>Runtime speed</td><td>poor for a 3D racer</td><td>good</td><td>best</td></tr>
+<tr><td>Moddability</td><td>low</td><td>medium (hook points in lifted code and host API)</td><td>highest</td></tr>
+<tr><td>Legal surface</td><td>smallest</td><td>small if translation happens on the user's machine</td><td>largest if source is shared</td></tr>
+</table>
+<div class="callout dec"><div class="t">Decision D0</div>
+<p><b>B as the main line, A as a throwaway probe, C only incrementally</b> for subsystems we want to change (netcode, tweaks). The Unicorn emulator ended up as the boot tool (it runs the packer up to the entry point) rather than the runtime.</p></div>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["Run Blur in a browser?"] --> A["A. Emulate x86 in wasm"]
+  Q --> B["B. Static recompile to C / wasm"]
+  Q --> C["C. Full decompile to C++"]
+  A -->|"too slow for a 3D racer<br/>(measured: emulator stalls at loading)"| X1["Kept only as the boot tool"]
+  B -->|"chosen"| P["Lifter + Win32/D3D9 host + web renderer"]
+  C -->|"engine-sized effort"| X2["Only for subsystems later"]
+  P --> M["Reference harness runs natively (seconds to rebuild)"]
+  M --> W["Same sources can later target wasm"]
+</pre>
+<div class="cap">Strategy decision, October 15.</div></div>
+
+<h3>Engineering method written down on day one</h3>
+<ol>
+<li><b>Metrics before features.</b> Per-frame time split (guest code, host APIs, command encode, GL) first; every later decision follows numbers.</li>
+<li><b>The native build is the reference harness.</b> Fix game and rendering bugs natively (fast rebuilds, real debuggers, differential oracle), then port. Never debug game logic and the wasm port at the same time.</li>
+<li><b>Vertical slice early.</b> Menu → race → finish on the slow simple path, then optimise measured hot spots.</li>
+<li><b>Platform-layer boundary.</b> Win32, D3D9, audio, input and file HLE ("high-level emulation" = our own implementation of the Windows calls) sit behind a small interface.</li>
+<li><b>Regression safety.</b> Deterministic input replay, golden frame hashes, and the instruction-level oracle on every recompiler change.</li>
+</ol>
+
+<h3>The roadmap and what happened to it</h3>
+<table>
+<tr><th>Phase</th><th>Planned</th><th>What happened</th></tr>
+<tr><td>0 Measure</td><td>Timers, sim-rate experiment</td><td><span class="tag ok">done</span> found the 60 Hz cap is game-internal (F1–F3); 120 fps dropped by user decision D1</td></tr>
+<tr><td>1 Playable natively</td><td>UI, car paint, input, audio, saves</td><td><span class="tag ok">done</span> root causes were host-API bugs (section 6)</td></tr>
+<tr><td>2 Platform layer</td><td>platform.h, in-process sink</td><td><span class="tag warn">partial</span> hostcommon/plat.h exist; the in-process sink only on the wasm path</td></tr>
+<tr><td>3 First wasm build</td><td>hot-set module + interpreter fallback</td><td><span class="tag ok">reached</span> menus at 60 fps in headless Chromium; a race at 7–8 fps. Later measured as <span class="tag bad">no-go for a 60 fps race</span> (F155)</td></tr>
+<tr><td>4 Gameplay completeness</td><td>movies, streaming, coverage</td><td><span class="tag warn">partial</span> Bink movies play; streaming them efficiently is open</td></tr>
+<tr><td>5 Performance</td><td>direct tail calls, lazy flags, WebGPU</td><td><span class="tag ok">60 fps race</span> via parallel guest threads; WebGPU renderer built behind a flag</td></tr>
+<tr><td>6 Multiplayer</td><td>WebRTC + lobby server</td><td><span class="tag ok">changed</span> serverless UDP mesh instead; verified with two instances</td></tr>
+</table>
+</section>
+
+<section id="timeline">
+<h2><span class="sec-num">3</span>How it unfolded</h2>
+<div class="diagram">
+<pre class="mermaid">
+timeline
+  title Blur port, October 2026
+  section Day 0-1
+    Oct 15 : Research and plan (B chosen)
+           : Recompiler lifts 373k functions, first frames in WebGL2
+    Oct 16 : Agent team launched, 13 workstreams
+           : UI textures empty, root cause found (GetType stub)
+           : Audio, Bink movies, offline shader cache, wasm M1/M2
+           : Race stall found: strict-aliasing UB
+  section Play-test fixes
+    Oct 17 : Race fps diagnosed as CPU-scheduling bound
+           : Parallel guest threads, 17 to 60 fps
+           : Texture leak, mirror viewport, input, heap fixes
+  section Multiplayer and packaging
+    Oct 18-19 : 2-instance LAN race verified, serverless mesh mode
+              : One-click Mac bundle (5.6 GB zip)
+    Oct 22 : Windows x64 and Linux x64/arm64 bundles
+  section Browser-native direction
+    Oct 23 : Study of two browser game sites
+           : Spikes: hash cache, WebGPU, full wasm
+           : Decision: native game + WebGPU page + hash cache
+           : WebGPU renderer, gamma and sampler fixes
+</pre>
+<div class="cap">Dates come from the change log in <code>PLAN_120FPS.md</code>; F-numbers in the text refer to its findings.</div></div>
+
+<p>Roughly three phases of work, each with a different feel:</p>
+<ul>
+<li><b>Make it run (Oct 15–16).</b> Many parallel investigations: why the UI was empty, why the game crashed after 7,000 frames, why the colours were wrong, how audio and movies work. Most of the time was spent proving where a bug <em>wasn't</em>.</li>
+<li><b>Make it fast and playable (Oct 17–22).</b> Play-test with the user in a real Chrome, fix what they saw, find the real frame-rate limiter, then package for three operating systems.</li>
+<li><b>Make it browser-native (Oct 23).</b> Learn from two browser game sites, run three time-boxed spikes (cache, WebGPU, wasm), choose a direction by measurement, then build and debug it live.</li>
+</ul>
+</section>
+
+<section id="how">
+<h2><span class="sec-num">4</span>How it works</h2>
+<p>The shape of the system, from the user's game folder to pixels:</p>
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Prep["Offline / first boot"]
+    EXE["Blur.exe<br/>(packed, PE32 x86)"] --> UC["Unicorn emulator<br/>runs the packer stub"]
+    UC --> OEP["Snapshot at the real entry point<br/>0xd43105"]
+    OEP --> LIFT["lift.py + Capstone<br/>x86 to C, 373,530 functions"]
+    LIFT --> OBJ["Native objects (obj_p2_nb)"]
+  end
+  subgraph Run["blurrt (native process)"]
+    OBJ --> DISP["rt_dispatch<br/>(tail-call dispatch)"]
+    DISP --> HLE["Host runtime (HLE)<br/>Win32, D3D9, D3DX, DirectSound,<br/>DirectInput/XInput, Winsock, Bink"]
+    HLE --> CMD["Command stream<br/>(binary messages)"]
+  end
+  CMD -->|"WebSocket"| PAGE
+  subgraph Browser["Browser page"]
+    PAGE["renderer.js (WebGL2)<br/>renderer_gpu.js (WebGPU)"] --> SCR["Canvas"]
+    HLE -->|"PCM"| AW["AudioWorklet"]
+    KEY["Keyboard / gamepad"] -->|"input messages"| HLE
+  end
+</pre>
+<div class="cap">Data flow. The browser only draws and plays sound; all game logic runs in the native process.</div></div>
+
+<h3>Four ideas that carry the design</h3>
+<dl>
+<dt><b>1. The emulator only boots; recompiled code runs the game.</b></dt>
+<dd>Blur.exe is protected by a packer (the <code>.8thSin</code> section). Its stub decrypts the image and uses "call gates" that derive jump targets from the CPU's <code>CPUID</code> and rewrite return addresses. Unicorn runs it to the original entry point; from there a snapshot of memory is taken and the recompiled code takes over. Because the packer reads CPUID, <em>the emulator version must be identical everywhere</em> (we later hit this on Linux, section 9).</dd>
+<dt><b>2. Every call, return and indirect jump is a tail call through a dispatcher.</b></dt>
+<dd>The guest stack alone defines control flow, which is what the packer's return-address tricks need. Lifted functions end in <code>MUSTTAIL</code> calls to <code>rt_dispatch</code>, which looks the target up in a table. Flags travel in the CPU struct; host APIs are stubs the dispatcher recognises by address.</dd>
+<dt><b>3. Guest memory is one flat mapping at a fixed address.</b></dt>
+<dd>The host maps the guest's 4 GB at <code>0x7000000000</code>. Compiling the lifted code with that base as a constant removed a reload of the base pointer after every guest store (section 7).</dd>
+<dt><b>4. The renderer is a remote.</b></dt>
+<dd>D3D9 calls become a compact binary message stream (create texture, set state, draw, present). The page replays it. That boundary is what later let us swap WebGL2 for WebGPU, add a content-hash cache, and compare renderers on recorded frames.</dd>
+</dl>
+
+<h3>How the pieces map to Windows calls</h3>
+<table>
+<tr><th>Game uses</th><th>We implemented</th><th>Notes</th></tr>
+<tr><td>Direct3D 9 (device, textures, buffers, states, SM3 shaders)</td><td><code>d3d9.c</code>, <code>d3dx.c</code>, <code>gfx.c</code>, <code>web/renderer*.js</code></td><td>909 shaders seen at runtime; 2325 distinct translated offline</td></tr>
+<tr><td>DirectSound8 + Bink audio</td><td><code>audio.c</code>, <code>audio_mix.c</code>, AudioWorklet</td><td>The game mixes everything itself (its own "Mercury" mixer); we only provide an output device</td></tr>
+<tr><td>Bink 1 movies (31 files, 2.6 GB)</td><td><code>bink_ff.c</code> (FFmpeg) → decoded frames as textures</td><td>Open cost: decoded frames cross the wire (section 10)</td></tr>
+<tr><td>XInput / DirectInput</td><td><code>hle2.c</code> + browser keyboard events</td><td>The game reads the keyboard itself; the fake XInput pad was removed (it doubled every key press)</td></tr>
+<tr><td>Winsock / Demonware netcode</td><td><code>wsock_hle.c</code></td><td>UDP only, per-frame polling; see section 8</td></tr>
+<tr><td>Win32 threads, files, heap, time</td><td><code>hle.c</code>, <code>hostcommon.c</code>, <code>rt.c</code></td><td>~15 guest threads; scheduler and heap were the sources of the hardest bugs</td></tr>
+</table>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Attract movie played through the real Bink decoder]</em></span><figcaption>The attract movie playing through the real Bink decoder (FFmpeg) in the browser page; movies are decoded on the host and drawn as textures (F43).</figcaption></figure>
+</section>
+
+<section id="method">
+<h2><span class="sec-num">5</span>How we debugged</h2>
+<p>A pattern repeated all the way through: observe a symptom, <em>rule out the big suspects cheaply</em>, then narrow with tools built for the question. The tool belt grew to dozens of environment-gated switches (<a href="#appendix">appendix</a>).</p>
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S["Symptom (screenshot, fps, crash address)"] --> M["Measure: per-frame time, draws per frame,<br/>API counts, memory"]
+  M --> R{"Which layer?"}
+  R -->|"recompiler?"| O["Differential oracle vs Unicorn<br/>(1.2M random trials)"]
+  R -->|"host API?"| A["API trace, arg recorder,<br/>stub audit, strict mode"]
+  R -->|"renderer?"| D["Record the command stream,<br/>replay and diff"]
+  R -->|"scheduler / timing?"| P["Frame profiler: wall vs CPU vs<br/>time inside API handlers"]
+  O --> H["Hypothesis with a prediction"]
+  A --> H
+  D --> H
+  P --> H
+  H --> T["Cheap test that can kill it"]
+  T -->|"killed"| R
+  T -->|"survives"| F["Fix, then A/B against the old binary"]
+  F --> G["Golden hashes + scripted walk to guard it"]
+</pre>
+<div class="cap">The loop. "Killed" hypotheses are recorded in the log so nobody re-chases them (the UI bug had seven).</div></div>
+
+<h3>Tools that paid for themselves</h3>
+<table>
+<tr><th>Tool</th><th>What it answered</th></tr>
+<tr><td><b>Instruction oracle</b> (<code>oracle.c</code>, <code>sse_oracle.py</code>)</td><td>Is a lifted function equal to what the CPU does? 577 SSE instruction forms, 172,800 trials, 0 mismatches after four lifter fixes (<code>pshuflw/pshufhw</code>, <code>pmuludq</code>, <code>cvtpd2dq</code>, non-temporal stores)</td></tr>
+<tr><td><b>x86 interpreter</b> (<code>port/work/interp</code>)</td><td>Verified against Unicorn: 2.4 M single-instruction trials and 347 k function runs, 0 mismatches. Doubles as the fallback for code never lifted</td></tr>
+<tr><td><b>Write/read watches</b> (<code>BLUR_WATCHW</code>, <code>BLUR_EMUWATCH</code>)</td><td>"Does anyone ever write into this texture?" (no one did, which led to the real cause)</td></tr>
+<tr><td><b>Deterministic mode</b> (<code>BLUR_DET</code>)</td><td>With a fixed clock and frame-keyed input the render stream is bit-identical run to run (4 runs × 10,504 frame hashes)</td></tr>
+<tr><td><b>Stream dump</b> (<code>BLUR_GFXDUMP</code>, <code>BLUR_GFXSNAP</code>)</td><td>Record the exact bytes sent to the page. Replay them on any renderer, and diff two binaries message by message</td></tr>
+<tr><td><b>Frame profiler</b> (<code>BLUR_PROF</code>)</td><td>Wall ms vs process CPU ms vs time inside API handlers vs busiest guest threads. Found the serial scheduler</td></tr>
+<tr><td><b>Scripted walk</b> (<code>BLUR_KEYS</code> + puppeteer)</td><td>Reach the same menu or race headlessly. Keys can be scheduled relative to Lua events, e.g. <code>Enter@L:StopScoreboardRequests+6s</code></td></tr>
+<tr><td><b>Page HUD</b> (<code>#hud=1</code>)</td><td>Present-to-present frame times, draws, pipelines compiled, and (new) page JS time per frame</td></tr>
+</table>
+<div class="callout less"><div class="t">Lesson: check that the scene is moving</div>
+<p>Early "60 fps in the race" readings (F130) were a frozen scene: constant draws per frame, car stationary on the grid. Any fps number is only meaningful if draws per frame vary and the scene advances.</p></div>
+</section>
+
+<section id="bugs">
+<h2><span class="sec-num">6</span>The bug log</h2>
+<p>Each entry is: what we saw, what we tried, the real cause, and the fix. Longer stories first; the rest are in the <a href="#more-bugs">table at the end</a>.</p>
+
+<article class="bugcard" id="bug-ui">
+<h3>6.1 The empty UI: 140 textures full of zeros</h3>
+<dl>
+<dt>Symptom</dt><dd>The 3D menu scene rendered but no text, icons or buttons. The UI atlases (font 512×1024 DXT1, UI atlas 512×512 DXT5, about 140 textures) were all zeros at every draw.</dd>
+<dt>Wrong turns</dt><dd>Pixel shader constants c21–c25 had alpha 0 (a consequence, not a cause). An SSE lane bug in the lifter (oracle said no). A broken Bink movie gating the boot layer (faking it did not help). A missing event waking a worker thread (job system was alive). Raising crypto handle limits. A recompiler fault: the pure Unicorn emulator showed the <em>same</em> zero statistics, which cleared the recompiler.</dd>
+<dt>Clues that mattered</dt><dd>A write watch on the font atlas saw no write for 150 s. The pak files and their table of contents decoded fine and the UI bank requests were read in full. A runtime-created icon atlas <em>was</em> non-zero, so banks loaded dynamically; only some textures stayed empty.</dd>
+<dt>Root cause</dt><dd><code>IDirect3DResource9::GetType</code> was a stub returning 0. The game's texture helper (<code>0x5aa710</code>) switched on the resource type, got "unknown" and computed row size 0, so the bank uploader copied zero bytes into every bank texture.</dd>
+<dt>Fix</dt><dd>Return the real type from <code>GetType</code>. A related earlier fix (<code>parse_ctab</code> read the constant table at the wrong offset, so every <code>ID3DXConstantTable</code> held garbage) and input validation on <code>CreateTexture</code> followed. Both were independently found by different agents.</dd>
+</dl>
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+  S["UI text and icons missing"] --> H1["UI shader constants alpha 0"]
+  S --> H2["Lifter SSE bug"]
+  S --> H3["Boot movie gating the loader"]
+  S --> H4["Missing wake-up for worker threads"]
+  S --> H5["Recompiler produces wrong code"]
+  H1 -->|"consequence"| R
+  H2 -->|"oracle: 577/577 forms correct"| R
+  H3 -->|"fake Bink variants: no change"| R
+  H4 -->|"SetEvent counts: job system alive"| R
+  H5 -->|"pure emulator shows same zeros"| R
+  R["Nobody writes the texture memory (write watch)"] --> P["Trace the bank uploader 0x5a8f40 to helper 0x5aa710"]
+  P --> G["GetType stub returns 0: row size 0, memcpy of 0 bytes"]
+  G --> FIX["Implement GetType: UI appears"]
+</pre>
+<div class="cap">Five of the suspects, each killed by a cheap experiment; the sixth path (trace who calls the uploader) found it.</div></div>
+<div class="grid2">
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: UI visible but scene overexposed]</em></span><figcaption>First time the UI icon drew (the scene behind it is blown out; that is the exposure bug in 6.3).</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Main menu rendered]</em></span><figcaption>The main menu after the fix, in a 330-second headless soak.</figcaption></figure>
+</div>
+<div class="callout less"><div class="t">Lesson</div><p>A stub that returns a plausible value (0) is more dangerous than one that fails loudly. We added <code>BLUR_STRICT=1</code> (log "succeeded where Windows would fail") and an argument recorder (<code>BLUR_ARGREC</code>) to audit every stub, and found a handful more: caps fields the game reads, getters that did not fill their outputs.</p></div>
+</article>
+
+<article class="bugcard" id="bug-heap">
+<h3>6.2 The crash at frame ~7,400: a zero-sized texture</h3>
+<dl>
+<dt>Symptom</dt><dd>Every run died around frame 7,200–7,600 at <code>0x5ab7c4</code>: <code>call [vtable+8]</code> (a COM <code>Release</code>) on an object whose vtable word was garbage that changed per run. It appeared natively, in the emulator and in wasm, so it was not a recompiler problem.</dd>
+<dt>Investigation</dt><dd>A per-thread ring of the last 256 function entries, heap canaries behind every allocation, a heap-poisoning mode, and a "strict" mode. Different agents found the same pattern: the bad pointer always had <code>[esp]=005ab7c6</code>, always at the loading→showroom transition.</dd>
+<dt>Root cause</dt><dd>The game calls <code>CreateTexture(Width=0, Height=0, Levels=7, DXT1)</code>. We returned success with a 56-byte placeholder. The game then wrote real mip data (DXT blocks) into it, smashing the neighbouring object's vtable.</dd>
+<dt>Fix</dt><dd>Validate creation parameters and return <code>D3DERR_INVALIDCALL</code> with a null out pointer, as real D3D9 does. Same guards for volume, cube, buffer and render-target creation.</dd>
+</dl>
+<div class="callout less"><div class="t">Lesson</div><p>A "flaky crash with random garbage" that survives three execution engines is a host-side memory bug. The fastest route was making failures reproducible and loud (ring buffer, canaries) rather than reading generated code.</p></div>
+</article>
+
+<article class="bugcard" id="bug-exposure">
+<h3>6.3 The washed-out scene: same symptom, two different causes</h3>
+<p>Blur does automatic exposure. Every frame it renders the scene to a small target, reduces it to a 1×1 float texture ("adapted luminance"), and <em>reads that texel back on the CPU</em> with <code>GetRenderTargetData</code> to set exposure constants for the next frame. The renderer lives in the browser, so the readback has to travel: host → page (read the texel) → page → host (send the value) → guest memory.</p>
+
+<h4>Round 1: October 16, the stub</h4>
+<dl>
+<dt>Symptom</dt><dd>The whole scene saturated to pink-white. No city, no car body.</dd>
+<dt>Root cause</dt><dd><code>GetRenderTargetData</code> was a stub, so the CPU read luminance 0 and the game computed maximum exposure: the pixel shader constant <code>c31</code> became (100, 0.01, …).</dd>
+<dt>Fix</dt><dd>Message 81 asks the page to read texel (0,0); the page answers with input type 10; the host writes the float into the destination surface. The page reads it asynchronously with a pixel-pack buffer and a fence, because a synchronous <code>readPixels</code> per frame stalled the GPU (about 30% of page time in a race).</dd>
+</dl>
+<h4>Round 2: October 23, the collision</h4>
+<dl>
+<dt>Symptom</dt><dd>The user reported "the gamma issue is back", on both WebGL2 and WebGPU. The title screen was pink again, and this time the 3D city and car were missing too.</dd>
+<dt>First wrong guess (ours)</dt><dd>We assumed the new WebGPU path lacked a gamma ramp and implemented one. The WebGL2 page showed the same pink, which killed that theory: the bug was common to both renderers. The gamma-ramp code is harmless but was not the cause.</dd>
+<dt>Method</dt><dd>(1) The old pre-merge binary on the same page rendered correctly, so the page was fine and the host binary was at fault. (2) Disabling the hash cache did not help. (3) Both binaries sent the same message types and counts. (4) We recorded each stream and diffed the <em>last frame</em> message by message: every draw was identical, texture ids differed only in numbering, but two pixel-shader constants differed: <code>c31 = (100, 0.01, …)</code> in the bad build and <code>(1, 1, …)</code> in the good one. That is exactly the "luminance read as 0" signature of round 1.</dd>
+<dt>Root cause</dt><dd>See the next entry: the new cache protocol swallowed the readback answer.</dd>
+</dl>
+<div class="grid3">
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Bad build]</em></span><figcaption>Bad host binary: exposure maxed, scene gone.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Good build]</em></span><figcaption>Pre-merge binary, same page.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Fixed build]</em></span><figcaption>Current binary after the fix, hash cache on.</figcaption></figure>
+</div>
+<div class="grid2">
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: User screenshot]</em></span><figcaption>The user's screenshot that started it: the menu bloomed out to white and pink.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Overexposed race frame in a replay]</em></span><figcaption>An earlier clue we misread: frames captured for the WebGPU replay tests were also overexposed, and we filed it as "a known exposure issue in both renderers".</figcaption></figure>
+</div>
+<div class="callout less"><div class="t">Lesson</div><p>"Known issue in both renderers" is a smell. If two independent implementations agree on a wrong picture, the bug is upstream of both. And a regression is best found by diffing <em>data</em> (constants per draw) between a good and a bad build, not by looking at pictures.</p></div>
+</article>
+
+<article class="bugcard" id="bug-collision">
+<h3>6.4 The new cache protocol ate the exposure answer (F159)</h3>
+<dl>
+<dt>Cause</dt><dd>Page → host messages are small binary frames whose first 32-bit word is a type: 1 key down, 2 key up, … 10 readback answer. The new hash cache needed two extra page → host messages (an "announce" of known hashes, and a "stored" acknowledgement) and used the numbers <b>10</b> and <b>12</b>. The host's receive loop treated every frame starting with 10 or 12 as a cache message and never queued it as input.</dd>
+<dt>Why it escaped</dt><dd>Everything else worked. Keyboard, mouse and the cache itself were fine; the one affected message type is only consumed by the exposure code. Our checks looked at fps, draws and "does the picture exist", not the colour.</dd>
+<dt>Fix</dt><dd>Cache messages now use their own codes <code>0x48430A</code> and <code>0x48430C</code> ("HC" + 0x0A / 0x0C) in <code>hcache.js</code>, <code>net.c</code> and <code>gfx.c</code>. Verified by screenshot (night city and car back) and by a hook that logs the type-10 answers.</dd>
+</dl>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant G as Game (guest)
+  participant H as Host (net.c)
+  participant P as Page
+  G->>H: GetRenderTargetData (exposure texel)
+  H->>P: message 81: read texel (0,0)
+  P-->>H: input type 10 = float bits
+  Note over H: BEFORE: frames starting with 10 were handled as a cache announce, so the answer was dropped
+  H--xG: (never delivered) luminance reads as 0
+  Note over G: exposure = max, c31 = 100
+  Note over H: AFTER: cache messages use 0x48430A / 0x48430C
+  P-->>H: input type 10 = float bits
+  H-->>G: texel written, normal exposure
+</pre>
+<div class="cap">Where the answer went missing.</div></div>
+<div class="callout less"><div class="t">Lesson</div><p>When a protocol grows a second use, give it its own namespace. A sentinel-style range (here a 24-bit "magic" prefix) is cheap insurance. A wire-protocol checklist item for any new message: "does its type code collide with an existing one, in either direction?"</p></div>
+</article>
+
+<article class="bugcard" id="bug-alias">
+<h3>6.5 The race that never started: undefined behaviour in generated C</h3>
+<dl>
+<dt>Symptom</dt><dd>At the start of a race the native process stopped advancing: 0 fps, half-drawn frame, watchdog "no scheduling progress", last thread stuck at <code>0x4cb1dd</code>. The log was full of "Potentially bad data" lines, which looked suspicious but are normal developer output.</dd>
+<dt>Root cause</dt><dd>The lifted code reads floats with <code>*(float*)</code> and stores 8 bytes with <code>*(uint64_t*)</code>, but the build had no <code>-fno-strict-aliasing</code>. In the unguarded insertion sort <code>f_004d1310</code> the game does <code>movq [esp+0x40], xmm3</code> then <code>comiss xmm2, [esp+0x44]</code>. Clang assumed the 64-bit store cannot change a float and <b>hoisted the load out of the loop</b> (visible in the disassembly: one <code>ldr s1</code> before the loop, none inside), so the comparison never changed.</dd>
+<dt>Found by</dt><dd>Two agents independently, one by bisecting toggles and one by reading the machine code of the stuck function.</dd>
+<dt>Fix</dt><dd>Compile with <code>-fno-strict-aliasing</code>. The wasm build was only spared because race code ran in the interpreter. Rebuilt objects also pick up this flag in the fast build recipe.</dd>
+</dl>
+<div class="callout less"><div class="t">Lesson</div><p>A loop that never terminates in correct-looking lifted code is a compiler assumption problem before it is a logic problem. Look at the generated machine code for the loop.</p></div>
+</article>
+
+<article class="bugcard" id="bug-sampler">
+<h3>6.6 Black frames in WebGPU: one invalid sampler drops the whole frame</h3>
+<dl>
+<dt>Symptom</dt><dd>From a screen recording: about a second of pure black when a taxi swerved close to the player's car, with the HUD graph still running. Other users of a WebGPU page would see "frames missing" in cutscenes or after impacts.</dd>
+<dt>Method</dt><dd>A scripted race drive on <code>#gpu=1</code> with console capture. The log showed 66 × "[Invalid Sampler] is invalid → [Invalid BindGroup] → [Invalid CommandBuffer]" and the WebGPU validation message: <em>minFilter/magFilter/mipmapFilter must all be linear when maxAnisotropy &gt; 1</em>.</dd>
+<dt>Root cause</dt><dd>The game requests anisotropic filtering with one filter set to point sampling or no mip filter. WebGL2 tolerated that; WebGPU makes the sampler invalid, which invalidates every bind group that uses it, which invalidates the whole command buffer for the frame. Chrome drops the submit and the canvas shows black.</dd>
+<dt>Fix</dt><dd>When anisotropy &gt; 1, force min, mag and mipmap filters to linear. Re-run: 137 warnings before, 1 afterwards (the harmless "audio needs a click" notice), zero Invalid messages.</dd>
+</dl>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Contact sheet of the screen recording around the black second]</em></span>
+<figcaption>Six-frames-per-second contact sheet of the screen recording: a taxi swerves in (top row), then five black frames (third row), then the scene returns over-bright (the game's own exposure re-adapting).</figcaption></figure>
+<div class="callout less"><div class="t">Lesson</div><p>WebGPU's validation is all-or-nothing per submit. Add error scopes or run with the console open during testing, and treat any "Invalid …" line as a dropped frame, not a warning.</p></div>
+</article>
+
+<h3 id="more-bugs">More bugs, shorter</h3>
+<table>
+<tr><th>Bug</th><th>Symptom</th><th>Root cause and fix</th></tr>
+<tr><td>Online-account gate (F65–F83)</td><td>Front-end stalled after the start screen</td><td><code>ReadOnlineAccountDetails</code> reads a name/password from the profile and returns false on a fresh one; the (invisible) registration form waited for input. Seed an account name and password into the primary profile, or press Down+Enter on the dialog (Skip).</td></tr>
+<tr><td>Random colours after "no copy" upload change (F115)</td><td>Teal/orange/psychedelic grading, different every run</td><td><code>convert()</code> built typed arrays at offset 0 of the buffer while the data was now a view inside the message buffer. Copy when <code>byteOffset != 0</code>.</td></tr>
+<tr><td>Rear-view mirror half drawn (F134)</td><td>Mirror showed the left 320 of 576 columns</td><td>D3D9 resets viewport and scissor to the whole target on <code>SetRenderTarget</code>; the host kept the previous pass's 320×192 viewport.</td></tr>
+<tr><td>Texture leak (F131)</td><td>fps decayed over a session (live textures 7.9k → 15k+)</td><td>The host freed destroyed D3D objects but never told the page. New message <code>G_DESTROY</code> (95).</td></tr>
+<tr><td>Host never replayed to a new viewer (F139)</td><td>Reloading the page showed nothing while audio kept playing; host waited 100 ms per frame for acks (7 fps)</td><td>On a new connection <code>d3d9_replay_resources()</code> re-creates every live resource; the frame-lead counter resets.</td></tr>
+<tr><td>Fake XInput pad (F138)</td><td>Every key fired twice (pad action plus the game's own keyboard binding)</td><td>Removed the keyboard-driven pad. Only real gamepad state reaches XInput.</td></tr>
+<tr><td>Guest heap exhaustion (F135, F143)</td><td>Crash in long sessions; allocator returned NULL with 124 MB on free lists</td><td>Reuse the smallest fitting free block when the bump region is full; object table cap raised to 1,048,576.</td></tr>
+<tr><td>Interpreter spin loops (F113)</td><td>Audio thread starved others</td><td>The interpreter charged its budget per call, so a loop without calls never yielded. Charge per back-edge.</td></tr>
+<tr><td>Stuck car after tab switch (F133)</td><td>Reverse gear "held forever"</td><td>The browser never delivers key-up after a focus change. Release every held key on blur/visibility/pagehide, and release by physical key code.</td></tr>
+<tr><td>Wrong Winsock ordinals (F25)</td><td>ioctlsocket/inet_addr/inet_ntoa swapped</td><td>Ordinals 10/11/12 corrected from real <code>ws2_32</code> and from game code at <code>0xd207e0</code>.</td></tr>
+<tr><td>Identical crypto nonces (F25, F51)</td><td>Two instances got the same DH keys</td><td><code>CryptGenRandom</code> was libc <code>rand()</code> with no seed. Seed per instance.</td></tr>
+<tr><td>Audio click on tab close (F116)</td><td>Crack when closing the page</td><td>Master gain ramp and a stop marker from the host.</td></tr>
+<tr><td>Emulator version mismatch on Linux (F153)</td><td>Boot hang at a garbage jump (<code>0x81fb7506</code>)</td><td>A system Unicorn 2.0.x gave different CPUID-derived targets. Link Unicorn 2.1.4 statically everywhere.</td></tr>
+<tr><td>Prefilled "B" and "*" on the Online Account dialog (October 23)</td><td>The dialog showed a one-letter username and one-char password, and the scripted Skip landed on "Create new account"</td><td>An earlier test run had typed junk into the saved profile (the save is obfuscated, so not hand-editable). With prefilled fields the dialog's focus starts on "Log in", so one Down was not enough. <code>BLUR_SEEDACCT=clear</code> zeroes the name/password fields in the profile when <code>ReadOnlineAccountDetails</code> runs; the dialog then opens with focus on "Create new account", and Down+Enter is Skip.</td></tr>
+<tr><td>Delete key on Mac (October 23)</td><td>The key labelled "delete" does nothing</td><td>A Mac's delete is Backspace. The page now sends both Backspace and Delete for it, and the host maps VK 46 to DIK_DELETE.</td></tr>
+</table>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Warning popup after Skip]</em></span><figcaption>The "Some features will be unavailable without a valid online account" popup that follows Skip. Host-injected Enter keys never dismiss it; real browser key events do, which is why the scripted drive is hybrid (host keys for the title and Skip, browser keys afterwards).</figcaption></figure>
+</section>
+
+<section id="perf">
+<h2><span class="sec-num">7</span>The road to 60 fps</h2>
+<p>The user's goal changed on October 16–17: <em>"a solid 60 fps in a race in fullscreen, whatever it takes"</em>. The 120 fps idea was dropped because Blur's simulation is built around a 60 Hz step (many code paths reference 1/60), so speeding up the presentation would speed up the game.</p>
+
+<div class="chart"><h5>Race frame rate through the project</h5>
+<div class="bars" id="chart-fps"></div>
+<div class="note">Not a benchmark suite: each bar is the number the log or a user screenshot reported at that point, in the state described. "Heavy scene" means 3,000+ draws per frame.</div></div>
+
+<h3>Where the game stands now: evidence from a screen recording</h3>
+<p>On the last day the user recorded a WebGPU race on the Mac. Frame-time HUD readings from that video line up with draw counts: the heavier the scene, the lower the fps. The recording itself (3600×2260 at 120 Hz) costs GPU time, so real numbers may be a little better.</p>
+<div class="grid2">
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: HUD at 2:22]</em></span><figcaption>2:22 — 40.7 fps, avg 24.6 ms, p99 44 ms, 2,594 draws, 1,019 pipelines compiled, 0 pending.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: HUD at 3:54]</em></span><figcaption>3:54 — 29.4 fps, avg 34 ms, p99 50 ms, 3,263 draws.</figcaption></figure>
+</div>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Crowded scene at about 30 fps]</em></span><figcaption>3:50–3:58, a crowd of cars around the player. The frame-time graph is red for the whole stretch.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Shock power-up effect]</em></span><figcaption>2:19–2:26, a Shock power-up: blue lightning, then a whiteout, then lightning over the car. Heavy full-screen effects.</figcaption></figure>
+<div class="callout find"><div class="t">What this does and does not show</div><p>Pipelines were not compiling (0 pending, 0 skipped), so it is not shader compilation. The HUD measures time between the game's frames arriving at the page, so a slow frame means either the host produced it late or the page was busy. The next measurement is <code>BLUR_PROF=120</code> on the host together with the HUD's new "page JS per frame" line.</p></div>
+
+<h3>Finding the limiter</h3>
+<ol>
+<li><b>The page was not the bottleneck.</b> In the user's real Chrome the HUD showed page JavaScript at 12–16 ms/frame, but the host's own fps log matched the page fps. With no viewer at all (<code>BLUR_NOWAIT</code>) and the accelerator held, the host alone ran 17–30 fps.</li>
+<li><b>The host was half asleep.</b> The main thread spent about half of each 60 ms frame idle in the cooperative scheduler. A profile (<code>BLUR_PROF</code>) showed three heavy guest threads (≈16, 15 and 12 ms) executed <b>one after the other</b> by a single host thread, with 6,000 context switches per frame.</li>
+<li><b>The fix</b> was one host thread per guest thread (<code>BLUR_PAR=1</code>). A global lock is held only inside API handlers (the HLE stays single-threaded by construction); blocked threads park on a per-thread condition variable and are woken after each API call re-evaluates who can run. The lifter already emitted sequentially-consistent atomics for <code>lock</code>/<code>xchg</code>.</li>
+</ol>
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Before["Cooperative scheduler: one host thread"]
+    direction TB
+    B0["main thread 12 ms"] --> B5["thread 5 16 ms"] --> B13["thread 13 15 ms"] --> BP["present: about 60 ms wall"]
+  end
+  subgraph After["BLUR_PAR=1: one host thread per guest thread"]
+    direction TB
+    A0["main 12 ms"]
+    A5["thread 5 16 ms"]
+    A13["thread 13 15 ms"]
+    A0 --> AP["present: about 16 ms wall"]
+    A5 --> AP
+    A13 --> AP
+  end
+</pre>
+<div class="cap">Same work, run concurrently. Diagrammatic: numbers are the profile from F137.</div></div>
+
+<h3>What else moved the numbers</h3>
+<table>
+<tr><th>Change</th><th>Measured effect</th><th>Kept?</th></tr>
+<tr><td>Fixed guest base address as a compile-time constant</td><td>total CPU −8.6% on identical paced racing (210.6 s → 192.5 s per 120 s window)</td><td><span class="tag ok">yes</span></td></tr>
+<tr><td><code>restrict</code> CPU pointer + no trace/budget checks</td><td>−12.7% total vs the old build; binary 180 → 128 MB</td><td><span class="tag ok">yes (needs PAR)</span></td></tr>
+<tr><td>Renderer: shadow all GL state, cache render-target resolution, program cache</td><td>page JS 7.5 → 4.9 ms/frame at 2.5k draws; idle 24% → 52%</td><td><span class="tag ok">yes</span></td></tr>
+<tr><td>Redundant GL-call filter, lazy <code>activeTexture</code></td><td>16.5k → 14.8k GL calls per frame at higher draw counts (8.3 → 5.8 per draw)</td><td><span class="tag ok">yes</span></td></tr>
+<tr><td>Half-rate rear-view mirror in the page</td><td>mirror + helper = 28% of all draws; alternate frames skip them while frame EMA &gt; ~18 ms</td><td><span class="tag ok">yes (auto)</span></td></tr>
+<tr><td><code>-O2</code> for the lifted code</td><td>+2% only</td><td><span class="tag bad">no</span></td></tr>
+<tr><td>Separate D3D lock lane</td><td>no measurable change (p95 17.4 vs 17.5 ms)</td><td><span class="tag warn">opt-in, off</span></td></tr>
+<tr><td><code>-mcpu=native</code></td><td>identical code</td><td><span class="tag bad">no</span></td></tr>
+<tr><td>Coroutine scheduler + runnable filter (perf2)</td><td>showroom frame 125 M instr / 32 ms → 32 M / 5.8 ms</td><td><span class="tag ok">yes</span></td></tr>
+</table>
+<div class="callout find"><div class="t">What the numbers said</div>
+<p>The scheduler change moved the whole game from 17–30 to 60 fps. Every other change moved the result by single-digit percent. The A/B discipline (identical paced racing, two runs per configuration) is what stopped us from keeping "improvements" that did nothing.</p></div>
+</section>
+
+<section id="mp">
+<h2><span class="sec-num">8</span>Multiplayer</h2>
+<h3>What the game does on the network</h3>
+<p>Reverse engineering (<code>port/work/net-re/NETCODE.md</code>) found that Blur's networking is the Demonware "bd" SDK plus Bizarre's own session layer:</p>
+<ul>
+<li>All gameplay traffic is <b>non-blocking UDP polled once per frame</b> through plain <code>socket/bind/sendto/recvfrom</code>. TCP/OpenSSL/curl exist only for the dead online services.</li>
+<li>Datagrams are at most 1,288 bytes. Per peer: NAT traversal, a DTLS-like handshake (HMAC + Diffie-Hellman keyed by a security id), then an own message layer (10-byte header, ≤1 KB fragments, sequence numbers, reliable/unreliable channels).</li>
+<li>Not lockstep: state is replicated. Each car is a <b>25-byte record</b> (24 bytes of bit-packed rigid-body state plus a feedback byte), sent about every 100 ms; 25 ordered race events (hits, spawns, boosts, abilities) ride in one message type.</li>
+<li><b>LAN mode exists and needs no backend.</b> Discovery is a UDP broadcast on port 50001 (24-byte query, 160-byte reply, 2 s window, 10 hosts max). Up to 20 players.</li>
+</ul>
+<h3>Two designs, one kept</h3>
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph First["First design (F24-F33, F48-F51): lobby + relay"]
+    direction TB
+    G1["Game A (virtual 10.77.0.1)"] -->|"16-byte relay frames"| R["Node relay + lobby<br/>rooms, tokens, kick/ban,<br/>star topology above 8"]
+    G2["Game B (10.77.0.2)"] --> R
+    R --> G3["Game C"]
+  end
+  subgraph Second["Final design (F152): serverless mesh"]
+    direction TB
+    M1["Game A"] <-->|"UDP 47801 HELLO + DATA"| M2["Game B"]
+    M2 <--> M3["Game C"]
+    M1 <--> M3
+  end
+</pre>
+<div class="cap">The browser-plus-server design is built and tested; for the home setup the mesh is simpler and needs no infrastructure.</div></div>
+<table>
+<tr><th>Option</th><th>For</th><th>Against</th><th>Outcome</th></tr>
+<tr><td>Winsock HLE over WebRTC data channels + lobby server</td><td>works for a pure browser/wasm build; internet play</td><td>needs a server (signalling, TURN); a mesh grows poorly past ~8 players</td><td><span class="tag info">built, tested with 12 simulated peers, parked</span></td></tr>
+<tr><td>Serverless UDP mesh on port 47801 (<code>BLUR_NET_MESH=1</code>)</td><td>zero config, no server, uses the game's own LAN discovery</td><td>one game per machine; same /24 for virtual IP collisions</td><td><span class="tag ok">chosen for the home setup</span></td></tr>
+</table>
+<p>Verified end to end on one machine with two instances (Multiplayer → local area network → host a playlist; second instance joins; both load a track and see each other). Not yet verified across two physical machines.</p>
+</section>
+
+<section id="cross">
+<h2><span class="sec-num">9</span>Mac, Windows, Linux</h2>
+<p>The home setup is an Apple Silicon Mac plus Windows and Linux machines (x64; the Linux box might be arm64). The child needs a zero-config zip.</p>
+<table>
+<tr><th>Target</th><th>Build</th><th>What had to change</th></tr>
+<tr><td>macOS arm64</td><td>native, 18 dylibs bundled with <code>install_name_tool</code> and ad-hoc signed</td><td>Reference platform. <code>Start.command</code> clears quarantine, asks the player name once, picks a free port, opens Chrome kiosk</td></tr>
+<tr><td>Windows x64</td><td>llvm-mingw cross build with static deps; tested under Wine</td><td><code>#ifdef _WIN32</code> blocks: winsock, <code>GetAdaptersAddresses</code> mesh, <code>VirtualAlloc</code> at <code>0x7000000000</code>, <code>winport.h</code>; <code>Start.bat</code>/<code>Start.ps1</code></td></tr>
+<tr><td>Linux x64 and arm64</td><td>built in Docker (x64 under Rosetta), smoke-tested in <code>ubuntu:20.04</code>; the bundle ships its own glibc and loader</td><td>Makefile branch with static Unicorn 2.1.4; guarded Apple-only coroutine path, <code>libproc</code> and <code>ucontext</code> register access; <code>start.sh</code></td></tr>
+</table>
+<div class="chart"><h5>Bundle sizes (all contain the user's own game copy)</h5>
+<div class="bars" id="chart-zips"></div></div>
+<div class="callout dec"><div class="t">Decisions</div>
+<ul>
+<li><b>Single harness, per-OS shims</b> (<code>plat.h</code> semaphore wrapper, <code>CPU_RELAX()</code> instead of the arm-only <code>yield</code>) rather than three forks.</li>
+<li><b>Static emulator everywhere</b>, because boot depends on CPUID-derived jump targets (<code>blurrt</code> and Unicorn must agree).</li>
+<li><b>Guest memory after boot is byte-identical Mac vs Linux</b> (verified with <code>BLUR_DUMPMEM</code>), so a snapshot is portable.</li>
+<li>Launchers gained opt-ins (<code>BLUR_SHARE_LAN=1</code>, <code>BLUR_REMOTE=…</code>); defaults are unchanged and stay on 127.0.0.1.</li>
+</ul></div>
+<p class="note"><span class="tag warn">not yet tested on real hardware</span> the Windows <code>Start.bat</code>/<code>Start.ps1</code> and firewall prompt, the Linux browser launch on a real desktop, and a two-machine LAN game.</p>
+</section>
+
+<section id="phase4">
+<h2><span class="sec-num">10</span>Browser-native direction (October 23)</h2>
+<p>The user pointed us at two browser game sites that stream desktop games well: a cricket game recompiled to wasm with WebGPU, and an NFS game running on a custom Rust engine. We studied their client architecture only (not their game files).</p>
+<table>
+<tr><th>Site</th><th>What it does</th><th>What we took from it</th></tr>
+<tr><td>Cricket-style (recompiled exe → wasm)</td><td>WebGPU renderer, OPFS storage, 16 MB gzip parts decoded with <code>DecompressionStream</code>, <b>content-hash URLs</b>, AudioWorklet reading wasm memory, COOP/COEP, lockstep netplay</td><td>content-hash caching; WebGPU as the higher-ceiling renderer</td></tr>
+<tr><td>NFS-style (custom Rust engine)</td><td>WebGPU with render bundles, indirect draws and compute; Cache API keyed by content hash; converted asset formats; server accounts</td><td>how cheap a GPU API can be per draw; content-addressed caching</td></tr>
+</table>
+<p>Three time-boxed spikes ran in parallel, each ending in a go/no-go with measurements. A subagent per track wrote a report; the orchestrating session wrote each <code>REPORT.md</code> and decided.</p>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TD
+  Q["Goal: better performance and load times"] --> A["Track A: hash cache + LAN serving"]
+  Q --> B["Track B: WebGPU renderer"]
+  Q --> C["Track C: full wasm port"]
+  A -->|"GO: -57% wire bytes on visit 2"| D["Hybrid: native game + WebGPU page + hash cache"]
+  B -->|"GO: all 2331 shaders reach WGSL, ~6-8x less JS per draw"| D
+  C -->|"NO-GO for 60 fps: wasm 1.5-1.85x slower than native"| X["Keep port/web as the no-install 30 fps route"]
+</pre>
+<div class="cap">Decision F155. Wasm is parked, not abandoned.</div></div>
+
+<h3 id="trackA">Track A: content-hash cache</h3>
+<h4>Measure first</h4>
+<p>Per-message-type raw byte counts from the host (<code>BLUR_HCSTAT=1</code>): the page receives <b>1.1 GB in the first 45 s</b> and about <b>9.4 GB over 200 s</b> if the career intro movie plays. Texture uploads are 85–97% of all bytes. Vertex/index buffers are 0.3%, shaders 0.04 MB (already offline-cached), state and draw messages about 10%.</p>
+<div class="chart"><h5>Where the first 1.1 GB goes (first 45 s: boot, title, attract movies)</h5>
+<div class="bars" id="chart-bytes"></div>
+<div class="note">The Bink movie traffic cannot be cached: it is one of a few 640×360 or 1280×720 textures re-uploaded with new pixels every frame (about 120 MB/s). Over a 200 s session that includes the career intro movie the total reaches about 9.4 GB.</div></div>
+
+<h4>Design</h4>
+<ul>
+<li>The <b>host rewrites each finished batch</b> right before sending; message producers are untouched.</li>
+<li>Only uploads of at least <b>2 KB</b> from objects that have uploaded at most <b>twice</b> are hashed. That keeps video frames and dynamic buffers out.</li>
+<li>Hash: a 64-bit multiply-fold (wyhash-style, two lanes, about 8–10 GB/s).</li>
+<li>The page keeps payloads in <b>IndexedDB</b> (192 MB memory layer in front, default cap 1,536 MB with LRU eviction at startup), and <b>announces its hashes at connect</b>; the host waits up to 3 s for that.</li>
+<li>A hash counts as known only <b>after the IndexedDB write commits</b> (ack message), so the host never refers to something the page might have lost.</li>
+<li>IndexedDB writes are throttled (slices ≤3 MB, only while the last 12 presents average ≤18 ms, pending queue ≤160 MB) because the first version dipped to 41–44 fps on first visit.</li>
+</ul>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant H as Host (gfx.c)
+  participant P as Page (hcache.js)
+  participant DB as IndexedDB
+  P->>H: ANNOUNCE hashes it holds (0x48430A)
+  Note over H: waits up to 3 s for the announce
+  H->>P: 98 TAGGED upload (payload + hash) for unknown content
+  P->>DB: store (throttled)
+  DB-->>P: commit
+  P->>H: STORED hashes (0x48430C)
+  H->>P: 96 REF (hash only) next time
+  P->>P: rebuild upload from cache
+</pre>
+<div class="cap">Protocol. The first version used codes 10 and 12 for the two page messages and broke exposure (section 6.4).</div></div>
+<h4>Results</h4>
+<div class="chart"><h5>Same run, title screen idle, ~43 s after start</h5>
+<div class="bars" id="chart-hash"></div>
+<div class="note">Visit 2: 5,228 refs (236 MB of texture data not sent), 0 misses. A verification run compared 5,084 uploads (244 MB) byte for byte: 0 mismatches. fps stayed at 60.</div></div>
+<h4>Cache lifetime (answer to "when is the download lost?")</h4>
+<ul>
+<li>OPFS, Cache API and IndexedDB are <b>per origin</b> (host and port). Another port or a LAN address is a different cache.</li>
+<li>Lost on "clear site data", when a private window closes, and evicted under storage pressure unless <code>navigator.storage.persist()</code> is granted.</li>
+<li>Hash-named content means only changed content re-downloads. A game update is cheap; a browser reset is not.</li>
+<li>WebGPU, OPFS and SharedArrayBuffer need a <b>secure context</b> (https or localhost). Another machine on plain http needs Chrome's <code>--unsafely-treat-insecure-origin-as-secure=&lt;origin&gt;</code> flag or https.</li>
+</ul>
+
+<h3 id="trackB">Track B: WebGPU renderer</h3>
+<h4>Shaders: D3D9 bytecode to WGSL, offline</h4>
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  BC["D3D9 shader bytecode<br/>(2331 distinct)"] --> VK["vkd3d-shader 2.1<br/>to SPIR-V"]
+  VK --> FIX["patch PointSize builtin,<br/>spirv-opt for const negate"]
+  FIX --> NG["naga 30.0.1<br/>to WGSL"]
+  NG --> IF["fixed interface rewrite:<br/>every varying is vec4 at a canonical<br/>location, component offsets applied offline"]
+  IF --> PK["blur.wgslpack (12.6 MB, 2.2 MB gz)"]
+  PK --> PAGE["page: createRenderPipelineAsync"]
+</pre>
+<div class="cap">All 2331 shaders convert; 111 of 111 real vertex/pixel pairs from the warm list compile in Chrome.</div></div>
+<table>
+<tr><th>Obstacle</th><th>Count</th><th>Fix</th></tr>
+<tr><td><code>PointSize</code> builtin unsupported by naga</td><td>520 vertex shaders</td><td>patch the SPIR-V</td></tr>
+<tr><td><code>OpSNegate</code> on a u32 constant</td><td>2 pixel shaders</td><td><code>spirv-opt --ccp --simplify-instructions</code></td></tr>
+<tr><td><code>textureSample</code> in non-uniform control flow</td><td>24 pixel shaders</td><td>prepend <code>diagnostic(off, derivative_uniformity);</code></td></tr>
+<tr><td>vkd3d numbers bindings per shader</td><td>14 pairs</td><td>fixed binding map: VS group 0, PS group 1; constants at binding 0, textures at 16+reg, samplers at 32+reg</td></tr>
+<tr><td>vkd3d trims varyings, naga drops <code>Component</code></td><td>71 pairs</td><td>every VS output and PS input is <code>vec4&lt;f32&gt;</code> at a canonical location, offsets applied offline</td></tr>
+</table>
+<p>GLSL → WGSL directly was a dead end (naga's GLSL front end rejects <code>#version 300 es</code>), and we kept the existing offline GLSL path for WebGL2.</p>
+<h4>Draw-cost benchmark</h4>
+<div class="chart"><h5>JS milliseconds per frame, 3,000 indexed draws, headless Chromium 141, M4 Max</h5>
+<div class="bars" id="chart-bench"></div>
+<div class="note">Trivial shaders and draws: this measures the API's JavaScript cost, not GPU shading. Real Chrome 157 gave 5.2 vs 0.92 ms (calibrated) and 9.34 vs 1.88 ms (heavy). Render bundles only win when whole chunks repeat byte for byte frame to frame, which D3D9 streams rarely do, so they are optional.</div></div>
+<h4>How the renderer maps D3D9 to WebGPU</h4>
+<ul>
+<li><b>Pipeline cache</b> keyed by (VS, PS, vertex layout, blend incl. separate alpha, colour mask, depth, stencil, cull, topology, target formats, sample count, depth bias). Viewport, scissor, stencil ref and blend constant are dynamic.</li>
+<li><b>Async compile</b>, at most 6 in flight. While a draw's pipeline compiles, the frame is held (last complete frame stays on screen, up to 30 frames), then the draw is skipped and counted.</li>
+<li><b>Warm list</b> of 431 pipelines (340 from replayed scenes plus 91 from live race-grid exports) plus recipes learned in earlier sessions (IndexedDB). Pipelines took p50 103 ms, p95 329 ms to create serially, which is why this matters.</li>
+<li>Per-draw constants through a <b>ring buffer with dynamic offsets</b> (about 1.3 KB per draw, 4 MB per frame).</li>
+<li>Vertex fix-ups: <code>unorm8x4-bgra</code> is absent in this Chrome, so COLOR0/1 swizzle through a pipeline-overridable constant; missing elements point at a zero-stride dummy buffer.</li>
+<li>sRGB: WebGPU decodes sRGB <em>before</em> filtering (the D3D-correct order); WebGL2 decodes after.</li>
+<li>A render target sampled in the same pass is illegal in WebGPU: end pass, copy, new pass with <code>loadOp: load</code>.</li>
+</ul>
+<h4>Validation: replay recorded frames against WebGL2</h4>
+<p>Three scenes were captured from the host (title 591 draws, career 735 draws, race 2,364 draws over 6 consecutive frames) as raw message streams. The same bytes were rendered by both renderers and compared per pixel: for the race frame, <b>98.8% of pixels within 8/255</b>. In the login-screen difference below the residue sits on soft background edges.</p>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: WebGL2, WebGPU and amplified difference of the title/login screen]</em></span>
+<figcaption>Replayed login screen: WebGL2 (left), WebGPU (middle), amplified difference (right). The difference is limited to soft bloom edges.</figcaption></figure>
+<div class="grid3">
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Race frame WebGL2]</em></span><figcaption>Race frame, WebGL2.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Race frame WebGPU]</em></span><figcaption>Same frame, WebGPU.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Difference]</em></span><figcaption>Amplified difference.</figcaption></figure>
+</div>
+<p class="note">These frames were captured while the host exposure bug (6.4) was active, so both look over-bright. That is fine for a renderer-vs-renderer comparison and a good example of the bug being invisible in one.</p>
+<h4>Live results</h4>
+<div class="grid2">
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Race grid on WebGPU]</em></span><figcaption>Scripted race grid on <code>#gpu=1</code> (after the sampler fix). The earlier run of the same script logged 2,035 draws, 60 fps, 700 pipelines compiled, 0 skipped.</figcaption></figure>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: Mid race on WebGPU]</em></span><figcaption>Same script, about a minute into the race. The earlier run logged 2,811 draws, 60 fps, page JS 5.3 ms/frame, 723 pipelines.</figcaption></figure>
+</div>
+<figure><span class="shot-omitted"><em>[screenshot omitted from the public repository: WebGPU menu with the HUD in the user's browser]</em></span><figcaption>The user's own browser on <code>#gpu=1&amp;hud=1</code>: a career reward screen at 60 fps with the WebGPU HUD (562 pipelines compiled, 0 pending, 0 skipped).</figcaption></figure>
+<p>Not implemented in the first renderer (none of the captured scenes use them): MSAA, triangle fans on indexed draws, point sprites (four vertex shaders write PSIZE), DrawUP, per-target write masks, <code>ColorFill</code> with a rect. 39 shaders read integer constants that are never set; they run with zeros.</p>
+
+<h3 id="trackC">Track C: full wasm (no-go for 60 fps)</h3>
+<p>A whole-game wasm build already existed (<code>port/web</code>): wasm module of the hot functions plus the interpreter fallback and the WebGL2 renderer in a Worker. It restored the OEP snapshot, drew the showroom at 60 fps, and the user had reached a race in it at 7–8 fps. The spike compared native and wasm on the same snapshot and a deterministic clock.</p>
+<div class="chart"><h5>Throughput on a 12 M API-call segment (lower is better)</h5>
+<div class="bars" id="chart-wasm"></div>
+<div class="note">First 1M API-call log lines byte-identical between native and wasm; switch, present and spin-event counts match at 12M. Call-heavy code is about 2.4× slower in wasm; one tight loop (inflate) is faster.</div></div>
+<table>
+<tr><th>Variant</th><th>Projected race fps</th><th>Effort</th></tr>
+<tr><td>Single wasm thread (exists)</td><td>11–26 typical, worse in crowds</td><td>0</td></tr>
+<tr><td>One Worker per guest thread over SharedArrayBuffer</td><td>33–47 typical, 14–20 crowded</td><td>20–28 days</td></tr>
+<tr><td>Plus dispatch redesign (inline probe or native-call model)</td><td>45–57 typical, 20–24 crowded</td><td>+3–15 days, uncertain</td></tr>
+</table>
+<div class="callout dec"><div class="t">Decision</div><p>No-go for 60 fps. The measured wasm cost (1.5–1.85× slower) on a game that is already CPU-bound at 60 fps natively leaves no headroom. <code>port/web</code> stays as the no-install ~30 fps route and is kept building. The 4 GB memory ceiling is also tight (the host uses 2.33 of 2.5 GB at startup) and stray pointers above the memory size trap in wasm where native reads zero.</p></div>
+</section>
+
+<section id="decisions">
+<h2><span class="sec-num">11</span>Decisions and trade-offs</h2>
+<p>The important choices, what we gave up, and what made us pick it. "Who" is the user (U) or the working session (S).</p>
+<table>
+<tr><th>#</th><th>Decision</th><th>Alternatives</th><th>Why / cost</th><th>Who</th></tr>
+<tr><td>1</td><td>Static recompile x86 → C, host the Windows API ourselves</td><td>Emulate in wasm; full decompile</td><td>Emulator never got past loading at usable speed; full decompile is years. Cost: a 520 MB generated tree, link times, and every Windows/D3D9 call is ours to get right.</td><td>S</td></tr>
+<tr><td>2</td><td>Unicorn only boots to the entry point; snapshot there</td><td>Re-run the packer each time</td><td>The packer's CPUID gates make re-running fragile. Cost: emulator version must be identical on every OS (static link).</td><td>S</td></tr>
+<tr><td>3</td><td>Keep the native build as the reference harness</td><td>Debug in the browser build</td><td>Seconds to rebuild, debuggers, deterministic replays. Cost: two renderers/targets to keep aligned.</td><td>S</td></tr>
+<tr><td>4</td><td><b>60 Hz simulation stays; target a rock-solid 60 fps</b> (120 dropped)</td><td>Interpolate to 120; patch dt constants</td><td>Many code paths hard-code 1/60; patching physics is risky. User decision.</td><td>U</td></tr>
+<tr><td>5</td><td>Delivery vehicle left open (browser or native window), measured later</td><td>Commit to wasm</td><td>The goal is the race at 60 fps, not a particular technology.</td><td>U</td></tr>
+<tr><td>6</td><td>Offline shader translation (D3D9 → GLSL ES), hash-keyed cache; async compile + warm list</td><td>vkd3d + SPIRV-Cross at runtime</td><td>2325/2325 shaders, byte-identical output, 1.27 MB gzip. Cost: only cache misses and <code>D3DXCompileShader</code> still need vkd3d at runtime.</td><td>S</td></tr>
+<tr><td>7</td><td>One host thread per guest thread (<code>BLUR_PAR=1</code>), global lock in API handlers</td><td>Keep the baton scheduler; optimise it</td><td>17–30 → 60 fps. Cost: ARM's weak memory model vs x86 TSO assumptions (no crash so far); the fast build only works with PAR on.</td><td>S</td></tr>
+<tr><td>8</td><td>Page connects over a WebSocket on loopback</td><td>In-process command sink</td><td>Keeps the hot path native and the browser disposable. Cost: serialisation and a copy. Loopback only by default; LAN sharing is an opt-in (<code>BLUR_BIND</code>) because anyone who can reach the port controls the game.</td><td>S</td></tr>
+<tr><td>9</td><td>Remove the fake XInput pad</td><td>Keep keyboard→pad mapping</td><td>It made every key fire twice. The game has its own keyboard bindings.</td><td>S</td></tr>
+<tr><td>10</td><td>Account seeding or press Skip on the Online Account dialog</td><td>Fake the Demonware login</td><td>The dialog is a local profile check; the dead servers are not needed.</td><td>S</td></tr>
+<tr><td>11</td><td>LAN play as a serverless UDP mesh; relay/WebRTC lobby kept but parked</td><td>Relay only; WebRTC mesh</td><td>No infrastructure for a home LAN. Cost: one game per machine; internet play needs the relay path.</td><td>S</td></tr>
+<tr><td>12</td><td>Bundle the user's game copy in the per-OS zips</td><td>Ship without the game</td><td>Zero-config for the child. Private, for the user's own machines only. No save file is bundled (an earlier tester save held junk account fields).</td><td>U/S</td></tr>
+<tr><td>13</td><td><b>Hybrid: native game + WebGPU page + hash cache; wasm parked</b></td><td>Full wasm port; stay on WebGL2</td><td>Measured: WebGPU ≈ 6–8× less JS per draw; wasm 1.5–1.85× slower than native on a CPU-bound game. Cost: needs a native process; the page needs a secure context.</td><td>U/S</td></tr>
+<tr><td>14</td><td>WebGPU as a second backend behind <code>#gpu=1</code>, WebGL2 fallback stays</td><td>Replace WebGL2</td><td>WebGPU is not available everywhere and the first renderer lacks MSAA, point sprites and fans.</td><td>S</td></tr>
+<tr><td>15</td><td>Shaders to WGSL via vkd3d → SPIR-V → naga, with a fixed binding map and vec4 interface rewritten offline</td><td>GLSL → WGSL (naga rejects <code>#version 300 es</code>); regexp rewriting in JS</td><td>2331/2331 converted. Cost: 12.6 MB of WGSL (2.2 MB gzip) and an offline toolchain.</td><td>S</td></tr>
+<tr><td>16</td><td>Pipeline cache + async compile; hold the last frame while compiling</td><td>Block on compile; skip draws</td><td>Compile takes 100–330 ms. Cost: a frozen frame for a few hundred ms the first time a new effect appears (warm list and learned recipes reduce it).</td><td>S</td></tr>
+<tr><td>17</td><td>Hash cache in IndexedDB, write-then-ack, ≥2 KB, ≤2 uploads per object</td><td>OPFS; Cache API; hash everything</td><td>IndexedDB works on insecure origins; ack-after-commit never refers to lost data; video and dynamic buffers stay out. Cost: first-visit write load, which needed throttling.</td><td>S</td></tr>
+<tr><td>18</td><td>Bink movies to the page (decode there), queued</td><td>Offline transcode to WebM; decode on host and send raw</td><td>Raw decoded frames are ~9.4 GB in the career intro. Page decode with a trimmed FFmpeg wasm is bit-exact and saves it. Cost: 4–6 days; not started.</td><td>S</td></tr>
+<tr><td>19</td><td>Half-rate rear-view mirror in the page, auto only when slow</td><td>Always full rate</td><td>Mirror + helper = 28% of draws. Cost: a slightly older mirror image on alternate frames in heavy scenes.</td><td>S</td></tr>
+<tr><td>20</td><td>Reject -O2, <code>-mcpu=native</code>, D3D lock lane</td><td>Keep them</td><td>A/B showed +2%, identical code, no change.</td><td>S</td></tr>
+</table>
+
+<div class="callout dec"><div class="t">How we kept decisions honest</div>
+<p>Every "go/no-go" had a measurement and a written report (<code>port/work/*/REPORT.md</code>). Rejected options stay in the log with the number that killed them, so they do not come back as new ideas.</p></div>
+</section>
+
+<section id="team">
+<h2><span class="sec-num">12</span>Working with agents</h2>
+<p>A lot of this was done by a coordinator session plus focused sub-agents, each with its own working copy and port so they could not clobber each other or the user's running game.</p>
+<table>
+<tr><th>Workstream</th><th>Scope</th><th>Typical output</th></tr>
+<tr><td>UI fork</td><td>why the UI was empty; menus; owner of <code>port/harness</code></td><td>findings, key-walk scripts</td></tr>
+<tr><td>wasm-core, interp</td><td>wasm runtime; x86 interpreter for cold code</td><td><code>port/web</code>, <code>port/work/interp</code> (oracle-verified)</td></tr>
+<tr><td>shader-cache</td><td>offline D3D9 → GLSL</td><td>cache, renderer path, replay-verified identical output</td></tr>
+<tr><td>audio, pak-re</td><td>DirectSound8, Bink, container formats</td><td>mixer, AudioWorklet, pak tools</td></tr>
+<tr><td>net-re, mp</td><td>netcode RE; lobby/relay</td><td><code>NETCODE.md</code>, <code>port/mp</code></td></tr>
+<tr><td>gfx-quality, tex-audit</td><td>colours; texture data integrity</td><td>exposure fix; 0/780 mismatches guest vs GL</td></tr>
+<tr><td>stability, perf, race-fix, fp-edge</td><td>crashes; scheduler; race stall</td><td>patches with regression suite</td></tr>
+<tr><td>win-port, linux-pack</td><td>cross-platform builds</td><td>the Windows and Linux zips</td></tr>
+<tr><td>webgpu-spike, wasm-spike, cache-hash, webgpu-shaders</td><td>the three Track spikes and the renderer</td><td><code>REPORT.md</code>, <code>renderer_gpu.js</code>, <code>hcache.js</code></td></tr>
+</table>
+<div class="callout less"><div class="t">What went wrong with the process</div>
+<ul>
+<li>Agent reports were truncated several times and agents cannot write report files; the coordinator asked for the missing tails and wrote the files itself.</li>
+<li>The user once stopped all 13 background agents by accident; the stalled work was restarted with fresh agents and recorded in the log.</li>
+<li>One agent's background watcher never fired and it sat idle for over 8 hours; it was found by comparing file timestamps. "Check the clock on the output file" became a habit.</li>
+<li>Agent patches were merged one at a time into a single harness by an integrator, with a backup and a regression run at each step. Two merges needed hand-resolution. One merge (the cache protocol) introduced bug 6.4 because it was tested for speed and bytes but not colour.</li>
+</ul></div>
+</section>
+
+<section id="lessons">
+<h2><span class="sec-num">13</span>Lessons</h2>
+<ol>
+<li><b>Build the measuring tools before the features.</b> The frame profiler, stream dump and API recorder produced every important root cause.</li>
+<li><b>The first suspect is almost never right.</b> UI bug: seven hypotheses, six wrong. Gamma bug: we implemented a gamma ramp for a protocol collision.</li>
+<li><b>A stub that returns success is a lie.</b> Prefer a loud failure plus an audit tool (<code>BLUR_STRICT</code>, argument recorder).</li>
+<li><b>Two independent implementations agreeing on a wrong picture means the bug is upstream.</b></li>
+<li><b>Diff data, not pictures.</b> Constants per draw in a good and a bad build pinpointed a bug no screenshot could.</li>
+<li><b>Verify "it's fast" is real.</b> A frozen scene reports 60 fps. Check that draws per frame vary.</li>
+<li><b>A/B every optimisation against the old binary</b> with the same paced input; reject what does not move the number.</li>
+<li><b>Treat extension protocols as public APIs.</b> Namespace new message types; check collisions in both directions.</li>
+<li><b>With WebGPU, "warning" often means "this frame is gone".</b> Capture the console in every scripted run and fail on "Invalid".</li>
+<li><b>Keep the reference build and the reference screenshot.</b> The one thing that settled the colour bug fast was an older binary that still worked.</li>
+<li><b>Decide by measurement, document the loser.</b> Wasm was a fair fight on paper; the 1.5–1.85× number ended it in an afternoon.</li>
+</ol>
+</section>
+
+<section id="open">
+<h2><span class="sec-num">14</span>Open items</h2>
+<table>
+<tr><th>Item</th><th>State</th></tr>
+<tr><td>Crowded-race fps (about 30 fps at 3,000+ draws in a screen recording)</td><td><span class="tag warn">open</span> HUD now shows present-to-present time and page JS per frame; <code>BLUR_PROF=120</code> shows host cost. Need one measured run to see which side limits.</td></tr>
+<tr><td>Career intro movie stutter (fps drops to ~20, audio stutters)</td><td><span class="tag warn">open</span> the 9.4 GB Bink traffic; fix is decoding movies in the page.</td></tr>
+<tr><td colspan="2"><figure style="margin:0"><span class="shot-omitted"><em>[screenshot omitted from the public repository: Movie playback stutter]</em></span><figcaption>Career intro movie on WebGL2: 103 MB/s of traffic, 311 messages per frame, fps 43.8 average 22.8 ms with spikes to 112 ms, and audio under-running (buf 122 ms, under=4).</figcaption></figure></td></tr>
+<tr><td>Profile skip and prefilled "B" / "*" on the Online Account dialog</td><td><span class="tag ok">fixed</span> <code>BLUR_SEEDACCT=clear</code> blanks the stored account fields when the game reads them, then <code>play.sh</code> sends Down+Enter (Skip). Verified on a copy of the real save: dialog skipped, WARNING popup then needs one Enter.</td></tr>
+<tr><td>WebGPU after the sampler fix: black frames in cutscenes and impacts</td><td><span class="tag info">fix in, needs play-test</span> scripted run is clean; the real cases were not reproduced.</td></tr>
+<tr><td>Real-machine tests: Windows launcher and firewall, Linux desktop browser launch, a two-machine LAN game</td><td><span class="tag warn">not done</span></td></tr>
+<tr><td>Zips are out of date (before the hash cache, WebGPU and exposure fix)</td><td><span class="tag warn">rebuild needed</span></td></tr>
+<tr><td>Two unexplained <code>404</code> console messages</td><td><span class="tag">unidentified</span> probably not renderer-related</td></tr>
+<tr><td>WebGPU gaps: MSAA, triangle fans, point sprites, gamma ramp tested live, DrawUP, per-target write masks</td><td><span class="tag">deferred</span> zero uses in captured scenes</td></tr>
+<tr><td>IndexedDB write cost at ~1 GB, and the eviction path</td><td><span class="tag">untested</span></td></tr>
+<tr><td>Motor Mash map list, powerup drops, long-session heap exhaustion</td><td><span class="tag">older notes</span></td></tr>
+</table>
+</section>
+
+<section id="blog">
+<h2><span class="sec-num">15</span>Blog outline</h2>
+<p>A skeleton for the blog post, with the best asset for each part.</p>
+<ol>
+<li><b>Hook: a tab that runs a 2010 racer.</b> Asset: <code>s02_title_fixed</code> beside <code>s01_washed_pink_stub</code>.</li>
+<li><b>Why not an emulator?</b> The measured stall at loading; static recompilation in one diagram. Asset: the architecture flowchart (section 4).</li>
+<li><b>The packer and the CPUID trick.</b> Short, fun, and the reason Unicorn is pinned to one version.</li>
+<li><b>"It runs, but there is no UI."</b> The seven hypotheses and the one-line stub. Asset: the UI diagram (6.1) and <code>s03_ui_first_visible</code>.</li>
+<li><b>The crash that appeared in three execution engines.</b> A 0×0 texture. Short, punchy.</li>
+<li><b>The compiler that deleted a loop.</b> Strict aliasing, machine code excerpt, the sorting loop (6.5).</li>
+<li><b>From 17 to 60 fps.</b> Profile → serial scheduler → parallel guest threads. Asset: the fps chart and the before/after diagram (section 7).</li>
+<li><b>Two browsers' worth of ideas.</b> What the cricket and NFS clients do; how we turned it into three experiments with go/no-go numbers. Asset: Track diagram (section 10).</li>
+<li><b>WebGPU for a D3D9 game.</b> Shader route, the fixed interface trick, the benchmark. Asset: <code>s09</code> triple, bench chart.</li>
+<li><b>A cache keyed by content.</b> The −57% result and the ack-after-commit rule. Asset: sequence diagram and bar chart.</li>
+<li><b>The week's two self-inflicted bugs.</b> The protocol collision (6.4) and the invalid sampler (6.6), each with the picture that gave it away. Asset: <code>s15–s17</code>, <code>s18</code>.</li>
+<li><b>What we would do differently</b> (section 13) and what is still open (section 14).</li>
+</ol>
+<p><b>Title ideas:</b> "A 2010 racing game in a browser tab: what static recompilation taught me"; "Seven wrong theories and a stub that returned zero"; "The bug was a message number".</p>
+</section>
+
+<section id="appendix">
+<h2>Appendix</h2>
+
+<h3>A. Run it</h3>
+<pre><code>cd port/harness
+./play.sh --port 8790          # asks for a player name once (.playername); default page is WebGL2
+# open http://127.0.0.1:8790/#hud=1            (WebGL2)
+# open http://127.0.0.1:8790/#gpu=1&amp;hud=1      (WebGPU)
+BLUR_NOSKIP=1 ./play.sh ...     # do not auto-skip the Online Account dialog
+BLUR_PROF=120 ./play.sh ...     # per-frame cost accounting on the host
+BLUR_HCSTAT=1 ./play.sh ...     # bytes per message type and cache hit counters
+BLUR_BIND=0.0.0.0 ./play.sh ... # serve other machines on the LAN (secure-context caveats apply)</code></pre>
+<p>Rebuild the fast native runtime: <code>port/harness/build_fast.sh</code> (about 4 minutes at -j6). The scripted race drive: <code>tools/shot/racedrive.sh &lt;tag&gt; "gpu=1&amp;hud=1" 240</code>.</p>
+
+<h3>B. Page URL options</h3>
+<table>
+<tr><th>Hash</th><th>Effect</th></tr>
+<tr><td><code>#gpu=1</code></td><td>WebGPU renderer (falls back to WebGL2)</td></tr>
+<tr><td><code>#hud=1</code>, <code>F2</code></td><td>frame-time HUD (present intervals, draws, pipelines, page JS)</td></tr>
+<tr><td><code>#hcache=0</code></td><td>disable the page hash cache; host side <code>BLUR_HCACHE=0</code></td></tr>
+<tr><td><code>#scale=2&amp;msaa=4&amp;aniso=16&amp;bias=-0.5&amp;srgb=1</code></td><td>quality options (WebGL2)</td></tr>
+<tr><td><code>#mirror=auto|half|full</code></td><td>rear-view mirror update rate</td></tr>
+<tr><td><code>#gpudbg=nosrgb,noaniso,nomip,trimip,noatest</code></td><td>WebGPU debug switches</td></tr>
+<tr><td><code>#diag=1</code></td><td>draw composition and GL call counts</td></tr>
+</table>
+
+<h3>C. Host environment switches worth knowing</h3>
+<table>
+<tr><th>Switch</th><th>Purpose</th></tr>
+<tr><td><code>BLUR_PAR=1</code></td><td>parallel guest threads (required by the fast build)</td></tr>
+<tr><td><code>BLUR_RECOMP=1</code></td><td>stop emulating at the entry point, run recompiled code</td></tr>
+<tr><td><code>BLUR_WEB=&lt;port&gt;</code></td><td>serve the page and WebSocket</td></tr>
+<tr><td><code>BLUR_KEYS="Enter@L:Binding+6s,…"</code></td><td>scripted key taps (seconds, frames, or relative to a Lua binding)</td></tr>
+<tr><td><code>BLUR_DET=5</code></td><td>deterministic guest clock</td></tr>
+<tr><td><code>BLUR_GFXDUMP=file</code>, <code>BLUR_GFXSNAP</code></td><td>record the stream; <code>GFXSNAP</code> makes a self-contained scene capture with a full resource replay</td></tr>
+<tr><td><code>BLUR_COVER=file</code></td><td>record which functions ran (hot-set sizing)</td></tr>
+<tr><td><code>BLUR_STRICT</code>, <code>BLUR_HEAPCHK</code>, <code>BLUR_RING</code></td><td>stub audit, heap canaries, per-thread call ring</td></tr>
+<tr><td><code>BLUR_PROF</code>, <code>BLUR_PARSTAT</code>, <code>BLUR_FPSLOG</code></td><td>frame cost, lock waits, fps log</td></tr>
+<tr><td><code>BLUR_NET_MESH=1</code>, <code>BLUR_PLAYER_NAME</code></td><td>serverless LAN, lobby name</td></tr>
+<tr><td><code>BLUR_SEEDACCT=0</code></td><td>do not seed the account name (use the Skip path)</td></tr>
+<tr><td><code>BLUR_SHARE_LAN</code>, <code>BLUR_REMOTE</code></td><td>launcher options for sharing the page on the LAN</td></tr>
+</table>
+
+<h3>D. Repository map</h3>
+<table>
+<tr><th>Path</th><th>What</th></tr>
+<tr><td><code>port/recomp/</code></td><td>lifter (<code>lift.py</code>, <code>lift_par.py</code>, <code>lift_extra.py</code>), runtime header, SSE helpers, differential oracle</td></tr>
+<tr><td><code>port/harness/</code></td><td>host runtime: <code>rt.c</code>, Win32/D3D9/D3DX/DirectSound/Winsock HLE, <code>gfx.c</code>, <code>net.c</code>, <code>web/</code> page</td></tr>
+<tr><td><code>port/harness/web/</code></td><td><code>index.html</code>, <code>renderer.js</code> (WebGL2), <code>renderer_gpu.js</code> (WebGPU), <code>hcache.js</code>, WGSL pack, warm list</td></tr>
+<tr><td><code>port/web/</code></td><td>whole-game wasm build and launcher shell</td></tr>
+<tr><td><code>port/mp/</code></td><td>lobby and relay server</td></tr>
+<tr><td><code>port/pack/</code>, <code>port/work/win</code>, <code>port/pack/linux</code></td><td>per-OS bundles and launchers</td></tr>
+<tr><td><code>port/work/*/REPORT.md</code>, <code>README.md</code></td><td>agent reports (webgpu, wasm, net-re, audio, perf, race-fix, …)</td></tr>
+<tr><td><code>tools/shot/</code></td><td>headless-Chromium drivers: <code>racedrive</code>, <code>livetest</code>, <code>rbtest</code>, <code>prof</code>, <code>diag</code>, <code>mpdrive</code></td></tr>
+<tr><td><code>PLAN_120FPS.md</code></td><td>the living log (F1–F159, decisions, change log)</td></tr>
+</table>
+
+<h3>E. Glossary</h3>
+<dl>
+<dt><b>HLE</b></dt><dd>High-level emulation: reimplementing an operating-system or library API instead of emulating the hardware under it.</dd>
+<dt><b>OEP</b></dt><dd>Original entry point: where the game's real code starts, after a packer has unpacked it.</dd>
+<dt><b>Lifting</b></dt><dd>Translating machine code (here x86) to a higher-level language (C) function by function.</dd>
+<dt><b>Hot set</b></dt><dd>The functions actually executed in recorded sessions; used to size a wasm module.</dd>
+<dt><b>Present</b></dt><dd>The D3D9 call that ends a frame; our page frame timing is measured between these.</dd>
+<dt><b>WGSL / SPIR-V</b></dt><dd>WebGPU's shader language and the Vulkan intermediate shader format.</dd>
+<dt><b>Render bundle</b></dt><dd>A pre-recorded WebGPU command list that can be replayed cheaply.</dd>
+<dt><b>OPFS / IndexedDB</b></dt><dd>Browser file system and database storage, per origin.</dd>
+</dl>
+
+<h3>F. Sources used for this document</h3>
+<ul>
+<li><code>PLAN_120FPS.md</code> findings F1–F159 and its change log; <code>PROGRESS.md</code>; <code>BLUR_WEB_PORT_PLAN.md</code></li>
+<li><code>port/work/webgpu/REPORT.md</code>, <code>port/work/wasm/REPORT.md</code>, per-agent READMEs under <code>port/work/</code></li>
+<li>Session history: the long build and debug session of October 14–23 (screenshots, screen recording frames at 1:44–1:50, 2:19–2:26 and 3:50–3:58 and HUD readings from them)</li>
+<li>The screenshots of the original log show the game and are not part of this repository; each is replaced by a note.</li>
+</ul>
+</section>
+
+<footer style="margin-top:80px;color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:16px">
+Built from the project log and chat history, October 23, 2026. Personal learning project; contains screenshots of a commercial game.
+</footer>
+</main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<script>
+(function(){
+  // ---- theme toggle (stored per viewer, tolerant of blocked storage)
+  const root=document.documentElement, btn=document.getElementById('themebtn');
+  const dark=()=>root.dataset.theme?root.dataset.theme==='dark':matchMedia('(prefers-color-scheme: dark)').matches;
+  try{const s=localStorage.getItem('blurlog-theme'); if(s) root.dataset.theme=s;}catch(e){}
+  function mm(){
+    if(!window.mermaid) return;
+    mermaid.initialize({startOnLoad:false,theme:dark()?'dark':'default',securityLevel:'loose',flowchart:{htmlLabels:true,curve:'basis'},timeline:{disableMulticolor:false}});
+  }
+  async function renderAll(){
+    mm(); const nodes=[...document.querySelectorAll('pre.mermaid')];
+    for(const n of nodes){ if(!n.dataset.src) n.dataset.src=n.textContent; n.removeAttribute('data-processed'); n.textContent=n.dataset.src; }
+    try{ await mermaid.run({nodes}); }catch(e){ console.warn('mermaid',e); }
+  }
+  btn.addEventListener('click',()=>{ const next=dark()?'light':'dark'; root.dataset.theme=next; try{localStorage.setItem('blurlog-theme',next);}catch(e){} renderAll(); });
+  renderAll();
+
+  // ---- bar charts from data
+  function bars(id,rows,unit,max,cls){
+    const el=document.getElementById(id); if(!el) return; const m=max||Math.max(...rows.map(r=>r[1]));
+    el.innerHTML=rows.map(r=>`<div class="lab" title="${r[0]}">${r[0]}</div><div class="trk"><div class="fil ${r[2]||cls||''}" style="width:${Math.max(1,r[1]/m*100)}%"></div></div><div class="val">${r[3]||r[1]+(unit||'')}</div>`).join('');
+  }
+  bars('chart-fps',[
+    ['Native, title screen (F1)',62,'g','62 fps'],
+    ['Race first starts natively, mostly interpreted (F123)',6,'r','6 fps'],
+    ['Wasm build, user reached a race',7.5,'r','7–8 fps'],
+    ['Native race in real Chrome, before parallel threads (F130)',17,'w','17 fps'],
+    ['After parallel guest threads: median (F137)',60,'g','60 fps'],
+    ['  same, 10th percentile frame (F137)',47,'g','47 fps'],
+    ['WebGPU scripted race grid, 2.0–2.8k draws',60,'g','60 fps'],
+    ['WebGPU, user screen recording, ~2.5k draws (2:22)',40.7,'w','40.7 fps'],
+    ['WebGPU, user screen recording, 3,263 draws (3:54)',29.4,'r','29.4 fps']
+  ],'',65);
+  bars('chart-zips',[['BlurLAN-mac.zip (arm64)',5.617,'','5.62 GB'],['BlurLAN-win.zip (x64)',5.592,'','5.59 GB'],['BlurLinux-x64.zip',5.667,'','5.67 GB'],['BlurLinux-arm64.zip',5.663,'','5.66 GB']],'',6);
+  bars('chart-bytes',[['Bink movie frames at boot (not cacheable)',700,'r','~700 MB'],['Load-time textures that repeat each session',240,'g','~240 MB'],['State and draw messages',200,'','~200 MB'],['Buffers + shaders',30,'','~30 MB']],'',760);
+  bars('chart-hash',[['Visit 1 (empty cache)',1142,'w','1,142 MB'],['Visit 2 (cache warm)',492,'g','492 MB (−57%)']],'',1200);
+  bars('chart-bench',[['WebGL2 immediate',9.67,'r','9.67 ms'],['WebGPU, new encoder each frame',1.55,'w','1.55 ms'],['Bundles, 0% chunks reused',1.71,'w','1.71 ms'],['Bundles, 50% reused',1.15,'','1.15 ms'],['Bundles, 90% reused',0.51,'g','0.51 ms'],['Bundles, 100% reused',0.01,'g','0.01 ms']],'',10);
+  bars('chart-wasm',[['Native (arm64, -O1)',4.2,'g','4.2 s (1.00×)'],['Wasm, TurboFan only',6.3,'w','6.3 s (1.5×)'],['Wasm, default tiering',6.8,'w','6.8 s (1.6×)'],['Wasm, -pthread build',6.87,'w','6.9 s (1.6×)'],['Wasm, Liftoff only',11.8,'r','11.8 s (2.8×)']],'',12);
+
+  // ---- active section in the table of contents
+  const links=[...document.querySelectorAll('nav.toc a')], map=new Map(links.map(a=>[a.getAttribute('href').slice(1),a]));
+  const io=new IntersectionObserver(es=>{ es.forEach(e=>{ if(e.isIntersecting){ links.forEach(l=>l.classList.remove('on')); const a=map.get(e.target.id); if(a) a.classList.add('on'); } }); },{rootMargin:'0px 0px -75% 0px'});
+  document.querySelectorAll('section[id],article[id]').forEach(s=>io.observe(s));
+})();
+</script>
+</body>
+</html>
