@@ -150,7 +150,7 @@ flowchart LR
   functions. Addresses the static pass cannot find are executed by the interpreter (`port/work/interp`) instead of
   stopping the game.
 * The image must be read *after* the protector wrote its run-time code, which is why `setup.sh` runs the game for four
-  seconds on the interpreter before lifting (see `docs/COMMIT_PLAN.md`, commit "bootstrap runtime").
+  seconds on the interpreter before lifting.
 * Guest memory is one 4 GB mapping at the fixed address `0x7000000000`, which lets the compiler fold the base into every
   load and store.
 * Windows API calls (`port/harness/hle*.c`, `win.c`, `com.c`), Direct3D 9 (`d3d9.c`, `d3dx.c`) and the rest are
@@ -178,8 +178,7 @@ port/tools/regress/        smoke walk, deterministic frame-hash and pacing check
 port/mp/                   multiplayer lobby/WebRTC prototype (unused by the game)
 port/web/src/              two files the native Makefile still includes (snapshot description)
 re/                        Ghidra scripts and Wine probes used while reverse engineering
-docs/                      plan, findings log, build log, netcode notes, COMMIT_PLAN.md
-HISTORY.md                 how this git history was reconstructed (read it)
+docs/                      plan, findings log, build log, netcode notes
 ```
 
 Generated and git-ignored: `game/`, `re/dump/`, `port/vendor/`, `third_party/*`, `port/recomp/gen*`, `port/recomp/obj*`,
@@ -194,7 +193,6 @@ Generated and git-ignored: `game/`, `re/dump/`, `port/vendor/`, `third_party/*`,
   page. The checks live in `port/tools/regress` (smoke walk, frame hashes) and `port/work/interp` (`./run_all.sh`).
 * Most "rendering bugs" turned out to be wrong or stubbed Windows/D3D9 calls in the host, not renderer or lifter bugs;
   start by finding the API call (`BLUR_APITRACE`, `BLUR_PROF`) before touching shaders.
-* Dates and authorship of the early commits are explained in [HISTORY.md](HISTORY.md).
 
 ## Credits and licence
 
