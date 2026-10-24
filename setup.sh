@@ -65,6 +65,12 @@ case "$OS" in
   *) die "unsupported system $OS. On Windows use WSL2 (Ubuntu) and run this script inside it; see README.";;
 esac
 [ -n "$JOBS" ] || JOBS="$NCPU"
+# Homebrew is often installed but not on PATH in a fresh shell or an ssh session; pick it up before looking for tools
+if ! have brew; then
+  for b in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+    [ -x "$b" ] && { eval "$("$b" shellenv)"; break; }
+  done
+fi
 
 # --------------------------------------------------------------------------------------------------- 1. the game
 say "1/9 locating Blur.exe"
@@ -112,52 +118,8 @@ else
 fi
 echo "$EXE" > "$STATE/game.path"
 
-# --------------------------------------------------------------------------------------------------- 2. msvcr90.dll
-say "2/9 msvcr90.dll"
-mkdir -p "$ROOT/port/vendor"
-CRT_OUT="$ROOT/port/vendor/msvcr90.dll"
-extract_crt_from_redist() {          # $1 = vcredist_x86.exe (VC++ 2008, RTM or later service pack that still ships 9.0.21022.8)
-  local tmp; tmp="$(mktemp -d)"
-  local sz=""; have 7zz && sz=7zz; [ -z "$sz" ] && have 7z && sz=7z; [ -z "$sz" ] && have 7za && sz=7za
-  [ -n "$sz" ] || { rm -rf "$tmp"; return 1; }
-  "$sz" x -y -o"$tmp" "$1" >/dev/null 2>&1 || true
-  [ -f "$tmp/vc_red.cab" ] && "$sz" x -y -o"$tmp/cab" "$tmp/vc_red.cab" >/dev/null 2>&1 || true
-  local f
-  for f in "$tmp"/cab/nosxs_msvcr90.dll "$tmp"/cab/msvcr90.dll*; do
-    [ -f "$f" ] || continue
-    if [ "$(sha256 "$f")" = "$CRT_SHA256" ]; then cp "$f" "$CRT_OUT"; rm -rf "$tmp"; return 0; fi
-  done
-  rm -rf "$tmp"; return 1
-}
-if [ -f "$CRT_OUT" ] && [ "$(sha256 "$CRT_OUT")" = "$CRT_SHA256" ]; then
-  note "already in place: port/vendor/msvcr90.dll"
-else
-  rm -f "$CRT_OUT"
-  CANDS=""
-  [ -n "$CRT_ARG" ] && CANDS="$CRT_ARG"
-  CANDS="$CANDS $GAME_DIR/msvcr90.dll $GAME_DIR/../msvcr90.dll"
-  for c in $CANDS; do
-    [ -f "$c" ] || continue
-    case "$(basename "$c" | tr 'A-Z' 'a-z')" in
-      msvcr90.dll) if [ "$(sha256 "$c")" = "$CRT_SHA256" ] || [ "$FORCE" = 1 ]; then cp "$c" "$CRT_OUT"; break; else note "$c is a different version of msvcr90.dll; skipped"; fi;;
-      *.exe) extract_crt_from_redist "$c" && break || note "could not extract msvcr90.dll 9.0.21022.8 from $c (needs 7-Zip: brew install sevenzip / apt install p7zip-full)";;
-    esac
-  done
-  if [ ! -f "$CRT_OUT" ]; then
-    for c in $(find "$GAME_DIR" -maxdepth 3 -iname 'vcredist_x86.exe' -type f 2>/dev/null | head -n 3); do
-      extract_crt_from_redist "$c" && break
-    done
-  fi
-  [ -f "$CRT_OUT" ] || die "msvcr90.dll (9.0.21022.8, x86) not found.
-    The game links against Microsoft's Visual C++ 2008 runtime, which is not part of this repository.
-    Get 'Microsoft Visual C++ 2008 Redistributable Package (x86)' from Microsoft (it is also on many Blur discs and
-    in C:\\Windows\\WinSxS on a Windows PC) and pass it: ./setup.sh '$GAME_ARG' --crt /path/to/vcredist_x86.exe
-    (or /path/to/msvcr90.dll). Expected SHA-256 of the DLL: $CRT_SHA256"
-  note "msvcr90.dll ready (SHA-256 $(sha256 "$CRT_OUT" | cut -c1-16)...)"
-fi
-
-# --------------------------------------------------------------------------------------------------- 3. packages
-say "3/9 build dependencies"
+# --------------------------------------------------------------------------------------------------- 2. packages
+say "2/9 build dependencies"
 BREW_PREFIX=""
 install_hint=""
 if [ "$SKIP_DEPS" = 1 ]; then
@@ -199,6 +161,50 @@ have make || die "make not found"
 have curl || die "curl not found"
 have python3 || die "python3 not found"
 [ -n "$BREW_PREFIX" ] || { have brew && BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"; }
+
+# --------------------------------------------------------------------------------------------------- 3. msvcr90.dll
+say "3/9 msvcr90.dll"
+mkdir -p "$ROOT/port/vendor"
+CRT_OUT="$ROOT/port/vendor/msvcr90.dll"
+extract_crt_from_redist() {          # $1 = vcredist_x86.exe (VC++ 2008, RTM or later service pack that still ships 9.0.21022.8)
+  local tmp; tmp="$(mktemp -d)"
+  local sz=""; have 7zz && sz=7zz; [ -z "$sz" ] && have 7z && sz=7z; [ -z "$sz" ] && have 7za && sz=7za
+  [ -n "$sz" ] || { rm -rf "$tmp"; return 1; }
+  "$sz" x -y -o"$tmp" "$1" >/dev/null 2>&1 || true
+  [ -f "$tmp/vc_red.cab" ] && "$sz" x -y -o"$tmp/cab" "$tmp/vc_red.cab" >/dev/null 2>&1 || true
+  local f
+  for f in "$tmp"/cab/nosxs_msvcr90.dll "$tmp"/cab/msvcr90.dll*; do
+    [ -f "$f" ] || continue
+    if [ "$(sha256 "$f")" = "$CRT_SHA256" ]; then cp "$f" "$CRT_OUT"; rm -rf "$tmp"; return 0; fi
+  done
+  rm -rf "$tmp"; return 1
+}
+if [ -f "$CRT_OUT" ] && [ "$(sha256 "$CRT_OUT")" = "$CRT_SHA256" ]; then
+  note "already in place: port/vendor/msvcr90.dll"
+else
+  rm -f "$CRT_OUT"
+  CANDS=""
+  [ -n "$CRT_ARG" ] && CANDS="$CRT_ARG"
+  CANDS="$CANDS $GAME_DIR/msvcr90.dll $GAME_DIR/../msvcr90.dll"
+  for c in $CANDS; do
+    [ -f "$c" ] || continue
+    case "$(basename "$c" | tr 'A-Z' 'a-z')" in
+      msvcr90.dll) if [ "$(sha256 "$c")" = "$CRT_SHA256" ] || [ "$FORCE" = 1 ]; then cp "$c" "$CRT_OUT"; break; else note "$c is a different version of msvcr90.dll; skipped"; fi;;
+      *.exe) extract_crt_from_redist "$c" && break || note "could not extract msvcr90.dll 9.0.21022.8 from $c (needs 7-Zip: brew install sevenzip / apt install p7zip-full)";;
+    esac
+  done
+  if [ ! -f "$CRT_OUT" ]; then
+    for c in $(find "$GAME_DIR" -maxdepth 3 -iname 'vcredist_x86.exe' -type f 2>/dev/null | head -n 3); do
+      extract_crt_from_redist "$c" && break
+    done
+  fi
+  [ -f "$CRT_OUT" ] || die "msvcr90.dll (9.0.21022.8, x86) not found.
+    The game links against Microsoft's Visual C++ 2008 runtime, which is not part of this repository.
+    Get 'Microsoft Visual C++ 2008 Redistributable Package (x86)' from Microsoft (it is also on many Blur discs and
+    in C:\\Windows\\WinSxS on a Windows PC) and pass it: ./setup.sh '$GAME_ARG' --crt /path/to/vcredist_x86.exe
+    (or /path/to/msvcr90.dll). Expected SHA-256 of the DLL: $CRT_SHA256"
+  note "msvcr90.dll ready (SHA-256 $(sha256 "$CRT_OUT" | cut -c1-16)...)"
+fi
 
 # --------------------------------------------------------------------------------------------------- 4. Unicorn (Linux) and vkd3d-shader
 say "4/9 vkd3d-shader $VKD3D_VER (D3D9 shader bytecode to SPIR-V) and Unicorn"
