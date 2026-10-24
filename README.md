@@ -49,6 +49,13 @@ The whole setup took 5 min 36 s from a clean clone on an Apple M4 Max (16 cores,
 
 ### What was tested
 
+**Second machine, clean (Mac mini, Apple M2 Pro, macOS 27, Homebrew present but with few of the packages):** `setup.sh` ran
+end to end from a fresh clone, including installing the missing Homebrew packages, building `vkd3d-shader`, lifting
+(373,511 functions in 226 s) and compiling (112 s). `play.sh` started the host, which entered the game on the recompiled path
+(audio buffers created, a long run of Direct3D calls) and served the page. Getting there needed four fixes that are now in
+the scripts (dependency order, `vulkan-loader`, a python3 that runs, busy-port detection). **Not yet confirmed on that
+machine:** the picture on screen (the check was done with a headless browser over a tunnel, which is not representative).
+
 From a clean clone on macOS (Apple silicon, Homebrew): `setup.sh` end to end, `setup.sh --interp-only`, a second `setup.sh`
 run (stages are skipped), `play.sh`, the page in headless Chromium (connected, about 60 fps, intro movie rendering) and
 `tools/build_shader_cache.sh` (2323 shaders translated, 0 failures; the page loads the cache). **Not tested:** Intel Macs,
