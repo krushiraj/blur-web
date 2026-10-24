@@ -4,7 +4,9 @@
 #   ./play.sh [options]
 #
 #   --port N       web port for the page (default 8765; the next free port is used if it is taken)
-#   --webgpu       open the page with #gpu=1 (WebGPU renderer; falls back to WebGL2 if unavailable or if the WGSL pack is missing)
+#   --webgpu       WebGPU renderer (this is the default now; falls back to WebGL2 by itself if the browser has no WebGPU or the
+#                  WGSL pack is missing: build it once with tools/build_wgsl_pack.sh)
+#   --webgl2       use the WebGL2 renderer instead
 #   --hud          show the frame-time HUD (#hud=1)
 #   --lan          LAN multiplayer without a server: broadcast on UDP 47801 so other machines running this are found
 #                  (game menu: Multiplayer -> Local Area Network). Allow incoming connections if your firewall asks.
@@ -21,11 +23,12 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-PORT=8765; OPEN=1; FRAG=""; LAN=0; SHARE=0; NAME=""; BROWSER=""
+WANT_GPU=1; PORT=8765; OPEN=1; FRAG=""; LAN=0; SHARE=0; NAME=""; BROWSER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2;;
-    --webgpu) FRAG="${FRAG:+$FRAG&}gpu=1"; shift;;
+    --webgpu) WANT_GPU=1; shift;;
+    --webgl2) WANT_GPU=0; shift;;
     --hud) FRAG="${FRAG:+$FRAG&}hud=1"; shift;;
     --lan) LAN=1; shift;;
     --share) SHARE=1; shift;;
@@ -41,6 +44,10 @@ done
 [ -f game/extracted/BLUR/Blur.exe ] || die "game/extracted/BLUR/Blur.exe is missing: run ./setup.sh /path/to/your/Blur first"
 [ "$(cat .setup/mode 2>/dev/null || true)" = interp ] && echo "note: this build runs the game on the x86 interpreter only (setup --interp-only); expect a slideshow"
 
+if [ "$WANT_GPU" = 1 ]; then
+  FRAG="${FRAG:+$FRAG&}gpu=1"
+  [ -f port/harness/web/blur.wgslpack.gz ] || echo "note: WebGPU is the default, but the WGSL shader pack is not built yet, so the page will use WebGL2. Build it once: tools/build_wgsl_pack.sh"
+fi
 # A port is busy if the host could not bind it (same call the host makes). Connecting is not enough: on macOS, system services
 # (e.g. sharingd) can hold a port on IPv6 only, which refuses a connect to 127.0.0.1 but still makes the bind fail.
 PYBIN=python3; [ -x .venv/bin/python ] && PYBIN=.venv/bin/python

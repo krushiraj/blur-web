@@ -13,6 +13,7 @@
 #   --jobs N          parallel jobs for lifting and compiling (default: number of CPUs)
 #   --interp-only     skip the lift/compile stage; the game then runs on the built-in x86 interpreter only.
 #                     Fast to set up, but far too slow to play (see README).
+#   --webgpu          also build the WGSL shader pack so the WebGPU renderer (the default in play.sh) is used instead of the WebGL2 fallback
 #   --shaders         also build the offline WebGL2 shader cache from the game's shader pak (optional, faster first draws)
 #   --yes             install missing packages without asking (brew / apt)
 #   --skip-deps       do not check or install packages
@@ -33,13 +34,14 @@ VKD3D_URL=https://dl.winehq.org/vkd3d/source/vkd3d-$VKD3D_VER.tar.xz
 VKD3D_SHA256=7510146aff2adfb4ae07ab890701a607e5ff7c66e57100cfc9f630ec92eeda6a
 UNICORN_VER=2.1.4
 
-GAME_ARG=""; CRT_ARG=""; JOBS=""; INTERP_ONLY=0; SHADERS=0; YES=0; SKIP_DEPS=0; FORCE=0
+GAME_ARG=""; CRT_ARG=""; JOBS=""; INTERP_ONLY=0; SHADERS=0; WGSL=0; YES=0; SKIP_DEPS=0; FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --crt) CRT_ARG="$2"; shift 2;;
     --jobs) JOBS="$2"; shift 2;;
     --interp-only) INTERP_ONLY=1; shift;;
     --shaders) SHADERS=1; shift;;
+    --webgpu) WGSL=1; SHADERS=1; shift;;
     --yes) YES=1; shift;;
     --skip-deps) SKIP_DEPS=1; shift;;
     --force) FORCE=1; shift;;
@@ -328,6 +330,10 @@ echo lifted > "$STATE/mode"
 if [ "$SHADERS" = 1 ]; then
   say "optional: offline shader cache"
   "$ROOT/tools/build_shader_cache.sh" || note "shader cache build failed; the page still works (it translates shaders live)"
+fi
+if [ "$WGSL" = 1 ]; then
+  say "optional: WGSL shader pack for WebGPU"
+  "$ROOT/tools/build_wgsl_pack.sh" || note "WGSL pack build failed; play.sh falls back to WebGL2 (run tools/build_wgsl_pack.sh to retry)"
 fi
 mark setup
 cat <<EOF
