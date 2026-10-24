@@ -30,6 +30,11 @@ else
   NAGA="$TOOLS/bin/naga"
 fi
 export NAGA
+# setup.sh builds vkd3d static, which leaves the compiler binary at the top of the tree; the pack tools look in .libs/
+V="$ROOT/third_party/vkd3d-2.1"
+if [ ! -x "$V/.libs/vkd3d-compiler" ] && [ -x "$V/vkd3d-compiler" ] && ! head -c 2 "$V/vkd3d-compiler" | grep -q '^#!'; then
+  mkdir -p "$V/.libs" && cp "$V/vkd3d-compiler" "$V/.libs/vkd3d-compiler"
+fi
 if ! ls -d port/work/shader-cache/o*t/src >/dev/null 2>&1 && [ ! -d port/work/shader-cache/out/src ]; then tools/build_shader_cache.sh; fi
 [ -d port/work/shader-cache/out/src ] && export CORPUS="$ROOT/port/work/shader-cache/out/src"
 JOBS="$( (sysctl -n hw.ncpu 2>/dev/null || nproc) )" port/work/webgpu/tools/make_wgsl_pack.sh
