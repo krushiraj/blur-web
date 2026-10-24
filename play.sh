@@ -41,7 +41,10 @@ done
 [ -f game/extracted/BLUR/Blur.exe ] || die "game/extracted/BLUR/Blur.exe is missing: run ./setup.sh /path/to/your/Blur first"
 [ "$(cat .setup/mode 2>/dev/null || true)" = interp ] && echo "note: this build runs the game on the x86 interpreter only (setup --interp-only); expect a slideshow"
 
-busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# A port is busy if the host could not bind it (same call the host makes). Connecting is not enough: on macOS, system services
+# (e.g. sharingd) can hold a port on IPv6 only, which refuses a connect to 127.0.0.1 but still makes the bind fail.
+PYBIN=python3; [ -x .venv/bin/python ] && PYBIN=.venv/bin/python
+busy() { ! "$PYBIN" -c 'import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1])))' "$1" 2>/dev/null; }
 tries=0; while busy "$PORT" && [ $tries -lt 30 ]; do PORT=$((PORT+1)); tries=$((tries+1)); done
 URL="http://127.0.0.1:$PORT/${FRAG:+#$FRAG}"
 
