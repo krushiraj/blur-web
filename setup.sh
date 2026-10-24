@@ -159,7 +159,13 @@ elif [ "$OS" = Linux ]; then
 fi
 have make || die "make not found"
 have curl || die "curl not found"
-have python3 || die "python3 not found"
+# Use a python3 that actually runs: a pyenv/Intel build on an Apple-silicon Mac ("Bad CPU type") or a broken shim is common
+PYTHON3=""
+for c in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys, venv; assert sys.version_info >= (3, 8)' >/dev/null 2>&1; then PYTHON3="$(command -v "$c")"; break; fi
+done
+[ -n "$PYTHON3" ] || die "no working python3 (3.8 or newer, with the venv module) found; install one (brew install python / apt install python3-venv)"
+note "python3: $PYTHON3"
 [ -n "$BREW_PREFIX" ] || { have brew && BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"; }
 
 # --------------------------------------------------------------------------------------------------- 3. msvcr90.dll
@@ -245,7 +251,8 @@ fi
 
 # --------------------------------------------------------------------------------------------------- 5. python
 say "5/9 python environment (Capstone, used by the lifter)"
-if [ ! -x "$ROOT/.venv/bin/python" ]; then python3 -m venv "$ROOT/.venv"; fi
+if [ ! -x "$ROOT/.venv/bin/python" ] || ! "$ROOT/.venv/bin/python" -c pass >/dev/null 2>&1; then rm -rf "$ROOT/.venv"; "$PYTHON3" -m venv "$ROOT/.venv"; fi
+export PATH="$ROOT/.venv/bin:$PATH"           # later steps and helper scripts that call plain python3 get this one
 PY="$ROOT/.venv/bin/python"
 "$PY" -c 'import capstone' 2>/dev/null || "$PY" -m pip install -q --disable-pip-version-check capstone
 note "capstone $("$PY" -c 'import capstone;print(capstone.__version__)')"
