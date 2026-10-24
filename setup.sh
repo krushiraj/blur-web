@@ -129,7 +129,7 @@ elif [ "$OS" = Darwin ]; then
   have brew  || die "Homebrew is needed for libraries: https://brew.sh"
   BREW_PREFIX="$(brew --prefix)"
   need=""
-  for p in unicorn ffmpeg spirv-cross vulkan-headers spirv-headers bison; do brew list --versions "$p" >/dev/null 2>&1 || need="$need $p"; done
+  for p in unicorn ffmpeg spirv-cross vulkan-headers vulkan-loader spirv-headers bison; do brew list --versions "$p" >/dev/null 2>&1 || need="$need $p"; done
   have pkg-config || need="$need pkgconf"
   have 7zz || have 7z || have 7za || need="$need sevenzip"
   if [ -n "$need" ]; then
