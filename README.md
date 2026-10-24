@@ -53,8 +53,8 @@ The whole setup took 5 min 36 s from a clean clone on an Apple M4 Max (16 cores,
 end to end from a fresh clone, including installing the missing Homebrew packages, building `vkd3d-shader`, lifting
 (373,511 functions in 226 s) and compiling (112 s). `play.sh` started the host, which entered the game on the recompiled path
 (audio buffers created, a long run of Direct3D calls) and served the page. Getting there needed four fixes that are now in
-the scripts (dependency order, `vulkan-loader`, a python3 that runs, busy-port detection). **Not yet confirmed on that
-machine:** the picture on screen (the check was done with a headless browser over a tunnel, which is not representative).
+the scripts (dependency order, `vulkan-loader`, a python3 that runs, busy-port detection). The WGSL pack also built there with `tools/build_wgsl_pack.sh`. **Not yet confirmed on that
+machine:** the picture on screen (the checks were done with a headless browser over a tunnel, which is not representative).
 
 From a clean clone on macOS (Apple silicon, Homebrew): `setup.sh` end to end, `setup.sh --interp-only`, a second `setup.sh`
 run (stages are skipped), `play.sh`, the page in headless Chromium (connected, about 60 fps, intro movie rendering) and
@@ -81,16 +81,23 @@ about 47 seconds and the loading screen ran at about 2 fps after 75 seconds, ver
 with lifted code. It is useful to check that your machine, game folder and `msvcr90.dll` are fine before waiting for the
 full setup. The Unicorn emulator alone is slower still (this is why the project lifts the code).
 
-## Renderers: WebGL2 and WebGPU
+## Renderers: WebGPU (default) and WebGL2
 
-The default page uses **WebGL2** and needs nothing else. `./play.sh --webgpu` opens `#gpu=1`: a WebGPU renderer that
-falls back to WebGL2 by itself when WebGPU, the texture formats or the shader pack are not available. The WGSL pack
-the WebGPU renderer needs is derived from the game's shaders, so it is not in this repository and `setup.sh` does not
-build it: see `port/work/webgpu/README.md` (needs `naga-cli`, SPIRV-Tools, brotli; experimental, not exercised by
-`setup.sh`). An optional **shader cache** for WebGL2 (`tools/build_shader_cache.sh`, or `./setup.sh <game> --shaders`)
-removes most shader-compile hitches; it too is generated from your game files.
+`./play.sh` opens the **WebGPU** renderer (`#gpu=1`) and falls back to **WebGL2** by itself when the browser has no WebGPU,
+lacks the needed texture formats or the shader pack is missing. `./play.sh --webgl2` forces WebGL2. The WGSL pack WebGPU
+needs is derived from the game's shaders, so it is not in this repository; build it once on your machine:
 
-Page flags go in the URL hash and can be combined with `&`: `#hud=1` frame-time HUD, `#gpu=1` WebGPU, `#diag=1` draw
+```sh
+tools/build_wgsl_pack.sh          # or: ./setup.sh <game> --webgpu
+```
+
+It installs SPIRV-Tools and brotli (Homebrew/apt), builds `naga-cli` 30.0.1 once with cargo (installs Rust through
+Homebrew if missing, a few minutes), builds the shader corpus from your game files and writes
+`port/harness/web/blur.wgslpack.gz` (about 2 MB, git-ignored; keep it private). Measured on a clean Mac mini (M2 Pro): the
+pack step itself takes under a minute once `naga` exists. An optional **shader cache** for WebGL2
+(`tools/build_shader_cache.sh`, or `./setup.sh <game> --shaders`) removes most shader-compile hitches there.
+
+Page flags go in the URL hash and can be combined with `&`: `#hud=1` frame-time HUD, `#gpu=1` WebGPU (the default from `play.sh`), `#gpu=0` WebGL2, `#diag=1` draw
 statistics, `#glcache=0` turn off the redundant-GL-call filter, `#mirror=full|half|auto`.
 
 ## Controls
